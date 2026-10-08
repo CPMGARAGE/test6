@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cheat codes - TerminalTanks</title>
+<meta name="description" content="Every cheat code in TerminalTanks and exactly what it unlocks.">
+<meta name="theme-color" content="#05090f">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Cheat codes - TerminalTanks">
+<meta property="og:description" content="Every cheat code in TerminalTanks and exactly what it unlocks.">
+<meta property="og:image" content="https://cpmgarage.github.io/test5/preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://cpmgarage.github.io/test5/cheats.html">
+<link rel="stylesheet" href="site.css">
+</head>
+<body data-page="cheats">
+<main data-title="CHEAT CODES">
+  <h2>HOW TO ENTER A CODE</h2>
+  <p class="lead">Open <b>Cheat codes</b> from the game's main menu, type the code, and press <kbd>Enter</kbd>.</p>
+  <p>Codes ignore capital letters and spaces, so <code>Unlock Level Five</code> works. Codes only unlock content. They never add coins or credits; those come from playing.</p>
+  <p>There are <b class="n-cheats"></b> codes in all: three general codes and one for each of the twenty Tournament levels.</p>
+
+  <input class="find" id="q" type="search" placeholder="Search codes" aria-label="Search codes">
+  <h2>GENERAL CODES</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>Code</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>iamethanlabs101</code></td><td>Unlocks everything at once: all <b class="n-unlock"></b> unlockables, covering every tank, ammo type, map and home screen, every Tournament level and mission, Master difficulty, the RGB hull and shell colors, and the rewards of all ten Terminal Ticket bosses. Levels become open to play but are not marked cleared, and no ticket boss is marked beaten, so tickets still sell in the shop.</td></tr>
+      <tr><td><code>asciieasteregg</code></td><td>Unlocks the ASCIIBOT tank and GLYPH ammo, the two items that exist nowhere else.</td></tr>
+      <tr><td><code>notasecrettheme</code></td><td>Unlocks the SECRET home screen and switches to it straight away.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>LEVEL CODES</h2>
+  <p>Each level has its own code: <code>unlocklevel</code> followed by the level number spelled out. A level code opens that one level to play. It does not mark the level cleared and does not open the level after it, so you still earn the rewards by winning the fight.</p>
+  <p class="muted">Level 1 is always open, so <code>unlocklevelone</code> has nothing to do. The rewards below are what you earn for clearing each level.</p>
+  <div class="scroll"><table id="levels">
+    <thead><tr><th>Code</th><th>Level</th><th>Reward for clearing</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+
+  <h2>WHAT THE CHEAT MENU TRACKS</h2>
+  <p>The cheat screen shows how much of the game you own. These are the current totals, taken from the game's own content lists. The menu leaves out the secret ASCIIBOT tank and GLYPH ammo, so it shows one fewer tank and one fewer ammo type than the game really has (<b class="n-tanks"></b> of each).</p>
+  <div class="kv" id="totals"></div>
+
+  <div class="card">
+    <p>Want specific unlocks without typing codes? The <a href="save-forge.html">Save forge</a> builds a save file with exactly the items you pick, including things no single code grants, such as one tank without the rest.</p>
+  </div>
+</main>
+<script src="site.js"></script>
+<script>
+(function () {
+  const label = (u) => { const k = TT.kindOf(u), n = TT.nameOf(u); return k ? n + ' ' + k : n.charAt(0) + n.slice(1).toLowerCase(); };
+  const rows = TT.levels.map((name, i) => `<tr><td><code>unlocklevel${TT.words[i]}</code></td><td>${i + 1}. ${name}</td><td>${TT.rewards[i].map(label).join(', ')}</td></tr>`);
+  const N = TT.counts;
+  document.querySelectorAll('.n-unlock').forEach((e) => { e.textContent = N.unlockables; });
+  document.querySelectorAll('.n-tanks').forEach((e) => { e.textContent = N.tanks; });
+  document.querySelectorAll('.n-cheats').forEach((e) => { e.textContent = N.cheats; });
+  document.getElementById('totals').innerHTML = [['Tanks', N.menuTanks], ['Ammo', N.menuAmmo], ['Maps', N.maps], ['Home screens', N.screens], ['Tank parts', N.parts], ['Custom tanks', N.customMax + ' slots']].map(([k, v]) => `<span>${k}</span><span>${v}</span>`).join('');
+  document.querySelector('#levels tbody').innerHTML = rows.join('');
+  document.querySelectorAll('td:first-child code').forEach((el) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'copy'; b.textContent = 'Copy'; b.setAttribute('aria-label', 'Copy ' + el.textContent); b.onclick = () => TT.copy(el.textContent, b); el.after(b); });
+  document.getElementById('q').oninput = (e) => { const q = e.target.value.trim().toLowerCase().replace(/\s+/g, ''); document.querySelectorAll('tbody tr').forEach((tr) => { tr.hidden = !!q && !tr.textContent.toLowerCase().replace(/\s+/g, '').replace(/copy/g, '').includes(q); }); };
+})();
+</script>
+</body>
+</html>

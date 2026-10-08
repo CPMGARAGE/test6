@@ -1,0 +1,22 @@
+{
+  "version": "1.4.0",
+  "next": [],
+  "notes": [
+    {
+      "title": "The big expansion",
+      "version": "1.4.0",
+      "items": [
+        "Far more to unlock: 107 tank designs, 107 ammo types, 79 home screens and 129 maps in all",
+        "A new premium tier at the top of the shop, with five extra tanks and five extra ammo types",
+        "The Workshop: build and save your own tanks from 129 parts and 24 accent colors",
+        "Terminal Tickets: ten boss battles, each with its own tank, map and ammo",
+        "Two-player and LAN matches can use a special attack: skip two turns, then your next shot deals 3 damage",
+        "Two-player and LAN matches can be played on a map you choose, and you can leave a match from a clear prompt",
+        "The Mothership is shielded until both of its drones are destroyed",
+        "Glass Cannon levels now give you 2 HP instead of 1",
+        "The shop scrolls, so every row is reachable on small terminals",
+        "Save format 5. Existing saves, wallets and unlocks carry over."
+      ]
+    }
+  ]
+}

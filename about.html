@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>About - TerminalTanks</title>
+<meta name="description" content="The story behind TerminalTanks and how the game is built.">
+<meta name="theme-color" content="#05090f">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:title" content="About - TerminalTanks">
+<meta property="og:description" content="The story behind TerminalTanks and how the game is built.">
+<meta property="og:image" content="https://cpmgarage.github.io/test5/preview.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://cpmgarage.github.io/test5/about.html">
+<link rel="stylesheet" href="site.css">
+</head>
+<body data-page="about">
+<main data-title="ABOUT">
+  <h2>THE STORY SO FAR</h2>
+  <p class="lead">All was well in the world of TerminalTanks, until people started fighting over resources.</p>
+  <p>The fighting made people greedy, and the greed drained the world. The land dried up, and the richest people alive, the ones who had hoarded the most, sat on what was left. Those hoarders became the bosses. The Master was the biggest and grandest of them all.</p>
+  <h3>THE ROAD TO THE MASTER</h3>
+  <p>You come to put it right. The Tournament is your road through the hoarders: twenty duels that begin at Boot Camp and end at the Master's Citadel. Every greedy boss you take down makes you stronger, and the resources they sat on go back to humanity.</p>
+  <h3>THE ALIENS</h3>
+  <p>Another world was running dry too. Its people heard about the Master's wealth and came to kill the Master and take the riches for themselves. They were too late. You had already beaten the Master and secured the riches, so the aliens' target changed. It is you now.</p>
+  <h3>THE INVASION</h3>
+  <p>The missions are that war. The aliens want everything you took back from the hoarders, and they want it for their own planet. Your job is to keep it safe: hunt the invaders, beat the UFOs as they grow from lone scouts up to the Archon, and finally take down the Mothership, which arrives with two drones and needs everything you have learned. Only then are the riches restored to the world.</p>
+
+  <h2>HOW IT IS BUILT</h2>
+  <p>TerminalTanks is one Python file of about 10,000 lines. It needs Python 3.10 or newer and a UTF-8 terminal of at least 96 by 28 characters. It uses no third-party packages: drawing, input and animation are all built on the standard library and plain ANSI escape sequences.</p>
+  <div class="kv">
+    <span>Rendering</span><span>ANSI escape sequences, no curses</span>
+    <span>Multiplayer</span><span>LAN play over TCP, with UDP discovery so hosts appear on their own</span>
+    <span>Fairness</span><span>The simulation is seeded and deterministic, and visual effects use their own random generator so they cannot change an outcome</span>
+    <span>Saves</span><span>One small JSON file, versioned, with migration for older saves and room for fields from newer ones</span>
+    <span>In the browser</span><span>The same game file on the Pyodide Python runtime, drawn by a hand-written canvas renderer</span>
+  </div>
+  <p>The deterministic design is what makes LAN play work: both machines run the same simulation from the same starting setup, so a shot only needs to send its angle and power. It also keeps matches reproducible.</p>
+  <h3>HOW THE BROWSER VERSION WORKS</h3>
+  <p>The browser version runs the same <code>terminaltanks.py</code> as the terminal, but not literally untouched. The page supplies stand-ins for the operating-system terminal modules the game imports and paces the game one frame at a time. Scenes, physics, AI and saves are the same code in both places.</p>
+  <p>The page draws the game with its own canvas renderer, with no terminal library and no other third-party code. The one outside piece is Pyodide, the Python runtime itself, which downloads on your first visit (about 10 MB) and is cached after that. The game and its renderer still follow the project's rule of no dependencies of their own.</p>
+  <p>Saves have changed shape over time, and the game still reads every older version and converts it. For example, the old Master fight at level 5 now lives at level 20, and its rewards carry over. Custom tanks are stored by stable part names rather than positions in a list, so a tank you build today still loads after new parts are added, and a part that is ever removed falls back to a safe default instead of breaking the save.</p>
+
+  <h2>TANKS OF YOUR OWN</h2>
+  <p>The Workshop lets you assemble a tank from parts you have unlocked: a turret, hull, tracks, barrel, glow, ambient effect and accent color. Name it, give it a line of lore, preview it, and equip it. Saving a design costs coins, and you can keep up to <b class="n-custom"></b> of them. Official tanks are never overwritten.</p>
+
+  <h2>TERMINAL TICKETS</h2>
+  <p class="lead">The world has run dry like this before.</p>
+  <p>Long ago the same greed drained it, and the same kind of hoarder rose to rule over what was left. A hero much like you came forward, a mage who wielded strong magic. The hoarders were too powerful. The mage could not beat them, and neither could anyone else.</p>
+  <p>So the mage did the one thing left to do. He bound the greediest of them, the super bosses, inside a prison called the Terminal Ticket. Sealing it took the Terminal Tanks spell, and finishing that spell took everything he had. He poured every last ounce of energy in his body into the casting, and it cost him his life.</p>
+  <p>The tickets are what remain: ancient artifacts, each one holding a boss behind the mage's seal. When you buy and use one, you break that seal, and you have to fight whatever comes out.</p>
+  <h3>HOW THEY WORK</h3>
+  <p>A ticket is the most expensive thing in the shop. Using one releases one of ten bosses, picked at random, each with its own tank, map and ammo. Win and you keep all of it, plus a home screen. A boss you have beaten stays beaten and never comes up again, and a ticket is not used up until the fight is won. Once all ten are down, the tickets sell out.</p>
+
+  <h2>RELEASE NOTES</h2>
+  <div id="notes"></div>
+  <div class="row">
+    <a class="btn big" href="https://github.com/ethanlabs101/TerminalTanks" target="_blank" rel="noopener">Source on GitHub</a>
+    <a class="btn big hot" href="play.html">Play</a>
+  </div>
+</main>
+<script src="site.js"></script>
+<script>
+document.querySelectorAll('.n-custom').forEach((e) => { e.textContent = TT.counts.customMax; });
+fetch('roadmap.json').then((r) => r.json()).then((j) => {
+  document.getElementById('notes').innerHTML = j.notes.map((n) => '<div class="soon"><h3>' + (n.title || 'Version ' + n.version) + '</h3>' + (n.title ? '<div class="muted">Version ' + n.version + '</div>' : '') + (n.text ? '<p>' + n.text + '</p>' : '') + (n.items ? '<ul>' + n.items.map((i) => '<li>' + i + '</li>').join('') + '</ul>' : '') + '</div>').join('');
+}).catch(() => { document.getElementById('notes').innerHTML = '<p class="muted">Release notes could not be loaded.</p>'; });
+</script>
+</body>
+</html>
