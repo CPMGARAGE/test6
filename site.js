@@ -34,7 +34,7 @@ const TT = {
   document.head.appendChild(icon);
 
   const mk = (n) => Array.from({ length: n }, () => `${(Math.random() * 100).toFixed(1)}vw ${(Math.random() * 78).toFixed(1)}vh ${Math.random() < .2 ? '#bfe9ff' : '#fff'}`).join(',');
-  const nav = [['play.html', 'Play', 'play'], ['home.html', 'Home', 'home'], ['catalog.html', 'Catalog', 'catalog'], ['workshop.html', 'Workshop', 'workshop'], ['cheats.html', 'Cheats', 'cheats'], ['save-forge.html', 'Save forge', 'forge'], ['install.html', 'Install', 'install'], ['about.html', 'About', 'about'], ['links.html', 'Links', 'links']];
+  const nav = [['play.html', 'Play', 'play'], ['home.html', 'Home', 'home'], ['catalog.html', 'Catalog', 'catalog'], ['workshop.html', 'Workshop', 'workshop'], ['cheats.html', 'Cheats', 'cheats'], ['save-forge.html', 'Save forge', 'forge'], ['install.html', 'Install', 'install'], ['coming-soon.html', 'Coming Soon', 'coming soon'], ['about.html', 'About', 'about'], ['links.html', 'Links', 'links']];
   const main = document.querySelector('main');
   main.classList.add('stage');
   const title = main.dataset.title || '';
@@ -46,7 +46,7 @@ const TT = {
   app.innerHTML = `<header class="bar"><a class="brand" href="home.html"><svg viewBox="0 0 14 9" aria-hidden="true">${r}</svg><div><h1>TERMINALTANKS</h1><small>TACTICAL ARTILLERY SIMULATION</small></div></a>
     <nav class="tools" aria-label="Site">${nav.map(([h, t, k]) => `<a class="btn${k === page ? ' on' : ''}${k === 'play' ? ' hot' : ''}" href="${h}"${k === page ? ' aria-current="page"' : ''}>${t}</a>`).join('')}</nav></header>`;
   app.appendChild(main);
-  app.insertAdjacentHTML('beforeend', `<footer class="foot"><div>&#9670; Source on <a href="https://github.com/ethanlabs101/TerminalTanks" target="_blank" rel="noopener">github.com/ethanlabs101/TerminalTanks</a> by <a href="https://github.com/ethanlabs101" target="_blank" rel="noopener">ethanlabs101</a></div><div><a href="coming-soon.html">Coming soon</a>. Runs in your browser; your progress stays on this device.<span id="ver"></span></div></footer>`);
+  app.insertAdjacentHTML('beforeend', `<footer class="foot"><div>&#9670; Source at <a href="https://github.com/ethanlabs101/TerminalTanks" target="_blank" rel="noopener">github.com/ethanlabs101/TerminalTanks</a> by <a href="https://github.com/ethanlabs101" target="_blank" rel="noopener">ethanlabs101</a></div><div>Runs in your browser; your progress stays on this device.<span id="ver"></span></div></footer>`);
   document.body.appendChild(app);
   if (location.protocol === 'file:') document.getElementById('content').insertAdjacentHTML('afterbegin', '<div class="card"><b class="warn">This page was opened straight from disk.</b><p>Browsers block the data files the catalog, Workshop and news need when a page is opened this way. Start a local server instead: run <code>python3 -m http.server 8000</code> in this folder and open <code>http://localhost:8000/home.html</code>. On GitHub Pages or any web host it just works.</p></div>');
   fetch('roadmap.json').then((r) => r.json()).then((j) => { document.getElementById('ver').textContent = ' Version ' + j.version + '.'; }).catch(() => {});
