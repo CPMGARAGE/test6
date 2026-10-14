@@ -11,13 +11,15 @@ standard library and plain ANSI escape sequences.
 from __future__ import annotations
 
 import argparse
-import argparse
 import atexit
+import bisect
 import colorsys
 import copy
 import json
 import math
 import os
+import pickle
+import queue
 import random
 import re
 import select
@@ -28,8 +30,11 @@ import struct
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import traceback
+import zlib
+from array import array
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from pathlib import Path
@@ -43,7 +48,7 @@ elif not IS_WEB:
     import termios
     import tty
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 CREDIT_NAME = "ethanlabs101"
 CREDIT_URL = "github.com/ethanlabs101"
 
@@ -762,9 +767,16 @@ class Settings:
     sound: bool = False
     wind: float = 6.0
     home_mode: str = "CLASSIC"
+    audio: int = 2                        # 2 ON (music + effects), 1 BELL only, 0 OFF
+    music_vol: float = 0.7
+    sfx_vol: float = 0.9
+    song_popup: bool = True               # the NOW PLAYING card when the music changes
+    wind_min: float = 0.0                 # lower bound of |wind| (set from a match's WIND band; the global setting leaves it at 0)
 
 
-SHOP_THEMES = ('SUNSET', 'MEADOW', 'DESERT', 'HARBOR', 'AUTUMN', 'DAWN', 'PRAIRIE', 'HARVEST', 'LAKESIDE', 'CAMPFIRE', 'TWILIGHT', 'FOGBANK', 'SPRING', 'MARKET', 'MONSOON', 'ARCTIC', 'JUNGLE', 'NEON', 'DEEPSEA', 'STORMFRONT', 'SYNTHWAVE', 'TOKYO', 'PYRAMIDS', 'TUNDRA', 'CANYONS', 'LAGOON', 'THUNDERHEAD', 'STEAMTOWN', 'ORBITRING', 'BAMBOO', 'MOLTEN', 'CRYSTALCAVE', 'BLOODMOON', 'EMERALD', 'GOLDENDUNES', 'NIGHTCITY', 'LAVAFALLS', 'VAPORWAVE', 'DEADSEA', 'SKYFORT', 'CYBERPUNK', 'MAELSTROM', 'ICEPALACE', 'SOLARSTORM', 'GHOSTTOWN', 'ECLIPSE', 'VOIDRIFT', 'SOLARCROWN', 'STARFALL', 'CELESTIAL', 'QUASAR', 'GALAXY', 'NEBULAR', 'HYPERGATE', 'BLACKHOLE', 'AURORAKING', 'CRYSTALPEAK', 'DRAGONSKY', 'CELESTIA', 'ASTRALSEA')
+SHOP_THEMES = ('SUNSET', 'MEADOW', 'DESERT', 'HARBOR', 'AUTUMN', 'DAWN', 'PRAIRIE', 'HARVEST', 'LAKESIDE', 'CAMPFIRE', 'TWILIGHT', 'FOGBANK', 'SPRING', 'MARKET', 'MONSOON', 'ARCTIC', 'JUNGLE', 'NEON', 'DEEPSEA', 'STORMFRONT', 'SYNTHWAVE', 'TOKYO', 'PYRAMIDS', 'TUNDRA', 'CANYONS', 'LAGOON', 'THUNDERHEAD', 'STEAMTOWN', 'ORBITRING', 'BAMBOO', 'MOLTEN', 'CRYSTALCAVE', 'BLOODMOON', 'EMERALD', 'GOLDENDUNES', 'NIGHTCITY', 'LAVAFALLS', 'VAPORWAVE', 'DEADSEA', 'SKYFORT', 'CYBERPUNK', 'MAELSTROM', 'ICEPALACE', 'SOLARSTORM', 'GHOSTTOWN', 'ECLIPSE', 'VOIDRIFT', 'SOLARCROWN', 'STARFALL', 'CELESTIAL', 'QUASAR', 'GALAXY', 'NEBULAR', 'HYPERGATE', 'BLACKHOLE', 'AURORAKING', 'CRYSTALPEAK', 'DRAGONSKY', 'CELESTIA', 'ASTRALSEA',
+               'GLASSDESERT', 'LANTERNFEST', 'WORLDTREE', 'SKYWHALE', 'SHATTERLINE',
+               'BIOLUME', 'SPIRITSHRINE', 'HOLOCITY', 'TESSERACT', 'KAIJUBAY', 'SHROOMGROVE', 'WORMSEA', 'JADETEMPLE', 'ORRERY', 'GHOSTARMADA')
 MISSION_THEMES = ('OUTPOST', 'RADAR', 'WARZONE', 'ORBITAL', 'DEEPSPACE', 'INVASION')
 TICKET_THEMES = ('VOLTCITY', 'CLOCKWORKS', 'FROSTCATHEDRAL', 'SUNTEMPLE', 'SUNKENCITY', 'PYRAMIDPLAIN', 'CHEMWORKS', 'GOTHICKEEP', 'ORBITALCITY', 'PAGODAPEAK')
 ANCIENT_THEMES = ('EMBERSANCTUM', 'TEMPESTSPIRES', 'ASTRALRIFT', 'SOLARIS', 'CHRONOS', 'ETERNAL')
@@ -784,7 +796,10 @@ SETTING_ROWS = (
     ("MAP SELECTION", "random_maps", (("CHOOSE", False), ("RANDOM", True)), "Pick the opening battlefield or roll the dice"),
     ("COLOR MODE", "color_mode", (("AUTO", ColorMode.AUTO), ("24-BIT", ColorMode.TRUE), ("256", ColorMode.ANSI256), ("16", ColorMode.ANSI16)),
      "Force a palette if colours look wrong"),
-    ("SOUND", "sound", (("OFF", False), ("BELL", True)), "Terminal bell on impacts"),
+    ("AUDIO", "audio", (("ON", 2), ("BELL ONLY", 1), ("OFF", 0)), "Music and sound effects (needs a sound device)"),
+    ("MUSIC VOLUME", "music_vol", tuple((f"{i * 10}%", i / 10) for i in range(11)), "Soundtrack level"),
+    ("SFX VOLUME", "sfx_vol", tuple((f"{i * 10}%", i / 10) for i in range(11)), "Explosions, shots and menu clicks"),
+    ("SONG POPUP", "song_popup", (("ON", True), ("OFF", False)), "A NOW PLAYING card slides in when the music changes"),
     ("HOME SCREEN", "home_mode", tuple((k, k) for k in HOME_ORDER), "Pick any home screen you own"),
 )
 
@@ -796,7 +811,7 @@ class Feedback:
         self.term, self.settings, self._last = term, settings, 0.0
 
     def emit(self, kind: str) -> None:
-        if self.settings.sound and kind in ("explosion", "destroy"):
+        if getattr(self.settings, "audio", 2) == 1 and kind in ("explosion", "destroy"):
             now = time.monotonic()
             if now - self._last > 0.15:
                 self._last = now
@@ -1115,9 +1130,58 @@ _NEW_MAPS = (
         _M(3, "THE LABYRINTH", "A maze of tall and short walls.", [(0, .2), (.05, .2), (.06, .7), (.08, .7), (.09, .2), (.14, .2), (.15, .7), (.17, .7), (.18, .2), (.23, .2), (.24, .7), (.26, .7), (.27, .2), (.32, .2), (.33, .7), (.35, .7), (.36, .2), (.5, .2)], replace(_THEMES["midnight"], aurora=True), False, 0.0, (.07, .93)),
         _M(3, "CELESTIAL STEPS", "Giant stairs that climb into the aurora.", [(0, .1), (.06, .1), (.08, .22), (.16, .22), (.18, .36), (.26, .36), (.28, .5), (.36, .5), (.38, .66), (.5, .66)], _SANCTUM, False, 0.0, (.07, .93))),
 )
+_PREMIUM_ACCENT = (255, 70, 140)
+_PREMIUM_MAPS = tuple(replace(m, accent=_PREMIUM_ACCENT) for m in (
+    _M(3, "GLASS DESERT", "Dunes of fused glass under twin suns: every shell throws prisms.",
+       [(0, .3), (.06, .42), (.12, .28), (.2, .5), (.28, .3), (.36, .44), (.44, .26), (.5, .34)],
+       Theme((30, 10, 66), (255, 150, 104), (116, 62, 110), (255, 232, 170), (150, 232, 244), (92, 182, 204), (62, 112, 142), (20, 40, 72), 0.004, False, "stardust"), True, 0.01),
+    _M(3, "LANTERN TERRACES", "Stepped temple terraces under a sky of rising lanterns.",
+       [(0, .15), (.06, .15), (.08, .28), (.16, .28), (.18, .42), (.26, .42), (.28, .56), (.4, .56), (.42, .62), (.5, .62)],
+       Theme((8, 6, 30), (196, 76, 62), (62, 22, 42), (255, 204, 124), (232, 172, 84), (152, 84, 52), (82, 42, 42), (30, 16, 24), 0.006, False, "fireflies", "pagoda")),
+    _M(3, "WORLDTREE ROOTS", "Colossal glowing roots arch over bottomless hollows.",
+       [(0, .45), (.04, .6), (.1, .2), (.16, .52), (.22, .18), (.3, .55), (.38, .22), (.44, .5), (.5, .35)],
+       Theme((2, 14, 24), (40, 164, 134), (10, 62, 62), (192, 255, 232), (112, 242, 172), (52, 152, 112), (30, 82, 70), (10, 30, 34), 0.008, True, "fireflies"), True),
+    _M(3, "WHALEFALL", "The bleached ribs of a sky-whale, arching over the dark.",
+       [(0, .2), (.04, .5), (.08, .2), (.12, .55), (.16, .2), (.2, .6), (.24, .2), (.28, .55), (.32, .2), (.36, .5), (.4, .2), (.5, .25)],
+       Theme((2, 6, 24), (32, 92, 164), (16, 42, 92), (204, 232, 255), (224, 232, 242), (162, 176, 202), (92, 102, 132), (30, 34, 60), 0.01, True, "stardust")),
+    _M(3, "SHATTERLINE", "Floating plates of cracked glass above a prismatic void.",
+       [(0, .4), (.05, .4), (.07, .02), (.1, .02), (.12, .5), (.2, .5), (.22, .02), (.26, .02), (.28, .62), (.36, .62), (.38, .02), (.44, .02), (.46, .45), (.5, .45)],
+       Theme((10, 4, 28), (122, 62, 202), (62, 32, 112), (255, 255, 255), (222, 202, 255), (152, 132, 232), (92, 72, 172), (30, 20, 70), 0.012, True, "stardust")),
+    # --- premium II ----------------------------------------------------------------------------------------------------
+    _M(3, "MARIANA DEEP", "Ledges falling into a black trench; jellyfish drift up past the kelp.",
+       [(0, .55), (.1, .55), (.14, .42), (.22, .4), (.27, .22), (.35, .2), (.4, .06), (.5, .04)],
+       Theme((2, 10, 30), (14, 62, 96), (8, 30, 54), (90, 170, 190), (50, 140, 120), (30, 90, 84), (20, 50, 60), (8, 18, 28), 0.006, False, "plankton", "kelp")),
+    _M(3, "TORII PATH", "A stone stair climbing through vermilion gates under a full moon.",
+       [(0, .18), (.08, .18), (.1, .26), (.16, .26), (.18, .34), (.24, .34), (.26, .42), (.32, .42), (.34, .5), (.42, .5), (.44, .58), (.5, .58)],
+       Theme((10, 6, 34), (120, 62, 124), (54, 30, 80), (255, 242, 222), (124, 150, 104), (92, 100, 72), (72, 58, 62), (30, 22, 30), 0.01, False, "sakura", "torii")),
+    _M(3, "NEON GRIDLOCK", "Rain-slick rooftops between towers of flickering holograms.",
+       [(0, .3), (.07, .3), (.08, .45), (.15, .45), (.16, .25), (.22, .25), (.23, .6), (.28, .6), (.29, .35), (.36, .35), (.37, .7), (.42, .7), (.43, .4), (.5, .4)],
+       Theme((8, 4, 26), (150, 40, 120), (40, 16, 60), (255, 120, 220), (90, 230, 255), (60, 60, 90), (36, 30, 56), (14, 10, 26), 0.004, False, "rain", "holo")),
+    _M(3, "PARADOX ENGINE", "Slabs of space adrift beneath a hypercube that should not exist.",
+       [(0, .4), (.08, .4), (.1, .03), (.13, .03), (.15, .45), (.22, .55), (.24, .03), (.27, .03), (.29, .3), (.35, .38), (.37, .03), (.4, .03), (.42, .6), (.5, .6)],
+       Theme((4, 2, 18), (80, 30, 140), (30, 14, 70), (220, 200, 255), (220, 200, 255), (150, 120, 230), (80, 60, 160), (26, 18, 60), 0.014, True, "stardust", "tesseract")),
+    _M(3, "KAIJU BAY", "A flattened harbour. A footprint the size of a block. Something sleeps offshore.",
+       [(0, .35), (.07, .35), (.08, .5), (.12, .5), (.13, .35), (.2, .32), (.24, .12), (.3, .1), (.34, .14), (.36, .4), (.4, .45), (.41, .25), (.5, .22)],
+       Theme((14, 16, 30), (90, 100, 130), (40, 44, 60), (200, 220, 255), (110, 120, 130), (80, 84, 92), (56, 56, 64), (24, 24, 30), 0.003, False, "storm", "kaiju")),
+    _M(3, "MYCELIA", "Soft rolling caps on a forest floor that glows from underneath.",
+       [(0, .32), (.1, .4), (.2, .3), (.3, .45), (.4, .32), (.5, .38)],
+       Theme((6, 10, 30), (60, 120, 130), (20, 40, 56), (190, 255, 220), (150, 230, 190), (70, 120, 100), (50, 60, 60), (20, 24, 28), 0.008, False, "spores", "shrooms"), True),
+    _M(3, "WORM'S MAW", "Dunes sliding into the open throat of a sandworm.",
+       [(0, .4), (.1, .48), (.18, .36), (.26, .5), (.34, .42), (.4, .2), (.44, .06), (.5, .03)],
+       Theme((20, 12, 40), (240, 160, 110), (140, 90, 70), (255, 236, 200), (236, 196, 130), (200, 150, 96), (150, 100, 64), (70, 44, 30), 0.006, False, "sandfall", "wormarch"), True),
+    _M(3, "SERPENT STAIRS", "Two stepped pyramids face each other across a jungle valley.",
+       [(0, .2), (.06, .2), (.08, .3), (.12, .3), (.14, .4), (.18, .4), (.2, .5), (.24, .5), (.26, .4), (.3, .4), (.32, .3), (.36, .3), (.38, .18), (.5, .15)],
+       Theme((40, 30, 80), (255, 170, 110), (60, 90, 70), (255, 220, 130), (90, 170, 100), (70, 120, 70), (90, 80, 60), (40, 34, 26), 0.002, False, "fireflies", "stepped")),
+    _M(3, "ASTROLABE", "Brass rings turn across the stars above a curved brass floor.",
+       [(0, .3), (.1, .42), (.18, .46), (.24, .4), (.28, .3), (.32, .2), (.38, .18), (.44, .3), (.48, .5), (.5, .52)],
+       Theme((4, 6, 30), (50, 50, 120), (26, 28, 70), (255, 220, 140), (220, 190, 120), (170, 140, 80), (90, 76, 60), (30, 26, 30), 0.016, False, "stardust", "orrery"), True),
+    _M(3, "GHOST REEF", "Wrecked galleons on a reef of fog; their lanterns are still lit.",
+       [(0, .25), (.08, .25), (.1, .38), (.14, .42), (.18, .36), (.22, .2), (.27, .18), (.3, .32), (.33, .48), (.36, .46), (.38, .3), (.44, .22), (.5, .24)],
+       Theme((2, 10, 16), (60, 110, 100), (20, 44, 46), (196, 255, 216), (120, 170, 150), (70, 110, 100), (46, 60, 60), (16, 24, 26), 0.01, False, "ghostlights", "wrecks")),
+))
 SHOP_MAPS = (_SHOP_BASE_MAPS[0:5] + _NEW_MAPS[0] + _SHOP_BASE_MAPS[5:10] + _NEW_MAPS[1] + _SHOP_BASE_MAPS[10:15] + _NEW_MAPS[2]
-             + _SHOP_BASE_MAPS[15:20] + _NEW_MAPS[3])
-assert len(SHOP_MAPS) == 60
+             + _SHOP_BASE_MAPS[15:20] + _NEW_MAPS[3] + _PREMIUM_MAPS)
+assert len(SHOP_MAPS) == 75
 
 _SPACE = Theme((2, 4, 24), (40, 70, 170), (16, 24, 80), (190, 220, 255), (170, 210, 255), (90, 120, 180), (50, 70, 120),
                (14, 20, 44), 0.014, True, "stardust")
@@ -1296,6 +1360,9 @@ def _b_windows(put, x0, y0, w, h, lit, seed):
 
 def _bake_buildings(kind: str, w: int, h: int, base_y: int, col: RGB, lit: RGB, put) -> None:
     r = random.Random(w * 31 + h * 7 + sum(map(ord, kind)))
+    if kind in _BAKE_EXTRA:
+        _BAKE_EXTRA[kind](w, h, base_y, col, lit, put, r)
+        return
     if kind == "skyline":
         x = 2
         while x < w - 4:
@@ -1409,7 +1476,250 @@ def _bake_buildings(kind: str, w: int, h: int, base_y: int, col: RGB, lit: RGB, 
             _b_rect(put, cx, base_y + 4 * int(h * 0.1) + 2, 1, 5, col)
 
 
-BUILDING_STYLES = ("skyline", "clock", "cathedral", "temple", "ruins", "pyramids", "factory", "castle", "station", "pagoda", "volcano", "isles", "rift")
+def _bk_line(put, x0, y0, x1, y1, col):
+    n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    for i in range(n + 1):
+        put(int(round(x0 + (x1 - x0) * i / n)), int(round(y0 + (y1 - y0) * i / n)), col)
+
+
+def _bk_kelp(w, h, b, col, lit, put, r):
+    """MARIANA DEEP: a forest of giant kelp swaying up toward the light, with rock arches between."""
+    for cx in (w // 5, w - w // 4):
+        R = int(h * 0.18)
+        for a in range(0, 181, 2):
+            ang = math.radians(a)
+            for t_ in range(3):
+                put(int(cx + math.cos(ang) * (R - t_)), int(b + math.sin(ang) * (R - t_) * 1.3), col)
+    for i in range(max(6, w // 6)):
+        x0, ht = r.randint(2, w - 3), int(h * r.uniform(0.3, 0.72))
+        ph = r.uniform(0, math.tau)
+        for y in range(ht):
+            x = int(x0 + math.sin(y * 0.18 + ph) * 2.2)
+            put(x, b + y, col)
+            if y % 3 == 0:
+                put(x + (1 if (y // 3) % 2 else -1), b + y, col)
+                put(x + (2 if (y // 3) % 2 else -2), b + y + 1, col)
+            if y % 9 == 4:
+                put(x, b + y + 1, lit)
+
+
+def _bk_torii(w, h, b, col, lit, put, r):
+    """TORII PATH: a mountain with a stair of gates up its flank and a lantern-lit shrine at the top."""
+    cx, top = int(w * 0.62), b + int(h * 0.55)
+    for x in range(w):
+        y_ = top - int(abs(x - cx) * 0.9)
+        for y in range(b, max(b, y_)):
+            put(x, y, col)
+    for k in range(5):                                                   # gates climbing the left flank
+        gx = int(cx - (5 - k) * (w * 0.07))
+        gy = top - int(abs(gx - cx) * 0.9)
+        s = 0.75 + k * 0.08
+        hw, hh = int(6 * s), int(10 * s)
+        for side in (-1, 1):
+            _b_rect(put, gx + side * hw, gy, 2, hh, lit)
+        for x in range(gx - hw - 2, gx + hw + 4):
+            lift = 1 if abs(x - gx) > hw else 0
+            put(x, gy + hh + lift, lit)
+            put(x, gy + hh + 1 + lift, (40, 20, 24))
+        for x in range(gx - hw, gx + hw + 1):
+            put(x, gy + hh - 3, lit)
+    _b_rect(put, cx - 5, top, 11, 5, col)
+    _b_tri(put, cx, top + 5, 8, 4, col)
+    put(cx, top + 2, lit)
+    put(cx, top + 3, lit)
+
+
+def _bk_holo(w, h, b, col, lit, put, r):
+    """NEON GRIDLOCK: dense towers carrying huge hologram billboards and blinking aircraft lights."""
+    x = 1
+    while x < w - 3:
+        bw, bh = r.randint(5, 10), int(h * r.uniform(0.25, 0.7))
+        _b_rect(put, x, b, bw, bh, col)
+        _b_windows(put, x, b, bw, bh, shade(lit, 0.6), x)
+        if r.random() < 0.45 and bw >= 6:                                # a billboard: a glowing panel with scanlines
+            by, bh2 = b + bh - r.randint(6, 10), r.randint(4, 6)
+            c1 = lit if r.random() < 0.5 else (255, 80, 210)
+            for yy in range(by, by + bh2 + 1):
+                for xx in range(x - 1, x + bw + 1):
+                    edge = yy in (by, by + bh2) or xx in (x - 1, x + bw)
+                    put(xx, yy, c1 if edge else (shade(c1, 0.75) if yy % 2 else shade(c1, 0.4)))
+        if r.random() < 0.5:
+            _b_rect(put, x + bw // 2, b + bh, 1, r.randint(3, 8), col)
+            put(x + bw // 2, b + bh + 8, (255, 70, 90))
+        x += bw + r.randint(0, 2)
+
+
+def _bk_tesseract(w, h, b, col, lit, put, r):
+    """PARADOX ENGINE: a vast wire hypercube hanging in the sky over drifting slabs."""
+    cx, cy, S = w // 2, b + int(h * 0.42), int(h * 0.16)
+    a, c = 0.6, 0.45
+    pts = []
+    for i in range(16):
+        v = [(1 if i >> k & 1 else -1) for k in range(4)]
+        x, y, z, ww = v
+        x, ww = x * math.cos(a) - ww * math.sin(a), x * math.sin(a) + ww * math.cos(a)
+        y, z = y * math.cos(c) - z * math.sin(c), y * math.sin(c) + z * math.cos(c)
+        k4 = 2.2 / (3.2 - ww)
+        k3 = 3.0 / (4.2 - z * k4)
+        pts.append((cx + x * k4 * k3 * S * 1.5, cy + y * k4 * k3 * S))
+    for i in range(16):
+        for j in range(i + 1, 16):
+            if bin(i ^ j).count("1") == 1:
+                _bk_line(put, *pts[i], *pts[j], lit)
+    for k in range(7):                                                   # floating slabs
+        sx, sy = r.randint(4, w - 12), b + int(h * r.uniform(0.05, 0.6))
+        sw = r.randint(5, 10)
+        _b_rect(put, sx, sy, sw, 2, col)
+        _b_tri(put, sx + sw // 2, sy - 3, sw // 2, 3, col)
+
+
+def _bk_kaiju(w, h, b, col, lit, put, r):
+    """KAIJU BAY: a broken harbour skyline on the left; on the right, the monster itself, asleep in the water."""
+    x = 1
+    while x < w * 0.4:
+        bw, bh = r.randint(4, 8), int(h * r.uniform(0.15, 0.45))
+        _b_rect(put, x, b, bw, bh, col)
+        if r.random() < 0.4:                                             # a smashed top
+            for k in range(bw):
+                if (k * 3) % 5 < 2:
+                    put(x + k, b + bh, col)
+        _b_windows(put, x, b, bw, bh, lit, x)
+        x += bw + r.randint(1, 2)
+    kx, sc = int(w * 0.78), h / 70.0
+    body = [(-24, 0), (-22, 20), (-14, 34), (-4, 42), (6, 46), (14, 44), (18, 38), (14, 33), (10, 29), (12, 21), (22, 12), (25, 0)]
+    for y in range(0, int(48 * sc)):                                     # fill the outline row by row
+        yy = y / sc
+        xs = []
+        for i in range(len(body) - 1):
+            (ax, ay), (bx_, by_) = body[i], body[i + 1]
+            if (ay <= yy < by_) or (by_ <= yy < ay):
+                xs.append(ax + (yy - ay) * (bx_ - ax) / (by_ - ay))
+        if len(xs) >= 2:
+            for xx in range(int(min(xs) * sc), int(max(xs) * sc) + 1):
+                put(kx - xx, b + y, col)
+    for k in range(9):                                                   # its dorsal plates, faintly glowing
+        f = k / 8
+        px_, py_ = kx - int((-16 + f * 22) * sc), b + int((22 + f * 22) * sc)
+        for s in range(int((4 + 3 * math.sin(f * math.pi)) * sc)):
+            put(px_, py_ + s, lit)
+    put(kx - int(13 * sc), b + int(41 * sc), (255, 120, 60))
+
+
+def _bk_shrooms(w, h, b, col, lit, put, r):
+    """MYCELIA: giant mushroom silhouettes, their caps dotted with glowing spots."""
+    for i in range(max(4, w // 22)):
+        cx = int(w * (0.05 + i * 0.9 / max(1, w // 22 - 1))) if w // 22 > 1 else w // 2
+        stem = int(h * r.uniform(0.12, 0.32))
+        _b_rect(put, cx - 1, b, 3, stem, col)
+        rx, ry = r.randint(9, 17), r.randint(4, 7)
+        for x in range(cx - rx, cx + rx + 1):
+            for y in range(0, ry):
+                d = ((x - cx) / rx) ** 2 + (y / ry) ** 2
+                if d <= 1:
+                    put(x, b + stem + y, shade(lit, 0.45) if d > 0.7 else col)
+        for x in range(cx - rx + 1, cx + rx):                            # the glowing gills under the cap
+            put(x, b + stem - 1, shade(lit, 0.6) if x % 2 else col)
+        for k in range(5):
+            put(cx + r.randint(-rx + 2, rx - 2), b + stem + r.randint(1, ry - 1), lit)
+
+
+def _bk_wormarch(w, h, b, col, lit, put, r):
+    """WORM'S MAW: a colossal sandworm arching out of the dunes on the horizon, ring by ring."""
+    x0, x1 = int(w * 0.18), int(w * 0.82)
+    for k in range(240):
+        u = k / 239
+        x = x0 + (x1 - x0) * u
+        y = b + math.sin(u * math.pi) * h * 0.5
+        rad = 4 + 3 * math.sin(u * math.pi)
+        for dy in range(-int(rad), int(rad) + 1):
+            put(int(x), int(y + dy), lit if (k % 8 < 2 and abs(dy) < rad - 1) else col)
+    for x in range(w):                                                   # dunes along the horizon
+        for y in range(int(4 + 3 * math.sin(x * 0.07) + 2 * math.sin(x * 0.19))):
+            put(x, b + y, col)
+
+
+def _bk_stepped(w, h, b, col, lit, put, r):
+    """SERPENT STAIRS: two stepped pyramids with temples on top, jungle crowns between them."""
+    for cx, s in ((w // 4, 1.0), (w - w // 4, 0.8)):
+        tiers, tw = 6, int(h * 0.3 * s)
+        for k in range(tiers):
+            ww = int(tw * (1 - k / (tiers + 1)))
+            _b_rect(put, cx - ww, b + k * int(4 * s + 1), 2 * ww + 1, int(4 * s + 1), col)
+        top = b + tiers * int(4 * s + 1)
+        _b_rect(put, cx - 3, top, 7, int(5 * s) + 1, col)
+        put(cx, top + 1, lit)
+        put(cx, top + 2, lit)
+        _b_rect(put, cx - 1, b, 3, top - b, shade(col, 0.8))           # the central stair
+    for i in range(w // 5):
+        cx = r.randint(0, w - 1)
+        R = r.randint(3, 6)
+        for x in range(cx - R, cx + R + 1):
+            for y in range(R):
+                if ((x - cx) / R) ** 2 + (y / R) ** 2 <= 1:
+                    put(x, b + int(h * 0.05) + y, col)
+
+
+def _bk_orrery(w, h, b, col, lit, put, r):
+    """ASTROLABE: the rings of a brass orrery cutting across the stars, with its planets."""
+    cx, cy = w // 2, b + int(h * 0.45)
+    for R, tilt in ((h * 0.12, 0.45), (h * 0.2, 0.38), (h * 0.3, 0.3), (h * 0.4, 0.24)):
+        n = int(R * 12)
+        for k in range(n):
+            a = k * math.tau / n
+            put(int(cx + math.cos(a) * R * 2.2), int(cy + math.sin(a) * R * tilt * 2), (240, 200, 120) if k % 24 == 0 else lit)
+        a = r.uniform(0, math.tau)
+        px_, py_ = int(cx + math.cos(a) * R * 2.2), int(cy + math.sin(a) * R * tilt * 2)
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                if dx * dx + dy * dy <= 4:
+                    put(px_ + dx, py_ + dy, lit)
+    for dx in range(-4, 5):
+        for dy in range(-4, 5):
+            if dx * dx + dy * dy <= 16:
+                put(cx + dx, cy + dy, lit)
+    for k in range(2):                                                   # the meridian frame
+        R = h * 0.46
+        for j in range(200):
+            a = math.pi * j / 199
+            put(int(cx + math.cos(a) * R * 2.2 * (0.5 + 0.5 * k)), int(cy + math.sin(a) * R), col)
+
+
+def _bk_wrecks(w, h, b, col, lit, put, r):
+    """GHOST REEF: the broken hulls of galleons on the reef, masts snapped and leaning, ghost-lanterns still burning."""
+    b += int(h * 0.14)                                                   # the wrecks sit up on the reef, clear of the battlefield
+    for i in range(4):
+        cx = int(w * (0.12 + i * 0.25)) + r.randint(-4, 4)
+        L_, hh = r.randint(16, 26), r.randint(4, 7)
+        tilt = r.uniform(-0.25, 0.25)
+        for x in range(-L_ // 2, L_ // 2):
+            top = int(hh * (1 - (abs(x) / (L_ / 2)) ** 3)) + int(x * tilt)
+            for y in range(max(0, top)):
+                put(cx + x, b + y, col)
+        for m in range(2):
+            mx = cx + r.randint(-L_ // 3, L_ // 3)
+            ml = int(h * r.uniform(0.2, 0.4))
+            lean = r.uniform(-0.6, 0.6)
+            for s in range(ml):
+                put(int(mx + s * lean * 0.5), b + hh + s, col)
+                put(int(mx + s * lean * 0.5) + 1, b + hh + s, col)
+            for s in range(6, ml - 3, 8):                                # tattered sails, ghost-lit at the edges
+                sw = 6 - s // 10
+                for yy in range(6):
+                    for k in range(-sw, sw + 1):
+                        if (k, yy) in ((1, 2), (-2, 4), (2, 3)):
+                            continue                                     # rips
+                        edge = abs(k) == sw or yy == 0
+                        put(int(mx + (s - yy) * lean * 0.5) + k, b + hh + s - yy, (110, 190, 160) if edge else (34, 62, 58))
+        put(cx + L_ // 2 - 2, b + hh + 2, lit)
+        put(cx - L_ // 2 + 3, b + 2, lit)
+
+
+_BAKE_LIT = {"kelp": (110, 230, 210), "torii": (214, 58, 44), "holo": (90, 230, 255), "tesseract": (200, 170, 255), "kaiju": (120, 190, 255),
+             "shrooms": (170, 255, 210), "wormarch": (150, 104, 62), "stepped": (255, 190, 90), "orrery": (130, 102, 58), "wrecks": (130, 255, 180)}
+_BAKE_EXTRA = {"kelp": _bk_kelp, "torii": _bk_torii, "holo": _bk_holo, "tesseract": _bk_tesseract, "kaiju": _bk_kaiju,
+               "shrooms": _bk_shrooms, "wormarch": _bk_wormarch, "stepped": _bk_stepped, "orrery": _bk_orrery, "wrecks": _bk_wrecks}
+BUILDING_STYLES = ("skyline", "clock", "cathedral", "temple", "ruins", "pyramids", "factory", "castle", "station", "pagoda", "volcano", "isles", "rift") \
+    + tuple(_BAKE_EXTRA)
 
 
 class Scenery:
@@ -1425,7 +1735,7 @@ class Scenery:
             def put(x, y, c, sky=self.sky, hh=height, ww=width):
                 if 0 <= x < ww and 0 <= y < hh:
                     sky[hh - 1 - y][x] = c
-            _bake_buildings(theme.buildings, width, height, int(height * 0.2), col, lit, put)
+            _bake_buildings(theme.buildings, width, height, int(height * 0.2), col, _BAKE_LIT.get(theme.buildings, lit), put)
         self.rows = [r[:] for r in self.sky]
         self.stars = []
         for _ in range(int(width * height * theme.star_density * 3) + 8):
@@ -1541,6 +1851,27 @@ class Scenery:
             self._draw_lavaglow(canvas, t)
         elif fx == "rift":
             self._draw_rift(canvas, t)
+        elif fx == "plankton":
+            self._draw_jellies(canvas, t)
+
+    def _draw_jellies(self, canvas: PixelCanvas, t: float) -> None:
+        """Mariana Deep: pale jellyfish drifting up through the water, bells pulsing, tendrils trailing."""
+        w, h = self.w, self.h
+        sb = lambda x, y, c, a: self._sky_blend(canvas, x, y, c, a)
+        for j, (xf, sz, spd, col) in enumerate(((0.22, 1.0, 1.0, (255, 150, 220)), (0.7, 0.8, 1.3, (140, 220, 255)), (0.48, 0.55, 1.7, (190, 255, 210)))):
+            y = ((t * spd * 2.2 + j * h * 0.5) % (h * 1.2)) - h * 0.1          # y up
+            x = w * xf + math.sin(t * 0.5 + j) * 4
+            pulse = 0.5 + 0.5 * math.sin(t * 2.3 + j)
+            rx, ry = 6 * sz * (1 + 0.15 * pulse), 4 * sz * (1 - 0.12 * pulse)
+            for k in range(7):
+                tx = x + (k - 3) * rx * 0.28
+                for s in range(int(16 * sz)):
+                    sb(tx + math.sin(s * 0.3 - t * 2 + k) * 1.1, y - s, col, 0.4 * (1 - s / (16 * sz)))
+            for dy in range(0, int(ry) + 1):
+                ww = rx * math.sqrt(max(0.0, 1 - (dy / max(1, ry)) ** 2))
+                for dx in range(-int(ww), int(ww) + 1):
+                    edge = abs(dx) >= int(ww) - 1 or dy == int(ry)
+                    sb(x + dx, y + dy, mix(col, (255, 255, 255), 0.4), 0.75 if edge else 0.3)
 
     def _draw_motes(self, canvas: PixelCanvas, t: float, style: tuple) -> None:
         _, speed, pal, alpha = style
@@ -1663,6 +1994,12 @@ _MOTE_STYLES = {
     "inferno": (0.011, 14.0, ((255, 236, 150), (255, 140, 40), (220, 50, 20)), 0.9),
     "tempest": (0.010, -42.0, ((190, 220, 255), (130, 180, 240), (220, 240, 255)), 0.55),
     "rift": (0.007, 6.0, ((255, 244, 205), (160, 110, 255), (255, 255, 255)), 0.85),
+    "plankton": (0.006, 1.6, ((140, 255, 230), (110, 200, 255), (210, 170, 255)), 0.8),
+    "sakura": (0.006, -4.5, ((255, 196, 220), (255, 160, 196), (255, 230, 240)), 0.9),
+    "rain": (0.012, -48.0, ((170, 190, 240), (130, 150, 210), (200, 210, 255)), 0.55),
+    "spores": (0.006, 1.8, ((190, 255, 220), (230, 190, 255), (150, 230, 255)), 0.85),
+    "sandfall": (0.008, -7.0, ((240, 210, 160), (220, 180, 120), (255, 230, 190)), 0.7),
+    "ghostlights": (0.004, 2.0, ((150, 255, 190), (100, 230, 160), (210, 255, 230)), 0.85),
 }
 
 
@@ -1899,6 +2236,33 @@ _NEW_TANKS = (
         _N("monolith", "MONOLITH", "A slab of glowing stone and static.", "pillbox/slab/heavy", "howitzer", "storm", "static+orbit", (180, 200, 230)),
         _N("phoenix", "PHOENIX", "A bird of fire on a gilded frame.", "fin/jewel/hoverpad", "flame", "ember", "fire+embers", (255, 160, 50))]),
 )
+# --- Premium vocabulary II (uppercase material letters, see MATERIALS):
+#   J abyss hide  U biolume   F foxfire   X spirit fur   H hologram   K hardlight steel   Q hyper-wire   Z hyper-void
+#   R kaiju scale N atomic    M fungus cap S spore glow  W worm ring  O worm maw        E jade         P quetzal plume
+#   C star chart  G gold line B ghost wood L ghostfire
+_TURRETS.update({
+    "anglerlure": ("...U.......", "..JJJJJJ..."), "foxears": (".X......X..", "XXXXFXXXXX."), "kabuto": ("..K.HHH.K..", ".HHHHHHHHH."),
+    "cube": ("...QQQQQ...", "...QZZZQ..."), "dorsal": ("N..N..N..N.", "RRNRRNRRNRR"), "cap": (".MMMMMMMMM.", "MMMMMMMMMMM"),
+    "maw": ("O.O.O.O.O..", "WWOOOOOOWW."), "plume": ("P.P.PPP.P.P", ".PEEEEEEEP."), "astrolabe": ("..G.CCC.G..", ".GCCCCCCCG."),
+    "masts": ("..B..B..B..", "BBBBBBBBBB."),
+})
+_HULLS.update({
+    "abyss_h": ("JJUJJJJUJJg", "JJJJlllJJJJ"), "kitsune_h": ("XXFXXXXFXXg", "XXXXlllXXXX"), "holo_h": ("HHHHKHHHHHg", "HKHHlllHHKH"),
+    "tess_h": ("QZZZZlZZZZQ", "QQZZQQQZZQQ"), "kaiju_h": ("RRRRRRRRRlg", "RRlRRRRRlRR"), "stem_h": ("..hhShhhhg.", ".hhhhlhhhh."),
+    "wyrm_h": ("WWWWWWWWWWg", "WkWWkWWkWWW"), "jade_h": ("EEyEEEEyEEg", "EEEElllEEEE"), "zodiac_h": ("CCGCClCCGCg", "CGCCCGCCCGC"),
+    "galleon_h": ("BBBBBBBBBBg", "BLBLBLBLBLB"),
+})
+_TRACKS.update({
+    "abyss_t": ("kUkJkJkUkJk", ".kkkkkkkkk."), "spirit_t": ("F.F.F.F.F.F", ".F.F.F.F.F."), "holo_t": ("kHkHkHkHkHk", "kkkkkkkkkkk"),
+    "phase_t": ("..Q.....Q..", ".QQQ...QQQ."), "claw_t": ("RkRkRkRkRkR", "kRkkkkkkkRk"), "root_t": (".k.k.k.k.k.", "kkSkkkkkSkk"),
+    "burrow_t": ("WWWWWWWWWWW", ".W.W.W.W.W."), "serpent_t": ("EkEkEkEkEkE", ".kkkkkkkkk."), "orbit_t": ("..C.....C..", ".CCC...CCC."),
+    "keel_t": (".BBBBBBBBB.", "..LLLLLLL.."),
+})
+assert all(len(r) == 11 for part in (_TURRETS, _HULLS, _TRACKS) for rows in part.values() for r in rows) \
+    and all(len(rows) == 2 for part in (_TURRETS, _HULLS, _TRACKS) for rows in part.values())
+PREMIUM_PARTS = PREMIUM_PARTS | {"anglerlure", "foxears", "kabuto", "cube", "dorsal", "cap", "maw", "plume", "astrolabe", "masts",
+                                 "abyss_h", "kitsune_h", "holo_h", "tess_h", "kaiju_h", "stem_h", "wyrm_h", "jade_h", "zodiac_h", "galleon_h",
+                                 "abyss_t", "spirit_t", "holo_t", "phase_t", "claw_t", "root_t", "burrow_t", "serpent_t", "orbit_t", "keel_t"}
 # The premium tier: intrinsic designs built from the premium component set (crystal, furnace, void, storm, clockwork).
 _PREMIUM_TANKS = _tanks([
     _N("prismatic_king", "PRISMATIC KING", "Grown from a single crystal: every facet splits the light.", "crystal/crystal_h/crystal_t", "crystal",
@@ -1911,6 +2275,27 @@ _PREMIUM_TANKS = _tanks([
        (160, 220, 255), {"paint": (52, 72, 128)}),
     _N("chronos", "CHRONOS", "A clockwork of gold that never stops turning.", "clock/chrono_h/gold_t", "coil", "gold", "orbit+sparkle",
        (255, 230, 140), {"paint": (150, 112, 40)}),
+    # --- premium II: ten new legends, each with its own materials, gun, glow and aura ---------------------------------
+    _N("luminary", "LUMINARY", "An abyssal angler. A living lure glows over a hide of cold deep water.", "anglerlure/abyss_h/abyss_t",
+       "lure", "biolume", "lure+bubbles", (120, 255, 235), {"paint": (14, 34, 66)}),
+    _N("kitsune", "KITSUNE", "A nine-tailed fox spirit floating on blue foxfire.", "foxears/kitsune_h/spirit_t", "spirit", "foxfire",
+       "tails+foxfire", (150, 205, 255), {"paint": (236, 232, 246), "hover": 2.5}),
+    _N("holoronin", "HOLO RONIN", "A masterless samurai woven from hard light. It glitches when it moves.", "kabuto/holo_h/holo_t", "katana",
+       "hologlitch", "scanlines+bits", (90, 240, 255), {"paint": (20, 30, 64)}),
+    _N("tesseract", "TESSERACT", "A four-dimensional cube folded into a tank. Do not stare at it.", "cube/tess_h/phase_t", "tesseract", "phase",
+       "hypercube", (190, 150, 255), {"paint": (10, 8, 30), "hover": 4.0}),
+    _N("kaiju", "KAIJU", "An atomic monster in armour. Its dorsal plates glow before it roars.", "dorsal/kaiju_h/claw_t", "atomic", "atomic",
+       "radiation", (130, 205, 255), {"paint": (40, 58, 50)}),
+    _N("sporeking", "SPOREKING", "A walking mushroom grove that breathes glowing spores.", "cap/stem_h/root_t", "fungal", "spore", "spores",
+       (130, 255, 200), {"paint": (214, 204, 184)}),
+    _N("sandwyrm", "SANDWYRM", "A great worm of the deep desert, ringed and ravenous.", "maw/wyrm_h/burrow_t", "wyrm", "maw", "sand+embers",
+       (255, 170, 80), {"paint": (176, 128, 72)}),
+    _N("quetzal", "QUETZAL", "A feathered serpent of jade and gold, crowned in plumes.", "plume/jade_h/serpent_t", "serpent", "jade",
+       "feathers+glyphs", (120, 255, 170), {"paint": (28, 108, 80)}),
+    _N("zodiac", "ZODIAC", "An astrolabe of brass and starlight that reads your fortune.", "astrolabe/zodiac_h/orbit_t", "astrolabe", "zodiac",
+       "constellation+sparkle", (255, 226, 150), {"paint": (16, 22, 64), "hover": 3.0}),
+    _N("wraithship", "WRAITHSHIP", "A ghost galleon sailing on its own fog, cannons lit with green fire.", "masts/galleon_h/keel_t",
+       "broadside", "ghost", "sails+ghostfire+mist", (120, 255, 170), {"paint": (38, 58, 62), "hover": 3.0}),
 ])
 SHOP_DESIGNS: tuple[TankDesign, ...] = (_SHOP_BASE_DESIGNS[0:5] + _NEW_TANKS[0] + _SHOP_BASE_DESIGNS[5:10] + _NEW_TANKS[1]
                                         + _SHOP_BASE_DESIGNS[10:15] + _NEW_TANKS[2] + _SHOP_BASE_DESIGNS[15:20] + _NEW_TANKS[3] + _PREMIUM_TANKS)
@@ -1965,7 +2350,7 @@ ANCIENT_DESIGNS: tuple[TankDesign, ...] = (
 ALL_DESIGNS = DESIGNS + SHOP_DESIGNS + MISSION_DESIGNS + TICKET_DESIGNS + SECRET_DESIGNS + ANCIENT_DESIGNS
 assert all(len(d.mask) == TANK_H and all(len(r) == TANK_W for r in d.mask) for d in ALL_DESIGNS)
 assert len(DESIGNS) == 25 and DESIGNS[-1].key == "sovereign"          # 5 starters + 20 Tournament unlocks
-assert len({d.key for d in ALL_DESIGNS}) == len(ALL_DESIGNS) and len(SHOP_DESIGNS) == 65
+assert len({d.key for d in ALL_DESIGNS}) == len(ALL_DESIGNS) and len(SHOP_DESIGNS) == 75
 DESIGN_BY_KEY = {d.key: d for d in ALL_DESIGNS}
 DEFAULT_DESIGN = DESIGNS[0]
 BASE_KITS = 5     # the first five designs / ammo types are available from the start
@@ -2015,7 +2400,7 @@ AMMOS: tuple[AmmoType, ...] = (          # first five: starters; then one per To
 )
 SECRET_AMMOS: tuple[AmmoType, ...] = (
     AmmoType("glyph", "GLYPH", "Cycling ASCII character, raining code.", "glyph", "code", "code"),
-    AmmoType("blessing", "MARTYR'S BLESSING", "An impossible blessing inherited from the Martyr. Land a direct hit and time fractures, stars multiply, and the battlefield receives its final judgment.",
+    AmmoType("blessing", "MARTYR'S BLESSING", "The Martyr's last power. Land a direct hit and time fractures, stars multiply and the battlefield is judged.",
              "blessing", "blessing", "blessing"),        # no `mech`: its power is the ONE-SHOT KILL handled in BattleScene (see BlessingFX)
 )
 BLESSING_KEY = "blessing"
@@ -2107,6 +2492,27 @@ _PREMIUM_AMMOS = _ammos([
     _A("armageddon", "ARMAGEDDON", "Twelve shells from the sky.", "sun", "fire", "nova", (("apex", ("split", 12, 1.6)), ("subr", 0.7))),
     _A("tectonic", "TECTONIC FURY", "A fissure that races across the land.", "lava", "lava", "magma", (("terrain", "trench"), ("radius", 1.8), ("chain", 10), ("cstep", 9.0), ("cr", 0.75))),
     _A("quantumecho", "QUANTUM ECHO", "Six impossible bounces, then a cluster.", "helix", "prism", "bloom", (("bounce", 6), ("br", 0.6), ("radius", 1.0), ("cluster", 4))),
+    # --- premium II ----------------------------------------------------------------------------------------------------
+    _A("anglerlure", "ANGLER'S LURE", "A glowing lure that bends toward the nearest enemy at the top of its arc.", "lure", "biolume", "biolume",
+       (("seek", 0.5), ("radius", 1.1))),
+    _A("foxfire", "FOXFIRE", "Bursts into nine spirit wisps that curl down toward your foe.", "foxfire", "foxfire", "foxfire",
+       (("apex", ("split", 9, 1.1)), ("seek", 0.16), ("subr", 0.4))),
+    _A("hardlight", "HARDLIGHT LANCE", "A near-straight beam that ignores wind and pierces deep into the ground.", "lance", "hardlight", "hardlight",
+       (("g", 0.22), ("wind", 0.0), ("speed", 1.2), ("pierce", 3), ("pstep", 5.0), ("radius", 0.9))),
+    _A("paradox", "PARADOX", "At the top of its arc a mirror twin splits off across the centre line.", "paradox", "paradox", "paradox",
+       (("apex", ("mirror",)), ("radius", 1.1))),
+    _A("atomicbreath", "ATOMIC BREATH", "A roaring blast that hurls every tank in reach away from it.", "atomic", "atomic", "atomic",
+       (("push", 12.0), ("radius", 1.7), ("multi", 1))),
+    _A("sporebloom", "SPORE BLOOM", "Grows a mushroom mound, then bursts it into six spore bombs.", "spore", "spores", "spore",
+       (("terrain", "mound"), ("radius", 1.1), ("cluster", 6), ("cspace", 6.5), ("cr", 0.55), ("cdelay", 1.1))),
+    _A("burrower", "BURROWER", "Dives into the sand and erupts beneath the first enemy ahead.", "worm", "sand", "eruption",
+       (("burrow", 30.0), ("radius", 1.3))),
+    _A("serpent", "SERPENT", "Lands, then slithers up to three hops toward the nearest enemy.", "serpent", "feathers", "jade",
+       (("slither", 3), ("radius", 0.9))),
+    _A("constellation", "CONSTELLATION", "Calls five stars down in a ring around the impact.", "astro", "constellation", "zodiac",
+       (("stars", 5), ("radius", 0.9))),
+    _A("broadside", "BROADSIDE", "A ghost galleon's volley: three cannonballs at once - short, true, long.", "cannonball", "ghostfire", "ghostfire",
+       (("volley", 3), ("radius", 0.8))),
 ])
 SHOP_AMMOS: tuple[AmmoType, ...] = (_SHOP_BASE_AMMOS[0:5] + _NEW_AMMOS[0] + _SHOP_BASE_AMMOS[5:10] + _NEW_AMMOS[1]
                                     + _SHOP_BASE_AMMOS[10:15] + _NEW_AMMOS[2] + _SHOP_BASE_AMMOS[15:20] + _NEW_AMMOS[3] + _PREMIUM_AMMOS)
@@ -2135,7 +2541,7 @@ ANCIENT_AMMOS: tuple[AmmoType, ...] = _ammos([
        (("apex", ("jump", 26.0)), ("fuse", 0.9), ("fr", 1.9), ("radius", 1.1))),
 ])
 ALL_AMMOS = AMMOS + SHOP_AMMOS + MISSION_AMMOS + TICKET_AMMOS + SECRET_AMMOS + ANCIENT_AMMOS
-assert len(AMMOS) == 25 and AMMOS[-1].key == "aurora" and len(SHOP_AMMOS) == 65
+assert len(AMMOS) == 25 and AMMOS[-1].key == "aurora" and len(SHOP_AMMOS) == 75
 assert len({a.key for a in ALL_AMMOS}) == len(ALL_AMMOS)
 AMMO_BY_KEY = {a.key: a for a in ALL_AMMOS}
 DEFAULT_AMMO = AMMOS[0]
@@ -2304,6 +2710,10 @@ BARRELS: dict[str, BarrelSpec] = {
     "void": BarrelSpec((0.0,), 8.0, "void"), "bolt": BarrelSpec((-0.6, 0.6), 8.0, "bolt"),
     "sunlance": BarrelSpec((0.0,), 10.0, "flame"), "umbra": BarrelSpec((-0.6, 0.6), 9.0, "void"), "gale": BarrelSpec((-1.2, 0.0, 1.2), 8.5, "coil"),
     "magmacannon": BarrelSpec((-0.5, 0.5), 8.5, "flame"), "ancient": BarrelSpec((-0.9, 0.0, 0.9), 9.5, "rune"),
+    "lure": BarrelSpec((0.0,), 8.0, "biolume"), "spirit": BarrelSpec((0.0,), 9.0, "spirit"), "katana": BarrelSpec((0.0,), 11.0, "hardlight"),
+    "tesseract": BarrelSpec((-0.8, 0.8), 8.5, "tesseract"), "atomic": BarrelSpec((-0.6, 0.0, 0.6), 8.0, "atomic"),
+    "fungal": BarrelSpec((0.0,), 7.0, "fungal"), "wyrm": BarrelSpec((-0.5, 0.5), 7.5, "maw"), "serpent": BarrelSpec((0.0,), 9.5, "serpent"),
+    "astrolabe": BarrelSpec((-1.0, 0.0, 1.0), 8.5, "astrolabe"), "broadside": BarrelSpec((-1.2, 0.0, 1.2), 6.5, "ghostfire"),
 }
 
 
@@ -2348,6 +2758,27 @@ def barrel_color(style: str, base: RGB, accent: RGB, t: float, d: float, lane: i
         return mix((20, 10, 40), (170, 90, 255), 0.5 + 0.5 * math.sin(d * 1.3 - t * 6))
     if style == "bolt":
         return (235, 245, 255) if _flick(t, int(d * 2), lane) > 0.8 else mix(base, accent, 0.5)
+    if style == "biolume":                                   # cold light pulsing up the stalk
+        return mix((16, 40, 70), (140, 255, 240), 0.15 + 0.85 * max(0.0, math.sin(d * 1.6 - t * 7)) ** 3)
+    if style == "spirit":
+        k = clamp(d / 9.0 + 0.25 * math.sin(t * 17 + d * 2.6), 0, 1)
+        return gradient(((0, (236, 232, 246)), (0.5, (110, 170, 255)), (1, (230, 248, 255))), k)
+    if style == "hardlight":                                 # a blade of light: white core, cyan edge, a glint running out
+        return (255, 255, 255) if int(d * 2 - t * 22) % 7 == 0 else ((200, 250, 255) if lane == 0 and d > 1.5 else (90, 220, 255))
+    if style == "tesseract":
+        return hsv(0.72 + 0.08 * math.sin(d * 0.9 - t * 3 + lane * 2), 0.5, 1.0) if int(d * 2 + t * 6) % 4 else (255, 255, 255)
+    if style == "atomic":
+        return mix((40, 80, 160), (225, 245, 255), max(0.0, math.sin(d * 0.9 - t * 8 + lane)) ** 2)
+    if style == "fungal":
+        return mix((206, 196, 176), (120, 255, 190), 0.5 + 0.5 * math.sin(d * 1.3 - t * 2.4))
+    if style == "maw":
+        return gradient(((0, (150, 104, 60)), (0.6, (226, 120, 50)), (1, (255, 214, 140))), clamp(d / 7.5 + 0.15 * math.sin(t * 9 + d), 0, 1))
+    if style == "serpent":
+        return (244, 206, 110) if int(d * 2) % 3 == 0 else mix((24, 112, 78), (100, 220, 160), 0.5 + 0.5 * math.sin(d - t * 4))
+    if style == "astrolabe":
+        return (255, 250, 220) if _flick(t * 0.6, int(d * 2), lane + 7) > 0.88 else mix((150, 110, 50), (240, 206, 120), 0.5 + 0.5 * math.sin(d * 1.2 + t))
+    if style == "ghostfire":
+        return mix((34, 60, 56), (130, 255, 180), clamp(0.3 + 0.7 * math.sin(d * 1.8 - t * 6 + lane * 1.7), 0, 1))
     return base
 
 
@@ -2419,11 +2850,122 @@ def _mat_chrono(body, a, t, c, r, f):
 
 MATERIALS.update({"o": _mat_solar, "r": _mat_rune, "s": _mat_star, "n": _mat_night, "m": _mat_aether, "z": _mat_chrono})
 
+
+def _mat_abyss(body, a, t, c, r, f):          # deep-water hide: caustic light rippling over dark blue
+    return mix((8, 20, 46), (34, 78, 126), 0.5 + 0.5 * math.sin(t * 1.3 + c * 0.7 + r * 1.1) * math.sin(t * 0.7 - c * 0.4))
+
+
+def _mat_biolume(body, a, t, c, r, f):        # bioluminescent spots: a slow wave of light, a rare white flash
+    if _flick(t * 0.5, c * 3 + r, 29) > 0.96:
+        return (240, 255, 255)
+    return mix((18, 80, 130), (140, 255, 236), 0.5 + 0.5 * math.sin(t * 4 - c * 0.9 + r))
+
+
+def _mat_foxfire(body, a, t, c, r, f):
+    k = clamp(0.55 + 0.45 * math.sin(t * 19 + c * 2.1 + r * 1.3) * math.sin(t * 7 + c), 0, 1)
+    return gradient(((0, (40, 60, 200)), (0.5, (90, 180, 255)), (1, (236, 250, 255))), k)
+
+
+def _mat_spirit(body, a, t, c, r, f):         # white spirit-fur with a gold sheen sweeping across
+    return mix((232, 228, 244), (255, 214, 140), 0.7 * max(0.0, 1 - abs((c + r * 1.5) - ((t * 5) % 20 - 4)) / 2.5))
+
+
+def _mat_holo(body, a, t, c, r, f):           # hard-light hologram: scanlines, shimmer and the odd magenta glitch
+    if _flick(t * 0.6, c, r + 40) > 0.95:
+        return (255, 60, 200)
+    if (int(t * 14) + r) % 6 == 0:
+        return (210, 255, 255)
+    return mix((18, 50, 100), (90, 230, 255), 0.55 + 0.3 * math.sin(t * 6 + r * 2 + c * 0.3))
+
+
+def _mat_hardsteel(body, a, t, c, r, f):      # katana steel: a glint sliding along the edge
+    return mix((150, 162, 184), (255, 255, 255), max(0.0, 1 - abs((c - r) - ((t * 9) % 22 - 5)) / 1.8))
+
+
+def _mat_wire(body, a, t, c, r, f):           # the tesseract's edges: violet light folding along the wire
+    k = max(0.0, 1 - abs((c + r) - ((t * 7) % 20 - 4)) / 2.0)
+    return mix(hsv(0.74 + 0.08 * math.sin(t * 2 + c * 0.5), 0.45, 1.0), (255, 255, 255), k)
+
+
+def _mat_hypervoid(body, a, t, c, r, f):      # the space inside the cube: dark with drifting stars
+    if _flick(t * 0.4, c * 3 + r, 23) > 0.9:
+        return (240, 236, 255)
+    return mix((6, 4, 20), (52, 22, 112), 0.5 + 0.5 * math.sin(t * 1.7 + c * 0.6 - r))
+
+
+def _mat_scales(body, a, t, c, r, f):         # kaiju scales: an armoured checker that shifts as it breathes
+    k = (c + (r % 2)) % 2
+    return mix((26, 40, 34), (78, 108, 90), 0.25 + 0.3 * k + 0.15 * math.sin(t * 1.2 + c))
+
+
+def _mat_atomic(body, a, t, c, r, f):         # dorsal plates: a charge climbing from tail to head before the roar
+    k = max(0.0, 1 - abs(c - ((t * 6) % 16 - 3)) / 2.5)
+    return mix((40, 90, 170), (220, 244, 255), 0.35 + 0.65 * k)
+
+
+def _mat_cap(body, a, t, c, r, f):            # mushroom cap: crimson-violet with glowing spots
+    if (c * 3 + r * 5) % 7 == 0:
+        return mix((255, 240, 200), (170, 255, 220), 0.5 + 0.5 * math.sin(t * 2.5 + c))
+    return mix((140, 26, 56), (206, 64, 116), 0.5 + 0.5 * math.sin(t * 1.5 + c * 0.6))
+
+
+def _mat_spore(body, a, t, c, r, f):
+    return mix((50, 170, 130), (210, 255, 226), 0.5 + 0.5 * math.sin(t * 3.3 + c * 1.7 + r))
+
+
+def _mat_worm(body, a, t, c, r, f):           # sandworm rings rippling down the body
+    return mix((112, 74, 38), (218, 174, 104), 0.5 + 0.5 * math.sin(c * 1.6 - t * 3 + r * 0.4))
+
+
+def _mat_maw(body, a, t, c, r, f):            # the furnace-hot throat
+    return gradient(((0, (90, 20, 10)), (0.6, (240, 110, 40)), (1, (255, 222, 150))), 0.5 + 0.5 * math.sin(t * 8 + c * 1.3))
+
+
+def _mat_jade(body, a, t, c, r, f):           # carved jade threaded with gold veins
+    if abs(math.sin(c * 1.3 + r * 2.1 + t * 0.6)) < 0.14:
+        return (250, 214, 120)
+    return mix((18, 104, 76), (96, 214, 156), 0.5 + 0.5 * math.sin(t * 1.1 + c * 0.5 + r))
+
+
+def _mat_plume(body, a, t, c, r, f):          # quetzal feathers: iridescent green-blue with crimson tips
+    if (c + r) % 5 == 0:
+        return mix((220, 50, 50), (255, 150, 90), 0.5 + 0.5 * math.sin(t * 3 + c))
+    return hsv(0.40 + 0.10 * math.sin(t * 1.8 + c * 0.5 + r * 0.8), 0.75, 0.95)
+
+
+def _mat_chart(body, a, t, c, r, f):          # a star chart: midnight blue, a faint grid, twinkling stars
+    if (c * 7 + r * 3) % 9 == 0:
+        return mix((140, 150, 220), (255, 250, 220), 0.5 + 0.5 * math.sin(t * 6 + c * 2))
+    return (36, 52, 120) if c % 4 == 0 else mix((12, 18, 56), (24, 34, 90), 0.5 + 0.5 * math.sin(t + c * 0.4))
+
+
+def _mat_goldline(body, a, t, c, r, f):
+    return mix((176, 136, 56), (255, 240, 180), 0.5 + 0.5 * math.sin(t * 5 + c * 1.1))
+
+
+def _mat_ghostwood(body, a, t, c, r, f):      # spectral planks, a green shimmer running along the grain
+    k = max(0.0, 1 - abs(c - ((t * 4 + r * 3) % 18 - 3)) / 3.0)
+    return mix(mix((24, 44, 46), (50, 86, 82), 0.5 + 0.5 * math.sin(c * 2.2 + r)), (120, 255, 170), 0.45 * k)
+
+
+def _mat_ghostfire(body, a, t, c, r, f):
+    k = clamp(0.5 + 0.5 * math.sin(t * 17 + c * 2.3 + r) * math.sin(t * 6 + c * 0.7), 0, 1)
+    return gradient(((0, (20, 90, 50)), (0.5, (90, 255, 150)), (1, (224, 255, 234))), k)
+
+
+MATERIALS.update({"J": _mat_abyss, "U": _mat_biolume, "F": _mat_foxfire, "X": _mat_spirit, "H": _mat_holo, "K": _mat_hardsteel,
+                  "Q": _mat_wire, "Z": _mat_hypervoid, "R": _mat_scales, "N": _mat_atomic, "M": _mat_cap, "S": _mat_spore,
+                  "W": _mat_worm, "O": _mat_maw, "E": _mat_jade, "P": _mat_plume, "C": _mat_chart, "G": _mat_goldline,
+                  "B": _mat_ghostwood, "L": _mat_ghostfire})
+
 # Glow styles recolour the 'l' pixels; ambient kinds are particle / overlay flavours (combine with '+').
 GLOW_STYLES = ("none", "pulse", "blink", "flame", "prism", "scan", "plasma", "lava", "storm", "matrix",
-               "refract", "ember", "void", "ice", "toxic", "neon", "gold", "aeon")
+               "refract", "ember", "void", "ice", "toxic", "neon", "gold", "aeon",
+               "biolume", "foxfire", "hologlitch", "phase", "atomic", "spore", "maw", "jade", "zodiac", "ghost")
 AMBIENT_KINDS = ("none", "sparks", "embers", "mist", "sparkle", "static", "frost", "flare", "bits",
-                 "smoke", "fire", "burn", "prism", "orbit", "void", "lightning", "bubbles", "petals", "halo", "glyphs", "riftmotes")
+                 "smoke", "fire", "burn", "prism", "orbit", "void", "lightning", "bubbles", "petals", "halo", "glyphs", "riftmotes",
+                 "lure", "tails", "foxfire", "scanlines", "hypercube", "radiation", "spores", "sand", "feathers", "constellation",
+                 "sails", "ghostfire")
 
 
 def _flick(t: float, a: int, b: int) -> float:
@@ -2435,6 +2977,28 @@ def _glow_color(design: TankDesign, body: RGB, t: float, idx: int) -> RGB:
     g, a = design.glow, design.accent
     if g == "aeon":
         return gradient(((0, (90, 40, 190)), (0.5, (255, 214, 120)), (1, (255, 255, 244))), 0.5 + 0.5 * math.sin(t * 3.2 + idx * 0.8))
+    if g == "biolume":
+        return mix((20, 90, 140), (160, 255, 240), max(0.0, math.sin(t * 3 - idx * 0.8)) ** 2)
+    if g == "foxfire":
+        return gradient(((0, (50, 70, 210)), (0.5, (110, 190, 255)), (1, (240, 252, 255))), 0.5 + 0.5 * math.sin(t * 15 + idx * 1.9))
+    if g == "hologlitch":
+        return (255, 70, 210) if _flick(t, idx, 31) > 0.9 else mix((40, 140, 220), (200, 255, 255), 0.5 + 0.5 * math.sin(t * 9 + idx))
+    if g == "phase":
+        return hsv(0.70 + 0.12 * math.sin(t * 2.2 + idx * 0.6), 0.55, 1.0)
+    if g == "atomic":
+        k = 0.5 + 0.5 * math.sin(t * 2.6)
+        return mix((50, 110, 210), (235, 250, 255), k ** 3)
+    if g == "spore":
+        return mix((40, 150, 110), (190, 255, 220), 0.5 + 0.5 * math.sin(t * 2 + idx * 1.4))
+    if g == "maw":
+        return gradient(((0, (120, 30, 10)), (0.6, (255, 120, 40)), (1, (255, 230, 160))), 0.5 + 0.5 * math.sin(t * 7 + idx * 1.1))
+    if g == "jade":
+        k = max(0.0, 1 - abs(idx - ((t * 5) % 15 - 2)) / 2.5)
+        return mix((40, 170, 110), (255, 226, 130), k)
+    if g == "zodiac":
+        return (255, 250, 220) if (int(t * 2) + idx) % 5 == 0 else mix((90, 110, 220), (255, 214, 130), 0.5 + 0.5 * math.sin(t * 2 + idx))
+    if g == "ghost":
+        return mix((30, 90, 60), (160, 255, 190), 0.5 + 0.5 * math.sin(t * 5 + idx * 0.9) * math.sin(t * 2.3))
     if g == "pulse":
         return mix(shade(a, 0.3), a, 0.5 + 0.5 * math.sin(t * 4 + idx))
     if g == "blink":
@@ -2578,6 +3142,104 @@ def _draw_ambient_overlay(canvas: PixelCanvas, x: float, y: float, scale: int, d
             canvas.blendf(gx, gy, design.accent, a_)
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 canvas.blendf(gx + dx, gy + dy, design.accent, a_ * 0.4)
+    if "lure" in kinds:                                      # the angler's lure: a bending stalk and a glowing bulb
+        sw = math.sin(t * 1.3) * 2.6
+        for k in range(10):
+            f = k / 9
+            canvas.blendf(x + sw * f * f * scale, y + (6 + 4.5 * f) * scale, (40, 90, 120), 0.75)
+        bx, by = x + sw * scale, y + 10.5 * scale
+        glow = 0.6 + 0.4 * math.sin(t * 4.2)
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                d = math.hypot(dx, dy)
+                if d <= 3.2:
+                    canvas.blendf(bx + dx, by + dy, (150, 255, 240) if d < 1.2 else (60, 200, 220), (1 - d / 3.4) * glow)
+        canvas.plotf(bx, by, (240, 255, 255))
+    if "tails" in kinds:                                     # nine spectral tails fanning up behind the fox
+        for i in range(9):
+            base_a = math.radians(28 + i * 15.5)
+            n_ = 12 * scale
+            for s in range(2, n_ + 1):
+                f = s / n_
+                a_ = base_a + 0.35 * math.sin(t * 2.2 + i * 0.7 + f * 2.5) * f
+                tx_, ty_ = x + math.cos(a_) * f * 11 * scale, y + 3 * scale + math.sin(a_) * f * 9.5 * scale
+                col = gradient(((0, (236, 232, 246)), (0.55, (120, 180, 255)), (1, (235, 250, 255))), f)
+                canvas.blendf(tx_, ty_, col, 0.7 * (1 - f * 0.45))
+                if f > 0.7:                                   # the tail tips flare into foxfire
+                    canvas.blendf(tx_ + math.cos(a_ + 1.6), ty_ + math.sin(a_ + 1.6), (120, 190, 255), 0.35)
+    if "foxfire" in kinds:                                   # three wisps of blue flame circling
+        for i in range(3):
+            ang = t * 1.8 + i * math.tau / 3
+            fx_, fy_ = x + math.cos(ang) * 8.5 * scale, y + 4 * scale + math.sin(ang) * 2.6 * scale
+            fl = 0.6 + 0.4 * _flick(t, i, 3)
+            canvas.blendf(fx_, fy_, (240, 252, 255), 0.95 * fl)
+            canvas.blendf(fx_, fy_ + 1, (110, 190, 255), 0.8 * fl)
+            canvas.blendf(fx_, fy_ + 2, (60, 90, 230), 0.5 * fl)
+            canvas.blendf(fx_ - 1, fy_, (90, 160, 255), 0.4 * fl)
+            canvas.blendf(fx_ + 1, fy_, (90, 160, 255), 0.4 * fl)
+    if "scanlines" in kinds:                                 # hologram scan bars rising, and the odd torn slice
+        for k in range(2):
+            sy = y + ((t * 6 + k * 4) % 9) * scale
+            for dx in range(-6 * scale, 6 * scale + 1):
+                canvas.blendf(x + dx, sy, (120, 240, 255), 0.22)
+        if _flick(t * 0.5, 7, 11) > 0.8:
+            gy = y + int(_flick(t, 3, 5) * 6) * scale
+            for dx in range(-5 * scale, 5 * scale + 1, 2):
+                canvas.blendf(x + dx + 2, gy, (255, 70, 210), 0.5)
+    if "hypercube" in kinds:                                 # a rotating tesseract: two wire cubes, joined corner to corner
+        cx_, cy_ = x, y + 4.5 * scale
+        ay, ax_ = t * 0.9, t * 0.55
+        pts = []
+        for s_ in (7.5, 4.0):
+            ring = []
+            for vx_ in (-1, 1):
+                for vy_ in (-1, 1):
+                    for vz_ in (-1, 1):
+                        X, Y, Z = vx_ * s_ * 0.5, vy_ * s_ * 0.5, vz_ * s_ * 0.5
+                        ang = ay * (1 if s_ > 5 else -1.6)
+                        X, Z = X * math.cos(ang) - Z * math.sin(ang), X * math.sin(ang) + Z * math.cos(ang)
+                        Y, Z = Y * math.cos(ax_) - Z * math.sin(ax_), Y * math.sin(ax_) + Z * math.cos(ax_)
+                        ring.append((cx_ + X * scale * 1.5, cy_ + Y * scale * 1.2))
+            pts.append(ring)
+        def _line(p, q, col, a_):
+            n_ = int(max(abs(q[0] - p[0]), abs(q[1] - p[1]))) + 1
+            for j in range(n_ + 1):
+                canvas.blendf(p[0] + (q[0] - p[0]) * j / n_, p[1] + (q[1] - p[1]) * j / n_, col, a_)
+        edges = [(i, j) for i in range(8) for j in range(i + 1, 8) if bin(i ^ j).count("1") == 1]
+        for i, j in edges:
+            _line(pts[0][i], pts[0][j], (200, 160, 255), 0.55)
+            _line(pts[1][i], pts[1][j], (255, 255, 255), 0.45)
+        for i in range(8):
+            _line(pts[0][i], pts[1][i], (140, 100, 240), 0.3)
+    if "constellation" in kinds:                             # twelve zodiac stars turning round the astrolabe, joined by gold lines
+        prev = None
+        for i in range(13):
+            ang = t * 0.4 + (i % 12) * math.tau / 12
+            rr = (9.5 + 1.2 * math.sin(i * 2.7)) * scale
+            sx, sy = x + math.cos(ang) * rr, y + 4 * scale + math.sin(ang) * rr * 0.42
+            if prev is not None:
+                for j in range(1, 6):
+                    canvas.blendf(prev[0] + (sx - prev[0]) * j / 6, prev[1] + (sy - prev[1]) * j / 6, (200, 170, 90), 0.25)
+            if i < 12:
+                tw = 0.5 + 0.5 * math.sin(t * 4 + i * 1.3)
+                canvas.blendf(sx, sy, (255, 250, 220), 0.6 + 0.4 * tw)
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    canvas.blendf(sx + dx, sy + dy, (255, 214, 130), 0.3 * tw)
+            prev = (sx, sy)
+    if "sails" in kinds:                                     # tattered spectral sails billowing on the three masts
+        for m_, h_ in ((-3, 3.5), (0, 4.5), (3, 3.5)):
+            top = y + (6 + h_) * scale
+            for k in range(int(h_ * scale) + 1):                  # the mast rising above the hull
+                canvas.blendf(x + m_ * scale, y + 6 * scale + k, (60, 100, 96), 0.9)
+            for row in range(1, int(h_ * scale)):
+                f = row / max(1, h_ * scale)
+                belly = math.sin(f * math.pi) * (0.9 + 0.5 * math.sin(t * 2 + m_)) * scale
+                w_ = max(1, int((1.8 - f * 0.6) * scale))
+                for dx in range(-w_, w_ + 1):
+                    if (dx * 7 + row * 3 + int(t * 3)) % 9 == 0:
+                        continue                                  # holes in the tattered canvas
+                    edge = abs(dx) == w_ or row == 1
+                    canvas.blendf(x + m_ * scale + dx + belly, top - row, (190, 255, 214), 0.5 if edge else 0.16)
     if "riftmotes" in kinds:                                 # light and dark sparks circling in opposition
         for i in range(8):
             ang = t * 1.5 + i * math.tau / 8
@@ -2905,6 +3567,82 @@ def draw_projectile(canvas: PixelCanvas, x: float, y: float, vx: float, vy: floa
             a_ = math.pi / 4 + k * math.pi / 2 + t * 1.5
             for s in range(3, 3 + int(3 + 3 * pulse)):
                 canvas.blendf(x + math.cos(a_) * s, y + math.sin(a_) * s, (180, 255, 220), 0.55 - s * 0.05)
+    elif style == "lure":                                    # ANGLER'S LURE: a glowing bulb on a short trailing filament
+        glow = 0.6 + 0.4 * math.sin(t * 9)
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                d = math.hypot(dx, dy)
+                if d <= 3.0:
+                    canvas.blendf(x + dx, y + dy, (150, 255, 236) if d < 1.3 else (40, 170, 210), (1 - d / 3.2) * glow)
+        for s in range(1, 6):
+            canvas.blendf(x - ux * s + math.sin(t * 6 + s) * 0.6, y - uy * s, (60, 140, 170), 0.7 - s * 0.1)
+        canvas.plotf(x, y, (240, 255, 255))
+    elif style == "foxfire":                                 # a blue flame with a white heart, licking backwards
+        for k in range(7):
+            fl = _flick(t, k, 41)
+            canvas.blendf(x - ux * k * 0.9 + (fl - 0.5) * 1.6, y - uy * k * 0.9 + k * 0.25, gradient(((0, (236, 250, 255)), (0.5, (110, 180, 255)), (1, (50, 70, 220))), k / 6), 0.95 - k * 0.11)
+        canvas.plotf(x, y, white)
+    elif style == "lance":                                   # HARDLIGHT LANCE: a long rod of light with a white tip
+        for i in range(12):
+            col = (255, 255, 255) if i < 2 else mix((150, 250, 255), (40, 140, 255), i / 12)
+            canvas.blendf(x - ux * i, y - uy * i, col, 1.0 - i / 14)
+            canvas.blendf(x - ux * i - uy * 0.9, y - uy * i + ux * 0.9, (90, 220, 255), 0.25 * (1 - i / 12))
+    elif style == "paradox":                                 # two shells half a step out of phase, swapping places
+        ph = math.sin(t * 13)
+        for sgn, col in ((1, (210, 170, 255)), (-1, (255, 255, 255))):
+            ox, oy = -uy * 1.6 * ph * sgn, ux * 1.6 * ph * sgn
+            for dx, dy in ((0, 0),) + nb:
+                canvas.blendf(x + ox + dx, y + oy + dy, col, 0.95 if (dx, dy) == (0, 0) else 0.45)
+    elif style == "atomic":                                  # a crackling blue-white core with a halo
+        for dx in range(-3, 4):
+            for dy in range(-3, 4):
+                d = math.hypot(dx, dy)
+                if d <= 3.2:
+                    canvas.blendf(x + dx, y + dy, (230, 248, 255) if d < 1.4 else (70, 140, 255), (1 - d / 3.4) * (0.8 + 0.2 * _flick(t, dx, dy)))
+        for k in range(3):
+            a_ = _flick(t, k, 13) * math.tau
+            canvas.blendf(x + math.cos(a_) * 3.5, y + math.sin(a_) * 3.5, (200, 230, 255), 0.9)
+    elif style == "spore":                                   # a pulsing spore pod trailing glowing motes
+        r_ = 1.6 + 0.4 * math.sin(t * 7)
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                d = math.hypot(dx, dy)
+                if d <= r_:
+                    canvas.blendf(x + dx, y + dy, (180, 40, 90) if d > 1.0 else (255, 220, 190), 0.95)
+        for k in range(3):
+            a_ = t * 4 + k * math.tau / 3
+            canvas.blendf(x + math.cos(a_) * 3, y + math.sin(a_) * 3, (170, 255, 210), 0.8)
+    elif style == "worm":                                    # a ringed sandworm head, maw glowing
+        for k in range(6):
+            off = math.sin(t * 12 - k * 1.1) * 1.0
+            cx_, cy_ = x - ux * k * 1.4 - uy * off, y - uy * k * 1.4 + ux * off
+            col = (255, 170, 90) if k == 0 else mix((214, 170, 100), (120, 80, 40), (k % 2) * 0.6)
+            for dx, dy in ((0, 0),) + nb:
+                canvas.blendf(cx_ + dx, cy_ + dy, col, (0.95 if (dx, dy) == (0, 0) else 0.5) * (1 - k / 8))
+    elif style == "serpent":                                 # a jade serpent head and a weaving feathered body
+        px, py = -uy, ux
+        for k in range(9):
+            off = math.sin(t * 10 - k * 0.8) * 1.6
+            col = (250, 214, 120) if k % 3 == 0 else (40, 190, 120)
+            canvas.blendf(x - ux * k + px * off, y - uy * k + py * off, col, 0.95 - k * 0.08)
+        canvas.plotf(x, y, (255, 240, 180))
+    elif style == "astro":                                   # a gold four-point star turning on a blue halo
+        for k in range(4):
+            a_ = t * 3 + k * math.pi / 2
+            for s in range(1, 4):
+                canvas.blendf(x + math.cos(a_) * s, y + math.sin(a_) * s, (255, 226, 140), 0.95 - s * 0.22)
+        for dx, dy in nb:
+            canvas.blendf(x + dx * 2, y + dy * 2, (120, 140, 255), 0.35)
+        canvas.plotf(x, y, white)
+    elif style == "cannonball":                              # an iron ball wrapped in green ghost-flame
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                d = math.hypot(dx, dy)
+                if d <= 1.5:
+                    canvas.blendf(x + dx, y + dy, (40, 50, 56), 1.0)
+                elif d <= 2.6:
+                    canvas.blendf(x + dx, y + dy, (90, 255, 160), 0.45 + 0.3 * _flick(t, dx + 3, dy + 3))
+        canvas.blendf(x - ux * 3, y - uy * 3 + 1, (140, 255, 190), 0.5)
     elif style == "helix":
         px, py = -uy, ux
         for k in range(8):
@@ -2998,6 +3736,20 @@ class ParticleSystem:
                     canvas.blend(x + dx, y + dy, col, a * 0.5)
 
 
+_PREMIUM_BLASTS = {      # second premium set: fireball palettes (core -> rim)
+    "biolume": [(0.0, (240, 255, 255)), (0.3, (150, 255, 236)), (0.6, (40, 160, 210)), (0.85, (10, 60, 110)), (1.0, (4, 20, 44))],
+    "foxfire": [(0.0, (250, 252, 255)), (0.3, (170, 210, 255)), (0.6, (70, 110, 240)), (0.85, (30, 30, 140)), (1.0, (10, 8, 50))],
+    "hardlight": [(0.0, (255, 255, 255)), (0.3, (200, 250, 255)), (0.6, (70, 200, 255)), (0.85, (20, 80, 180)), (1.0, (6, 20, 60))],
+    "paradox": [(0.0, (255, 255, 255)), (0.3, (220, 200, 255)), (0.6, (140, 90, 240)), (0.85, (50, 20, 120)), (1.0, (12, 4, 36))],
+    "atomic": [(0.0, (255, 255, 255)), (0.25, (220, 240, 255)), (0.55, (90, 160, 255)), (0.85, (30, 60, 160)), (1.0, (8, 14, 50))],
+    "spore": [(0.0, (255, 240, 220)), (0.3, (255, 160, 200)), (0.6, (170, 50, 110)), (0.85, (40, 120, 90)), (1.0, (10, 34, 26))],
+    "eruption": [(0.0, (255, 240, 200)), (0.3, (255, 180, 90)), (0.6, (200, 130, 60)), (0.85, (110, 74, 40)), (1.0, (40, 28, 18))],
+    "jade": [(0.0, (255, 250, 220)), (0.3, (180, 255, 210)), (0.6, (40, 180, 120)), (0.85, (14, 80, 56)), (1.0, (4, 26, 20))],
+    "zodiac": [(0.0, (255, 255, 240)), (0.3, (255, 226, 150)), (0.6, (120, 130, 240)), (0.85, (30, 40, 120)), (1.0, (8, 10, 40))],
+    "ghostfire": [(0.0, (230, 255, 236)), (0.3, (140, 255, 180)), (0.6, (40, 160, 100)), (0.85, (20, 60, 50)), (1.0, (6, 20, 18))],
+}
+
+
 class Explosion:
     """Expanding fireball with radial gradient, flash core and shockwave; `style` is the ammo's blast look."""
 
@@ -3033,6 +3785,8 @@ class Explosion:
             stops = [(0.0, (255, 255, 255)), (0.2, (150, 255, 215)), (0.5, (150, 100, 255)), (0.8, (70, 30, 150)), (1.0, (14, 6, 40))]
         elif style == "alien":
             stops = [(0.0, (235, 255, 240)), (0.25, (130, 255, 190)), (0.55, (80, 90, 220)), (0.85, (60, 20, 120)), (1.0, (16, 6, 36))]
+        elif style in _PREMIUM_BLASTS:
+            stops = _PREMIUM_BLASTS[style]
         else:
             stops = [(0.0, (255, 252, 238)), (0.28, mix((255, 255, 255), accent, 0.35)), (0.55, accent),
                      (0.8, shade(accent, 0.5)), (1.0, shade(accent, 0.2))]
@@ -3113,6 +3867,86 @@ class Explosion:
                 q = clamp((p - k * 0.14) / 0.7, 0, 1)
                 if 0 < q < 1:
                     self._ringline(canvas, self.radius * (0.5 + 3.0 * ease_out(q)), mix((120, 255, 190), (190, 120, 255), k / 2), (1 - q) * 0.85)
+        elif style in _PREMIUM_BLASTS:
+            self._premium2(canvas, p)
+
+    def _premium2(self, canvas: PixelCanvas, p: float) -> None:
+        """The second premium set's signature blasts (drawn over the shared fireball)."""
+        R, x, y, st = self.radius, self.x, self.y, self.style
+        if st == "biolume":                                 # a jellyfish bloom: a bell of light and trailing tendrils
+            q = ease_out(clamp(p / 0.7, 0, 1))
+            for k in range(40):
+                a_ = math.pi * k / 39
+                canvas.blendf(x + math.cos(a_) * R * 1.8 * q, y + math.sin(a_) * R * 1.3 * q, (160, 255, 236), (1 - p) * 0.8)
+            for k in range(7):
+                bx = x + (k - 3) * R * 0.5 * q
+                for s in range(int(R * 2.2 * q)):
+                    canvas.blendf(bx + math.sin(s * 0.6 + p * 9 + k) * 1.2, y - s, (90, 210, 240), (1 - p) * 0.55 * (1 - s / (R * 2.4 + 1)))
+        elif st == "foxfire":                               # nine flames rising in a circle
+            for k in range(9):
+                a_ = k * math.tau / 9 + p * 2
+                fx_, fy_ = x + math.cos(a_) * R * 1.6 * ease_out(p), y + math.sin(a_) * R * 0.7 + p * R * 1.5
+                for s in range(4):
+                    canvas.blendf(fx_, fy_ + s, gradient(((0, (240, 252, 255)), (1, (60, 80, 230))), s / 3), (1 - p) * (0.95 - s * 0.2))
+        elif st == "hardlight":                             # a vertical pillar of light and a horizontal flare line
+            q = clamp(p / 0.3, 0, 1)
+            for s in range(int(R * 5 * q)):
+                canvas.blendf(x, y + s, (255, 255, 255), (1 - p) * 0.9)
+                canvas.blendf(x - 1, y + s, (90, 230, 255), (1 - p) * 0.5)
+                canvas.blendf(x + 1, y + s, (90, 230, 255), (1 - p) * 0.5)
+            for s in range(-int(R * 3.5), int(R * 3.5) + 1):
+                canvas.blendf(x + s, y, (180, 245, 255), (1 - p) * 0.8 * (1 - abs(s) / (R * 3.6)))
+        elif st == "paradox":                               # two rings expanding in opposite directions of time
+            for k, (col, rev) in enumerate((((210, 170, 255), False), ((255, 255, 255), True))):
+                q = (1 - p) if rev else p
+                self._ringline(canvas, R * (0.4 + 2.6 * ease_out(q)), col, (1 - p) * 0.85)
+            for k in range(4):
+                a_ = k * math.pi / 2 + p * 4
+                canvas.blendf(x + math.cos(a_) * R * 2 * p, y + math.sin(a_) * R * 2 * p, (255, 255, 255), 1 - p)
+        elif st == "atomic":                                # a mushroom cloud: a rising stem and a rolling cap, a shockwave ring
+            q = ease_out(clamp(p / 0.8, 0, 1))
+            top = y + R * 3.4 * q
+            for s in range(int(R * 3.4 * q)):
+                w_ = R * (0.35 + 0.15 * math.sin(s * 0.5 + p * 8))
+                for dx in range(-int(w_), int(w_) + 1):
+                    canvas.blendf(x + dx, y + s, (170, 210, 255), (1 - p) * 0.55)
+            for dx in range(-int(R * 1.9 * q), int(R * 1.9 * q) + 1):
+                for dy in range(-int(R * 0.9 * q), int(R * 0.9 * q) + 1):
+                    if (dx / max(1, R * 1.9 * q)) ** 2 + (dy / max(1, R * 0.9 * q)) ** 2 <= 1:
+                        canvas.blendf(x + dx, top + dy, mix((240, 250, 255), (60, 110, 230), abs(dy) / max(1, R * q)), (1 - p) * 0.7)
+            self._ringline(canvas, R * (1 + 3.5 * ease_out(p)), (200, 230, 255), (1 - p) * 0.7)
+        elif st == "spore":                                 # a ring of spores drifting out and up
+            for k in range(14):
+                a_ = k * math.tau / 14
+                rr = R * (0.6 + 2.2 * ease_out(p))
+                canvas.blendf(x + math.cos(a_) * rr, y + math.sin(a_) * rr * 0.7 + p * R, (190, 255, 220) if k % 2 else (255, 200, 230), (1 - p) * 0.9)
+        elif st == "eruption":                              # a column of sand and fire bursting straight up from below
+            q = ease_out(clamp(p / 0.5, 0, 1))
+            for s in range(int(R * 4.5 * q)):
+                spread = 0.6 + s * 0.12
+                for dx in range(-int(R * spread), int(R * spread) + 1):
+                    k = s / (R * 4.5 + 1)
+                    canvas.blendf(x + dx + math.sin(s * 0.7 + p * 10) * 0.8, y + s, mix((255, 200, 120), (190, 140, 80), k), (1 - p) * (0.75 - 0.4 * k))
+        elif st == "jade":                                  # a jade serpent ring biting its own tail, gold glints
+            for k in range(36):
+                a_ = k * math.tau / 36 + p * 3
+                rr = R * (0.8 + 1.6 * ease_out(p)) * (1 + 0.08 * math.sin(k * 1.3))
+                canvas.blendf(x + math.cos(a_) * rr, y + math.sin(a_) * rr * 0.8, (250, 214, 120) if k % 6 == 0 else (60, 210, 140), (1 - p) * 0.9)
+        elif st == "zodiac":                                # a five-point star drawn in gold lines
+            q = ease_out(clamp(p / 0.4, 0, 1))
+            pts = [(x + math.cos(math.pi / 2 + k * math.tau * 2 / 5) * R * 2.2 * q, y + math.sin(math.pi / 2 + k * math.tau * 2 / 5) * R * 2.2 * q) for k in range(5)]
+            for k in range(5):
+                (x0, y0), (x1, y1) = pts[k], pts[(k + 1) % 5]
+                n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+                for j in range(n + 1):
+                    canvas.blendf(x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n, (255, 226, 140), (1 - p) * 0.85)
+                canvas.blendf(x0, y0, (255, 255, 255), 1 - p)
+        elif st == "ghostfire":                             # green ghost-flames and a skull-pale flash
+            for k in range(10):
+                a_ = k * math.tau / 10 + p * 1.5
+                bx, by = x + math.cos(a_) * R * 1.5 * ease_out(p), y + abs(math.sin(a_)) * R * 0.8
+                for s in range(5):
+                    canvas.blendf(bx + math.sin(p * 12 + k + s) * 0.6, by + s + p * R * 2, gradient(((0, (220, 255, 230)), (1, (30, 120, 60))), s / 4), (1 - p) * (0.9 - s * 0.15))
 
     def _blessing(self, canvas: PixelCanvas, p: float) -> None:        # BLESSING burst: white core, an 8-point golden star, 3 rings, orbiting stars
         R = self.radius
@@ -3453,6 +4287,47 @@ class EffectsFactory:
             ps.emit(Particle(x, y, 0, -10, l * 1.1, l * 1.1, (150, 255, 175), (8, 56, 22), alpha=0.9))
             if r.random() < 0.4:
                 ps.emit(Particle(x + r.uniform(-1, 1), y + 1, 0, -14, l, l, (80, 220, 110), (6, 40, 16), alpha=0.7))
+        elif style == "biolume":                             # slow glowing droplets that sink and fade like plankton
+            ps.emit(Particle(x, y, 0, 0, l * 1.2, l * 1.2, (150, 255, 236), (10, 50, 90), alpha=0.85))
+            if r.random() < 0.45:
+                ps.emit(Particle(x + r.uniform(-1, 1), y, r.uniform(-2, 2), r.uniform(-4, -1), l * 1.8, l * 1.8, (90, 220, 230), (10, 40, 70),
+                                 alpha=0.7, size=2 if r.random() < 0.2 else 1))
+        elif style == "foxfire":
+            ps.emit(Particle(x + r.uniform(-0.8, 0.8), y, r.uniform(-2, 2), r.uniform(3, 10), l * 0.9, l * 0.9, (180, 220, 255), (40, 50, 200),
+                             gravity=-14, alpha=0.95, size=2 if r.random() < 0.3 else 1))
+        elif style == "hardlight":                           # a hard, bright line that lingers, edged in cyan
+            ps.emit(Particle(x, y, 0, 0, l * 1.5, l * 1.5, (255, 255, 255), (30, 120, 255), alpha=0.95))
+            ps.emit(Particle(x, y + 1, 0, 0, l * 0.9, l * 0.9, (90, 230, 255), (10, 40, 120), alpha=0.5))
+        elif style == "paradox":                             # afterimages that alternate between now and then
+            c = (255, 255, 255) if n % 2 else (190, 140, 255)
+            ps.emit(Particle(x, y, 0, 0, l, l, c, (40, 20, 90), alpha=0.85))
+            if n % 5 == 0:
+                ps.emit(Particle(x, y, 0, 0, l * 1.6, l * 1.6, (150, 110, 255), (20, 10, 50), size=2, alpha=0.4))
+        elif style == "atomic":
+            ps.emit(Particle(x, y, 0, 0, l, l, (210, 240, 255), (30, 60, 160), alpha=0.9, size=2 if n % 3 == 0 else 1))
+            if r.random() < 0.5:
+                a_ = r.uniform(0, math.tau)
+                ps.emit(Particle(x, y, math.cos(a_) * 12, math.sin(a_) * 12, 0.25, 0.25, (255, 255, 255), (80, 140, 255), drag=2.0))
+        elif style == "spores":
+            ps.emit(Particle(x + r.uniform(-1, 1), y + r.uniform(-1, 1), r.uniform(-3, 3), r.uniform(-1, 4), l * 1.6, l * 1.6,
+                             (180, 255, 214), (40, 110, 90), alpha=0.75, windk=0.6))
+        elif style == "sand":
+            ps.emit(Particle(x, y, r.uniform(-3, 3), r.uniform(-2, 3), l, l, (230, 196, 130), (120, 84, 46), gravity=50, alpha=0.9))
+            if r.random() < 0.3:
+                ps.emit(Particle(x, y, r.uniform(-4, 4), r.uniform(2, 6), l * 1.4, l * 1.4, (200, 170, 120), (90, 70, 50), size=2, alpha=0.4, windk=0.8))
+        elif style == "feathers":
+            c = (60, 220, 150) if n % 3 else (230, 70, 60)
+            ps.emit(Particle(x + r.uniform(-1, 1), y, r.uniform(-3, 3), r.uniform(-4, 1), l * 1.4, l * 1.4, c, shade(c, 0.3), alpha=0.9, windk=0.7))
+        elif style == "constellation":                       # a dotted line of stars: every fourth step a bright one
+            if n % 4 == 0:
+                ps.emit(Particle(x, y, 0, 0, l * 2.0, l * 2.0, (255, 250, 220), (90, 110, 230), alpha=0.95, size=2))
+            elif n % 2 == 0:
+                ps.emit(Particle(x, y, 0, 0, l * 1.3, l * 1.3, (220, 190, 120), (40, 40, 110), alpha=0.6))
+        elif style == "ghostfire":
+            ps.emit(Particle(x + r.uniform(-0.6, 0.6), y, r.uniform(-2, 2), r.uniform(3, 10), l * 0.9, l * 0.9, (200, 255, 220), (20, 80, 50),
+                             gravity=-12, alpha=0.9, size=2 if r.random() < 0.35 else 1))
+            if r.random() < 0.3:
+                ps.emit(Particle(x, y, r.uniform(-3, 3), r.uniform(-1, 3), l * 2, l * 2, (120, 150, 140), (20, 30, 30), size=2, alpha=0.35, windk=0.8))
         elif style == "prism":
             c = hsv(t * 0.8 + n * 0.05, 0.65, 1.0)
             ps.emit(Particle(x, y, 0, 0, l * 1.1, l * 1.1, c, shade(c, 0.15), alpha=0.95))
@@ -3548,6 +4423,31 @@ class EffectsFactory:
                 self.ps.emit(Particle(x, y, math.cos(a_) * 44, math.sin(a_) * 44, 0.9, 0.9, (190, 255, 230), (110, 60, 220), alpha=0.9, drag=1.6))
         elif style == "alien":
             self._burst(x, y, self._n(40 * scale), (12, 52), (0.8, 1.6), (150, 255, 200), (110, 50, 200), gravity=-10, drag=0.8, size=2)
+        elif style == "biolume":
+            self._burst(x, y, self._n(40 * scale), (6, 30), (1.6, 2.8), (150, 255, 236), (10, 50, 90), gravity=-4, drag=0.9, alpha=0.85)
+        elif style == "foxfire":
+            self._burst(x, y, self._n(40 * scale), (10, 40), (0.7, 1.4), (200, 230, 255), (40, 50, 200), gravity=-22, drag=0.6, size=2)
+        elif style == "hardlight":
+            self._burst(x, y, self._n(34 * scale), (40, 110), (0.25, 0.5), (255, 255, 255), (40, 160, 255), gravity=0, drag=1.2)
+        elif style == "paradox":
+            self._burst(x, y, self._n(36 * scale), (20, 60), (0.6, 1.2), (255, 255, 255), (140, 90, 240), gravity=0, drag=1.4)
+            self._burst(x, y, self._n(20 * scale), (2, 10), (1.0, 1.8), (200, 170, 255), (30, 10, 70), gravity=-6, size=2, alpha=0.6)
+        elif style == "atomic":
+            self._burst(x, y, self._n(50 * scale), (30, 90), (0.5, 1.0), (230, 245, 255), (40, 80, 200), gravity=10, drag=1.0)
+            self._burst(x, y, self._n(26 * scale), (6, 22), (1.4, 2.4), (170, 200, 230), (30, 40, 70), gravity=-12, drag=0.6, size=2, alpha=0.6)
+        elif style == "spore":
+            self._burst(x, y, self._n(44 * scale), (6, 28), (1.8, 3.0), lambda: r.choice(((190, 255, 220), (255, 190, 220))), lambda: (40, 90, 70),
+                        gravity=-3, drag=0.9, alpha=0.85, windk=0.7)
+        elif style == "eruption":
+            self._burst(x, y, self._n(56 * scale), (20, 70), (0.8, 1.6), (240, 200, 130), (110, 80, 50), gravity=70, solid=True, size=2,
+                        spread=(1.2, 1.95))
+        elif style == "jade":
+            self._burst(x, y, self._n(40 * scale), (14, 50), (0.7, 1.4), lambda: r.choice(((60, 220, 150), (250, 214, 120), (230, 70, 60))),
+                        lambda: (14, 60, 40), gravity=30, drag=0.6)
+        elif style == "zodiac":
+            self._burst(x, y, self._n(36 * scale), (16, 60), (0.7, 1.5), (255, 240, 190), (60, 70, 200), gravity=-4, drag=0.9)
+        elif style == "ghostfire":
+            self._burst(x, y, self._n(44 * scale), (10, 40), (0.6, 1.3), (200, 255, 220), (20, 90, 50), gravity=-18, drag=0.6, size=2)
 
     def ambient(self, design: TankDesign, x: float, y: float, body: RGB, dt: float) -> None:
         for kind in design.ambient.split("+"):
@@ -3556,7 +4456,7 @@ class EffectsFactory:
 
     def _ambient_one(self, kind: str, x: float, y: float, body: RGB, dt: float) -> None:
         r = self.rng
-        rate = {"fire": 15.0, "burn": 15.0, "smoke": 7.0, "prism": 9.0}.get(kind, 6.0)
+        rate = {"fire": 15.0, "burn": 15.0, "smoke": 7.0, "prism": 9.0, "ghostfire": 12.0, "radiation": 9.0, "sand": 10.0}.get(kind, 6.0)
         if r.random() > dt * rate * self.settings.particle_density:
             return
         if kind == "burn":                                   # a burning machine: flames, smoke and embers together
@@ -3604,6 +4504,22 @@ class EffectsFactory:
         elif kind == "petals":
             self.ps.emit(Particle(x + r.uniform(-5, 5), y + 8, r.uniform(-5, 5), r.uniform(-6, -1), 1.8, 1.8,
                                   (255, 170, 200), (200, 80, 130), alpha=0.85, windk=0.8))
+        elif kind == "radiation":                            # blue-white atomic sparks rising off the plates
+            self.ps.emit(Particle(x + r.uniform(-5, 5), y + r.uniform(5, 8), r.uniform(-2, 2), r.uniform(8, 18), 0.9, 0.9,
+                                  (210, 240, 255), (40, 80, 170), gravity=-10, alpha=0.9))
+        elif kind == "spores":                               # glowing spores drifting up and wandering
+            self.ps.emit(Particle(x + r.uniform(-6, 6), y + r.uniform(4, 9), r.uniform(-3, 3), r.uniform(2, 6), 2.6, 2.6,
+                                  (200, 255, 220), (40, 140, 110), gravity=-1.5, alpha=0.85, windk=0.7))
+        elif kind == "sand":                                 # sand pouring off the rings
+            self.ps.emit(Particle(x + r.choice((-5, 5)) + r.uniform(-1, 1), y + r.uniform(1, 5), r.uniform(-4, 4), r.uniform(-2, 4), 0.9, 0.9,
+                                  (226, 190, 120), (130, 90, 50), gravity=40, alpha=0.8))
+        elif kind == "feathers":                             # quetzal feathers spiralling down
+            c = r.choice(((60, 220, 150), (40, 170, 210), (230, 60, 60)))
+            self.ps.emit(Particle(x + r.uniform(-5, 5), y + 9, r.uniform(-6, 6), r.uniform(-5, -1), 2.2, 2.2,
+                                  c, shade(c, 0.4), alpha=0.85, windk=0.9))
+        elif kind == "ghostfire":                            # green ghost-flame licking up from the hull
+            self.ps.emit(Particle(x + r.uniform(-5, 5), y + r.uniform(2, 5), r.uniform(-2, 2), r.uniform(10, 18), 0.6, 0.6,
+                                  (200, 255, 220), (20, 90, 50), gravity=-16, alpha=0.9, size=2 if r.random() < 0.3 else 1))
 
     def tank_debris(self, x: float, y: float, color: RGB) -> None:
         r = self.rng
@@ -3760,13 +4676,22 @@ class BattleWorld:
 
     # -- wind ----------------------------------------------------------------
     def roll_wind(self) -> None:
-        m = self.settings.wind
-        self.wind = round(self.rng.choice((-1, 1)) * self.rng.uniform(0.2, 1.0) * m, 1) if m > 0 else 0.0
+        m, lo = self.settings.wind, getattr(self.settings, "wind_min", 0.0)
+        if m <= 0:
+            self.wind = 0.0
+        elif lo > 0:
+            self.wind = round(self.rng.choice((-1, 1)) * self.rng.uniform(lo, m), 1)
+        else:
+            self.wind = round(self.rng.choice((-1, 1)) * self.rng.uniform(0.2, 1.0) * m, 1)
 
     def drift_wind(self) -> None:
-        m = self.settings.wind
+        m, lo = self.settings.wind, getattr(self.settings, "wind_min", 0.0)
         if m > 0:
-            self.wind = round(clamp(self.wind + self.rng.uniform(-0.45, 0.45) * m, -m, m), 1)
+            w = clamp(self.wind + self.rng.uniform(-0.45, 0.45) * max(m - lo, 1.0) * (1.0 if lo > 0 else m / max(m - lo, 1.0)), -m, m)
+            if lo > 0 and abs(w) < lo:                       # stay inside the band: bounce off its calm edge
+                w = math.copysign(lo + (lo - abs(w)), w or self.wind or 1.0)
+                w = clamp(w, -m, m)
+            self.wind = round(w, 1)
 
     def _make_streaks(self) -> None:
         n = max(8, self.width * self.height // 450)
@@ -3989,7 +4914,10 @@ class AIController:
         me, foe, world, wind, probe = ctx
         ang = rel if me.facing > 0 else 180 - rel
         phys = world.physics
-        launch = phys.make_launch(me.launch_origin(ang), ang, power, phys.cfg.gravity * g_scale, wind)
+        M = me.ammo.mechanics if getattr(world, "ammo_fx", True) else {}
+        launch = phys.make_launch(me.launch_origin(ang), ang, power, phys.cfg.gravity * g_scale * M.get("g", 1.0), wind * M.get("wind", 1.0))
+        if M.get("speed", 1.0) != 1.0:
+            launch = replace(launch, vx=launch.vx * M["speed"], vy=launch.vy * M["speed"])
         return phys.trace(launch, probe, dt=self.profile.sim_dt, max_time=10.0).impact
 
     @staticmethod
@@ -4298,8 +5226,8 @@ class Loadout:
 #   T + $$$      first clear of any other level                 $$       other levels, later clears
 #   $            single-player win (x difficulty)               $.5      any loss (level failed / match lost)
 # ---------------------------------------------------------------------------
-COIN_HALF, COIN_LITTLE, COIN_SOME, COIN_DECENT, COIN_LOTS = 10, 20, 50, 120, 400
-CREDITS_SOME, CREDITS_LOTS = 4, 15
+COIN_HALF, COIN_LITTLE, COIN_SOME, COIN_DECENT, COIN_LOTS = 15, 40, 120, 250, 1000
+CREDITS_SOME, CREDITS_LOTS = 6, 30
 SP_WIN_MULT = {Difficulty.EASY: 1.0, Difficulty.NORMAL: 1.25, Difficulty.HARD: 1.5, Difficulty.MASTER: 2.0}
 
 
@@ -4316,12 +5244,15 @@ def tournament_payout(level: TournamentLevel, won: bool, first: bool) -> Payout:
     if not won:
         return Payout(COIN_HALF)
     if level.is_final:
-        return Payout(COIN_LOTS, CREDITS_LOTS) if first else Payout(COIN_SOME, CREDITS_SOME)
-    return Payout(COIN_DECENT, CREDITS_SOME) if first else Payout(COIN_SOME)
+        return Payout(COIN_LOTS, CREDITS_LOTS) if first else Payout(COIN_SOME * 2, CREDITS_SOME)
+    return Payout(COIN_DECENT, CREDITS_SOME) if first else Payout(COIN_SOME, 2 if level.number > 10 else 1)    # replays now pay credits too
+
+
+SP_WIN_CREDITS = {Difficulty.EASY: 0, Difficulty.NORMAL: 0, Difficulty.HARD: 2, Difficulty.MASTER: 4}
 
 
 def match_payout(won: bool, difficulty: Difficulty) -> Payout:
-    return Payout(int(COIN_LITTLE * SP_WIN_MULT[difficulty])) if won else Payout(COIN_HALF)
+    return Payout(int(COIN_LITTLE * SP_WIN_MULT[difficulty]), SP_WIN_CREDITS[difficulty]) if won else Payout(COIN_HALF)
 
 
 # ---------------------------------------------------------------------------
@@ -4482,6 +5413,38 @@ HOME_THEMES: dict[str, HomeTheme] = {t.key: t for t in (
         (230, 255, 220), (60, 220, 150), "stardust", "ufo", "xenon", True, True, True),
 )}
 HOME_THEMES.update({t.key: t for t in (
+    _hx("GLASSDESERT", "GLASS DESERT", "Twin suns over dunes of fused glass.", ((255, 214, 150), (255, 140, 112), (96, 44, 130), (14, 6, 40)), (112, 62, 104), (36, 22, 48),
+        (150, 236, 246), "stardust", "prismatic_king", "prismrain", ("twinsuns",), True),
+    _hx("LANTERNFEST", "LANTERN FEST", "A night festival: a thousand lanterns rising.", ((255, 190, 120), (214, 84, 70), (70, 24, 56), (8, 6, 30)), (64, 24, 44), (28, 14, 22),
+        (255, 190, 100), "fireflies", "phoenix", "cataclysm", ("lanterns",), True),
+    _hx("WORLDTREE", "WORLDTREE", "A colossal tree whose veins glow with starlight.", ((150, 255, 220), (60, 190, 150), (14, 70, 70), (2, 12, 24)), (10, 54, 56), (8, 24, 28),
+        (120, 250, 180), "fireflies", "stormbringer", "maelstrom", ("worldtree",), True, True),
+    _hx("SKYWHALE", "SKY WHALE", "A sky-whale as big as a moon drifts through the stars.", ((190, 220, 255), (70, 120, 200), (20, 44, 100), (2, 6, 24)), (16, 40, 92), (8, 14, 36),
+        (170, 220, 255), "stardust", "singularity", "eventhorizon", ("whale",), True, True),
+    _hx("SHATTERLINE", "SHATTERLINE", "A fractured sky of drifting, prismatic glass.", ((255, 230, 255), (180, 120, 255), (70, 34, 140), (8, 2, 24)), (56, 28, 104), (16, 8, 40),
+        (226, 190, 255), "stardust", "chronos", "quantumecho", ("shards",), True, True),
+    # --- premium II ---------------------------------------------------------------------------------------------------
+    _hx("BIOLUME", "BIOLUME TRENCH", "The deep sea: jellyfish lanterns drifting up through the dark.", ((20, 70, 110), (10, 40, 80), (4, 18, 48), (2, 6, 20)),
+        (6, 16, 30), (4, 10, 20), (120, 255, 235), "", "luminary", "anglerlure", ("abyss",), False),
+    _hx("SPIRITSHRINE", "SPIRIT SHRINE", "Torii gates climb to a moonlit shrine. Foxfire drifts between them.", ((120, 70, 140), (70, 40, 110), (30, 20, 70), (8, 6, 30)),
+        (26, 16, 40), (16, 10, 24), (150, 200, 255), "", "kitsune", "foxfire", ("shrine",), True),
+    _hx("HOLOCITY", "HOLO CITY", "Rain, neon and holograms over a city that never sleeps.", ((170, 60, 140), (90, 30, 110), (36, 14, 70), (10, 6, 30)),
+        (8, 6, 18), (6, 4, 14), (90, 240, 255), "", "holoronin", "hardlight", ("holocity",), False),
+    _hx("TESSERACT", "THE TESSERACT", "A hypercube turning through dimensions you cannot see.", ((90, 30, 140), (40, 16, 90), (14, 6, 44), (2, 2, 14)),
+        (20, 8, 40), (12, 4, 26), (200, 160, 255), "stardust", "tesseract", "paradox", ("hyper",), True),
+    _hx("KAIJUBAY", "KAIJU BAY", "A storm, a harbour city and something enormous wading ashore.", ((120, 128, 150), (78, 88, 112), (40, 46, 68), (14, 16, 28)),
+        (12, 14, 20), (8, 10, 14), (130, 205, 255), "", "kaiju", "atomicbreath", ("kaiju",), False),
+    _hx("SHROOMGROVE", "GLOWSHROOM GROVE", "Giant glowing mushrooms breathing spores into the night.", ((40, 80, 90), (24, 50, 70), (14, 24, 50), (4, 8, 24)),
+        (14, 26, 30), (8, 16, 18), (130, 255, 200), "fireflies", "sporeking", "sporebloom", ("shrooms",), True),
+    _hx("WORMSEA", "THE DEEP DESERT", "Three moons over endless dunes. Something vast moves beneath.", ((240, 170, 110), (170, 90, 90), (70, 40, 80), (14, 10, 34)),
+        (90, 56, 40), (60, 36, 26), (255, 170, 80), "", "sandwyrm", "burrower", ("wormsea",), True),
+    _hx("JADETEMPLE", "JADE TEMPLE", "A feathered serpent circles a pyramid in the jungle.", ((255, 200, 130), (230, 140, 90), (110, 90, 120), (30, 30, 70)),
+        (20, 50, 34), (14, 34, 24), (120, 255, 170), "", "quetzal", "serpent", ("jadetemple",), False),
+    _hx("ORRERY", "THE ORRERY", "A brass astrolabe the size of the sky, turning the stars.", ((50, 50, 110), (28, 30, 80), (12, 14, 48), (2, 4, 20)),
+        (16, 18, 40), (10, 10, 26), (255, 226, 150), "", "zodiac", "constellation", ("orrery",), True),
+    _hx("GHOSTARMADA", "GHOST ARMADA", "Spectral galleons sail a sea of cloud under a green moon.", ((60, 110, 100), (30, 64, 70), (12, 30, 40), (2, 8, 16)),
+        (18, 36, 38), (10, 22, 24), (120, 255, 170), "", "wraithship", "broadside", ("armada",), True),
+
     replace(_ht("EMBERSANCTUM", "EMBER SANCTUM", "A volcanic temple above a river of fire.", ((255, 170, 70), (220, 70, 24), (90, 20, 16), (14, 4, 8)),
                 (60, 14, 12), (22, 8, 8), (255, 120, 40), (255, 150, 60), (255, 236, 170), (255, 110, 40), "inferno", "a_emberheart", "cinderfall"),
             layers=("volcano",)),
@@ -4499,7 +5462,7 @@ HOME_THEMES.update({t.key: t for t in (
                 True, False, True), layers=("hourglass",)),
     replace(_ht("ETERNAL", "ETERNAL", "The legend's own sanctum. The universe is safe. Because of you.", ((255, 250, 230), (255, 206, 110), (120, 70, 190), (4, 2, 20)),
                 (70, 40, 120), (14, 8, 30), (255, 226, 150), (255, 230, 150), (255, 255, 244), (255, 200, 90), "rift", "a_martyr", "timerift",
-                True, True, True), layers=("sanctum", "riftring", "arcane")),
+                True, True, False), layers=("sanctum",)),
 )})
 assert set(HOME_ORDER) == {"CLASSIC", "MASTER", "SECRET"} | set(HOME_THEMES) and len(HOME_ORDER) == len(set(HOME_ORDER))
 
@@ -4521,14 +5484,14 @@ class ShopItem:
 SHOP_PAGES = ("TANKS", "AMMO", "MAIN SCREEN", "MAPS", "EXTRAS")
 TIER_COLORS = ((170, 205, 175), (120, 190, 255), (255, 165, 90), (255, 206, 100), (255, 70, 140))   # tier 4 = premium
 TIER_SIZE = 15                                         # items per ordinary tier; anything after tier 3 is the premium tier
-_TIER_RANGE = ((60, 190), (200, 650), (450, 1300), (800, 2400))          # cheapest..dearest coin price inside each tier
-PREMIUM_COINS = (5000, 6500, 8000, 9500, 11000)
-PREMIUM_CREDITS = (40, 50, 60, 70, 80)
-RGB_PRICE = (1000, 14)
-PRISMATIC_PRICE = (45000, 450)        # ultra expensive: the Prismatic King's refracting crystal as paint for ANY tank and shell
-VOID_PRICE = (30000, 300)             # the Singularity's void as paint for ANY tank and shell
-TICKET_PRICE = (14000, 120)
-MARTYR_PRICE = (60000, 400)
+_TIER_RANGE = ((50, 150), (150, 450), (300, 900), (600, 1600))          # cheapest..dearest coin price inside each tier
+PREMIUM_COINS = tuple(3000 + 400 * j for j in range(15))          # 3,000 .. 8,600 coins
+PREMIUM_CREDITS = tuple(15 + 2 * j for j in range(15))            # 15 .. 43 credits
+RGB_PRICE = (800, 8)
+PRISMATIC_PRICE = (20000, 120)        # ultra expensive: the Prismatic King's refracting crystal as paint for ANY tank and shell
+VOID_PRICE = (14000, 80)             # the Singularity's void as paint for ANY tank and shell
+TICKET_PRICE = (3000, 25)
+MARTYR_PRICE = (15000, 90)
 
 
 def tier_of(index: int) -> tuple:
@@ -4540,9 +5503,9 @@ def tier_of(index: int) -> tuple:
 def tier_price(tier: int, j: int) -> tuple:
     """(coins, credits) for item j of a tier. Only master-tier (3) and premium (4) gear costs credits."""
     if tier >= 4:
-        return PREMIUM_COINS[j % 5], PREMIUM_CREDITS[j % 5]
+        return PREMIUM_COINS[min(j, len(PREMIUM_COINS) - 1)], PREMIUM_CREDITS[min(j, len(PREMIUM_CREDITS) - 1)]
     lo, hi = _TIER_RANGE[tier]
-    return int(round((lo + (hi - lo) * j / (TIER_SIZE - 1)) / 5) * 5), (10 + 2 * j if tier == 3 else 0)
+    return int(round((lo + (hi - lo) * j / (TIER_SIZE - 1)) / 5) * 5), (3 + j if tier == 3 else 0)
 
 
 def _build_shop() -> tuple[ShopItem, ...]:
@@ -4637,16 +5600,20 @@ class Mission:
 
     @property
     def first_coins(self) -> int:
-        base = 40 + 3 * self.number
+        base = 80 + 6 * self.number
         if self.kind == "rush":
             base = int(base * 1.5)
         if self.kind == "mother":
-            base += 400
+            base += 1000
         return base
 
     @property
     def repeat_coins(self) -> int:
-        return int(self.first_coins * 0.4)
+        return int(self.first_coins * 0.5)
+
+    @property
+    def first_credits(self) -> int:
+        return 25 if self.kind == "mother" else 6 if self.kind == "rush" else 2
 
 
 MISSION_REWARDS = {
@@ -4681,7 +5648,7 @@ def _build_missions() -> tuple:
         d = tier(n)
         rewards = MISSION_REWARDS.get(n, ())
         if n == 50:
-            m = Mission(n, "THE MOTHERSHIP", "mother", Difficulty.HARD, Difficulty.HARD, 1, 1, 3, 9, 3, 4, 26, 0.8,
+            m = Mission(n, "THE MOTHERSHIP", "mother", Difficulty.HARD, Difficulty.HARD, 1, 1, 3, 9, 3, 4, 24, 0.8,
                         map_key="mothership", blurb="The alien flagship and its two drones. Everything you have learned, at once.")
         elif n in _RUSH:
             lv = _RUSH[n]
@@ -4731,7 +5698,7 @@ def payout_state(level: TournamentLevel, cleared: bool) -> tuple:
 def mission_payout(m: Mission, won: bool, first: bool) -> Payout:
     if not won:
         return Payout(COIN_HALF)
-    return Payout(m.first_coins if first else m.repeat_coins)        # missions never pay credits
+    return Payout(m.first_coins, m.first_credits) if first else Payout(m.repeat_coins)    # first clears also pay a few credits
 
 
 # ---------------------------------------------------------------------------
@@ -4769,7 +5736,7 @@ TICKET_BOSSES: tuple = (
 TICKET_BOSS_BY_KEY = {b.key: b for b in TICKET_BOSSES}
 assert len(TICKET_BOSSES) == 10 and all(b.tank in DESIGN_BY_KEY and b.ammo in AMMO_BY_KEY and b.map_key in SPECIAL_MAP_BY_KEY
                                         and b.theme in HOME_THEMES for b in TICKET_BOSSES)
-TICKET_PLAYER_HP, TICKET_WIN_COINS = 6, 600
+TICKET_PLAYER_HP, TICKET_WIN_COINS, TICKET_WIN_CREDITS = 6, 2000, 10
 
 
 # ---------------------------------------------------------------------------
@@ -4779,7 +5746,7 @@ TICKET_PLAYER_HP, TICKET_WIN_COINS = 6, 600
 # ---------------------------------------------------------------------------
 CUSTOM_FMT = 1
 CUSTOM_TANK_FEE = 2500
-HOVER_COINS, HOVER_CREDITS = 25000, 50          # the very pricey HOVER upgrade for a custom tank
+HOVER_COINS, HOVER_CREDITS = 2500, 0           # HOVER doubles a custom tank's price (2,500 -> 5,000); opens after the Mothership
 CUSTOM_TANK_MAX = 24
 CUSTOM_SLOTS = ("turret", "hull", "track", "barrel", "glow", "ambient", "accent")
 CUSTOM_FALLBACK = {"turret": "dome", "hull": "plain", "track": "std", "barrel": "single", "glow": "none", "ambient": "none", "accent": "WHITE"}
@@ -5117,10 +6084,31 @@ class SaveData:
         return ((len(TOURNAMENT) in self.completed and len(MISSIONS) in self.mission_completed) or bool(self.tickets_won)
                 or bool(self.ticket_active) or self.martyr_open or self.martyr_paid or self.martyr_won)
 
+    def progress_tier(self) -> int:
+        """0 none · 1 Tournament cleared (gold) · 2 Missions cleared (green) · 3 every vault boss beaten (void) · 4 the Martyr beaten (astral + gold)."""
+        if self.martyr_won:
+            return 4
+        if self.tickets_sold_out():
+            return 3
+        if len(MISSIONS) in self.mission_completed:
+            return 2
+        return 1 if len(TOURNAMENT) in self.completed else 0
+
+    def progress_counts(self) -> dict:
+        """{'tanks': (owned, total), 'ammo': ..., 'maps': ..., 'screens': ...} for profile cards."""
+        def count(prefix: str, base: int) -> tuple:
+            us = [u for u in _UNLOCKABLES if u.uid.startswith(prefix)]
+            return base + sum(1 for u in us if self.is_unlocked(u.uid)), base + len(us)
+        return {"tanks": count("tank:", BASE_KITS), "ammo": count("ammo:", BASE_KITS), "maps": count("map:", len(MAPS)), "screens": count("theme:", 1)}
+
     def paint_ok(self, name: str, hull: bool) -> bool:
         """Animated paints need their unlock; the plain 24 colours are always fine."""
         need = PAINT_UNLOCK.get(name)
         return need is None or self.is_unlocked(need[0 if hull else 1])
+
+    def hover_open(self) -> bool:
+        """The Workshop HOVER upgrade opens once the Mothership (Mission 50) falls. Tanks already built with hover keep it."""
+        return len(MISSIONS) in self.mission_completed
 
     def workshop_open(self) -> bool:
         """The Workshop opens after Tournament level 5. Saves that already built a tank (or are past level 5) keep it."""
@@ -5203,6 +6191,8 @@ class SaveData:
         """Builds a custom tank for CUSTOM_TANK_FEE coins (+ the HOVER upgrade if asked). Returns '' on success, else the reason."""
         if len(self.custom_tanks) >= CUSTOM_TANK_MAX:
             return "WORKSHOP FULL - DELETE A TANK FIRST"
+        if hover and not self.hover_open():
+            return "HOVER OPENS AFTER YOU DEFEAT THE MOTHERSHIP"
         cost, cred = CUSTOM_TANK_FEE + (HOVER_COINS if hover else 0), HOVER_CREDITS if hover else 0
         if self.coins < cost:
             return f"NEED {cost - self.coins:,} MORE COINS"
@@ -5771,7 +6761,7 @@ class TicketSession(MatchSession):
                 save.ticket_active = ""
                 for uid in self.boss.reward_ids():
                     save.grant(uid)
-                self.payout = Payout(TICKET_WIN_COINS)
+                self.payout = Payout(TICKET_WIN_COINS, TICKET_WIN_CREDITS)
             else:
                 self.payout = Payout(COIN_HALF)
             save.earn(self.payout)
@@ -6176,8 +7166,12 @@ class AmbientBackdrop:
         x0 = r.uniform(0.05, 0.3) * w if left else r.uniform(0.7, 0.95) * w
         tx = r.uniform(0.3, 0.7) * w
         th = math.radians(r.uniform(48, 68))
-        v = math.sqrt(32 * abs(tx - x0) / math.sin(2 * th))
         y0 = self.ridge[int(x0)] + 2
+        hh = self.layer.h if self.layer is not None else 56
+        tmax = 4 * (hh - 9 - y0) / max(4.0, abs(tx - x0))              # apex = range*tan(angle)/4 must stay inside the canvas
+        if math.tan(th) > tmax:
+            th = math.atan(max(0.45, tmax))
+        v = math.sqrt(32 * abs(tx - x0) / math.sin(2 * th))
         self.shells.append({"l": Launch(x0, y0, math.copysign(v * math.cos(th), tx - x0), v * math.sin(th), 32),
                             "t": 0.0, "c": r.choice(COLOR_CHOICES)[1]})
 
@@ -6508,7 +7502,9 @@ class MasterBackdrop:
             th = self.hero_angle
             rad = math.radians(th)
             ox, oy = muzzle_point(int(self.hero_x) + 0.5, hy, th, DESIGN_BY_KEY["sovereign"], 2)
-            v = math.sqrt(32 * max(10.0, tx - ox) / max(0.2, math.sin(2 * rad)))
+            reach = max(10.0, tx - ox)
+            reach = min(reach, 4 * max(10.0, self.size[1] * 2 - 10 - oy) / max(0.3, math.tan(rad)))    # never let the arc leave the canvas
+            v = math.sqrt(32 * reach / max(0.2, math.sin(2 * rad)))
             self.shells.append({"l": Launch(ox, oy, v * math.cos(rad), v * math.sin(rad), 32.0), "t": 0.0})
             self.recoil = 0.25
             self.fx.muzzle(ox, oy, th, (255, 214, 120))
@@ -6687,6 +7683,10 @@ class SecretBackdrop:
             ang = 38 + 9 * math.sin(self.clock * 0.7)
             ox, oy = muzzle_point(11.5, 2 + visual_lift(design, self.clock, 2), ang, design, 2)
             a = math.radians(ang)
+            cap = min(getattr(self, "size", (0, 20))[1] * 2, 72) - 10
+            apex = oy + (v * math.sin(a)) ** 2 / 80
+            if apex > cap > oy:
+                v *= math.sqrt((cap - oy) / (apex - oy))
             self.shells.append({"l": Launch(ox, oy, v * math.cos(a), v * math.sin(a), 40.0), "t": 0.0})
         for s in self.shells[:]:
             s["t"] += dt
@@ -6712,7 +7712,7 @@ class SecretBackdrop:
                     ch = self.GLYPHS[(x * 7919 + y * 104729 + (tick if i < 2 else tick // 4) * 31) % len(self.GLYPHS)]
                     screen.put(x, y, ch, (205, 255, 215) if i == 0 else mix((70, 255, 120), (4, 40, 18), i / trail))
         # the hero: an ASCIIBOT on a ground strip, drawn on black and masked onto the screen
-        w, h = cols, 40
+        w, h = cols, min(rows * 2, 72)
         cv = PixelCanvas(w, h, (0, 0, 0))
         for x in range(w):
             cv.plot(x, 0, (22, 96, 48))
@@ -7030,88 +8030,871 @@ def _L_arcane(self, screen, cols, rows, t):
 
 
 def _L_sanctum(self, screen, cols, rows, t):
-    """PROTECTOR OF THE UNIVERSE: the Martyr himself (the same archmage as the cutscene) stands on the ridge before a vast turning
-    clock of the ages, six elements orbiting, god-rays fanning behind him, nebula ribbons, shooting stars and drifting isles."""
+    """PROTECTOR OF THE UNIVERSE: the Martyr (the cutscene's archmage) stands on the ridge, and above him hangs the Arcane Time
+    Machine itself (the cutscene's own artifact: a glowing hourglass wrapped in turning rune rings). A thin thread of light
+    ties the two together; three elemental orbs circle the machine and a quiet rune circle glows at his feet."""
     rc, G, V = self.rowcol, (255, 214, 100), (176, 120, 255)
-    for y in range(rows):                                            # nebula ribbons
-        for x in range(0, cols, 1):
-            v = math.sin(x * 0.045 + y * 0.14 + t * 0.25) + math.sin(x * 0.021 - y * 0.2 - t * 0.17)
-            if v > 1.0:
-                k = clamp((v - 1.0) * 0.55, 0, 0.55)
-                screen.put(x, y, "░" if k < 0.3 else "▒", mix(rc[y], mix((150, 80, 230), (255, 190, 120), 0.5 + 0.5 * math.sin(x * 0.03 + t * 0.3)), k), rc[y])
-    mx = int(cols * 0.80)
+    mx = int(cols * 0.88)
     rid = self.ridge[min(cols - 1, mx)]
-    base_y = rid * 2 + 2                                              # feet on the ridge (canvas pixels, y up)
-    cy = rows - rid - int(rows * 0.30)                                # the mage's chest, in cells
-    R = max(6, int(rows * 0.34))
-    for j in range(18):                                               # god-rays
-        a = j * math.tau / 18 + t * 0.05
-        for s in range(3, int(R * 2.4), 2):
-            x, y = mx + int(math.cos(a) * s * 2), cy + int(math.sin(a) * s)
-            if 0 <= x < cols and 0 <= y < rows - rid:
-                screen.put(x, y, "·", mix(rc[y], G, 0.55 * (1 - s / (R * 2.4))), rc[y])
-    for rr, fr, ch, col in ((1.0, 1.0, "·", G), (0.88, -1.4, "◦", V), (0.62, 2.0, "·", G)):   # the clock of the ages
-        n = int(rr * R * 12)
-        for i in range(n):
-            a = i * math.tau / n + t * 0.12 * fr
-            x, y = mx + int(math.cos(a) * rr * R * 2), cy + int(math.sin(a) * rr * R)
-            if 0 <= x < cols and 0 <= y < rows:
-                screen.put(x, y, "✧" if i % 11 == 0 else ch, col, rc[y])
-    if R >= 8:
-        for i, rn in enumerate(("XII", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI")):
-            a = i * math.tau / 12 - math.pi / 2
-            x, y = mx + int(math.cos(a) * R * 1.86) - len(rn) // 2, cy + int(math.sin(a) * R * 0.93)
-            for j, c in enumerate(rn):
-                if 0 <= x + j < cols and 0 <= y < rows:
-                    screen.put(x + j, y, c, (255, 244, 200) if (int(t * 2) % 12) == i else G, rc[y])
-    for length, spd, col in ((0.55, 0.9, G), (0.85, 0.15, (255, 255, 255))):          # sweeping hands
-        a = t * spd - math.pi / 2
-        for s in range(1, int(R * length * 2)):
-            x, y = mx + int(math.cos(a) * s), cy + int(math.sin(a) * s * 0.5)
-            if 0 <= x < cols and 0 <= y < rows:
-                screen.put(x, y, "•" if s % 3 else "◦", col, rc[y])
-    cv = PixelCanvas(cols, rows * 2, (0, 0, 0))                       # the Martyr, drawn with the cutscene's own sprite
-    sc = max(1.0, rows * 2 * 0.62 / 32.0)
-    draw_mage(cv, mx, base_y, sc, t, 1.0, True)
+    sc = clamp(rows * 2 * 0.40 / 32.0, 0.9, 2.2)                      # the mage is ~40% of the screen height
+    tm_s = clamp(rows * 2 * 0.02, 0.9, 1.6)                          # the Time Machine hangs above him
+    tcy = rows * 2 - int(rows * 2 * 0.20)                             # its centre, in canvas pixels (y up)
+    head = rid * 2 + 2 + int(32 * sc)                                 # top of the mage, canvas pixels
+    for yy in range(head + 3, tcy - int(7 * tm_s), 3):               # the thread of light between them
+        r_ = rows - 1 - yy // 2
+        if 0 <= r_ < rows - rid:
+            screen.put(mx, r_, "·", shade(mix(G, V, 0.5 + 0.5 * math.sin(yy * 0.4 - t * 3)), 0.8), rc[r_])
+    for k, col in enumerate(((255, 120, 70), (110, 190, 255), (150, 255, 170))):               # fire, water, earth orbs round the machine
+        ang = t * 0.8 + k * math.tau / 3
+        x = mx + int(math.cos(ang) * 9 * tm_s)
+        y = rows - 1 - int(tcy / 2) + int(math.sin(ang) * 3 * tm_s)
+        if 0 <= x < cols - 1 and 0 <= y < rows - rid:
+            screen.put(x, y, "●", col, rc[y])
+    cv = PixelCanvas(cols, rows * 2, (0, 0, 0))
+    draw_artifact(cv, mx, tcy, tm_s, t)
+    draw_mage(cv, mx, rid * 2 + 2, sc, t, 1.0, True)
     for r in range(rows):
-        for c in range(max(0, mx - 30), min(cols, mx + 30)):
-            a, b = cv.rows[2 * r][c], cv.rows[2 * r + 1][c]
-            if a == (0, 0, 0) and b == (0, 0, 0):
+        for c in range(max(0, mx - 34), min(cols, mx + 34)):
+            a_, b_ = cv.rows[2 * r][c], cv.rows[2 * r + 1][c]
+            if a_ == (0, 0, 0) and b_ == (0, 0, 0):
                 continue
             bgc = screen.back[r][c][2]
-            screen.back[r][c] = ("▀", bgc if a == (0, 0, 0) else a, bgc if b == (0, 0, 0) else b)
-    gy = rows - rid                                                   # runic circle at his feet
-    for i in range(60):
-        a = i * math.tau / 60 - t * 0.4
-        x, y = mx + int(math.cos(a) * 15), gy + int(math.sin(a) * 1.4)
+            screen.back[r][c] = ("▀", bgc if a_ == (0, 0, 0) else a_, bgc if b_ == (0, 0, 0) else b_)
+    gy = rows - rid                                                   # a quiet rune circle at his feet
+    for i in range(36):
+        ang = i * math.tau / 36 - t * 0.35
+        x, y = mx + int(math.cos(ang) * 11), gy + int(math.sin(ang) * 1.2)
         if 0 <= x < cols and 0 <= y < rows:
-            screen.put(x, y, "✦" if i % 10 == 0 else "·", mix(G, V, 0.5 + 0.5 * math.sin(a * 3 + t)), rc[min(rows - 1, y)])
-    for k in range(5):                                                # shooting stars
-        ph = (t * 0.35 + k * 0.23) % 1.0
-        if ph < 0.45:
-            sx = int(cols * (0.06 + 0.88 * (((k * 37) % 100) / 100))) - int(ph * cols * 0.25)
-            sy = int(rows * 0.04) + int(ph * rows * 0.45)
-            for tr in range(7):
-                x, y = sx + tr * 2, sy - tr
-                if 0 <= x < cols and 0 <= y < rows:
-                    screen.put(x, y, "✦" if tr == 0 else "·", shade((255, 255, 255), 1 - tr * 0.13), rc[y])
-    for ix, iy, iw in ((0.10, 0.30, 9), (0.24, 0.17, 7), (0.63, 0.24, 8)):                   # drifting isles
-        x0 = int(cols * ix + math.sin(t * 0.4 + ix * 9) * 2)
-        y0 = int(rows * iy + math.sin(t * 0.55 + ix * 5) * 1.2)
-        for j in range(iw):
-            for dy, (ch, col) in enumerate((("▄", (120, 90, 170)), ("▀", (60, 40, 100)), ("▾", (40, 26, 76)))):
-                w = iw - dy * 2 - (0 if dy == 0 else 1)
-                if dy * 1 <= j < iw - dy * 1 and 0 <= x0 + j < cols and 0 <= y0 + dy < rows and w > 0:
-                    screen.put(x0 + j, y0 + dy, ch, col, rc[y0 + dy])
-        for j in range(iw):
-            if 0 <= x0 + j < cols and 0 <= y0 - 1 < rows and j % 2 == 0:
-                screen.put(x0 + j, y0 - 1, "‚", (130, 255, 170), rc[y0 - 1])
+            screen.put(x, y, "✦" if i % 9 == 0 else "·", shade(mix(G, V, 0.5 + 0.5 * math.sin(ang * 3 + t)), 0.8), rc[min(rows - 1, y)])
 
 
-LAYER_DRAWERS = {"sanctum": _L_sanctum, "moon": _L_moon, "sun": _L_sun, "city": _L_city, "mountains": _L_mountains, "grid": _L_grid, "ocean": _L_ocean,
+def _L_twinsuns(self, screen, cols, rows, t):
+    """GLASS DESERT: two suns of different size sinking into the same haze, with sun-pillars of light on the dune-glass."""
+    for cx_f, cy_f, r, col in ((0.26, 0.34, max(3, rows // 6), (255, 236, 176)), (0.44, 0.45, max(2, rows // 10), (255, 150, 110))):
+        _L_disc(self, screen, cols, rows, int(cols * cx_f), int(rows * cy_f), r, col)
+    for k, cx_f in enumerate((0.26, 0.44)):                                  # the sun-pillars: a slow shimmering column down to the dunes
+        x = int(cols * cx_f)
+        for y in range(int(rows * 0.5), rows - 4):
+            if (y + int(t * 6)) % 3 == 0 and 0 <= x < cols:
+                screen.put(x + int(math.sin(y * 0.5 + t * 2) * (1 + k)), y, "│", mix(self.rowcol[min(rows - 1, y)], (255, 230, 170), 0.5))
+    for i in range(14):                                                      # glints: glass catching the light
+        gx = int((i * 53 + 11) % cols)
+        gy = rows - 3 - int((i * 7) % 6)
+        if (int(t * 3) + i) % 5 == 0 and 0 <= gy < rows:
+            screen.put(gx, gy, "✦", rainbow(t * 0.7 + i * 0.3))
+
+
+def _L_lanterns(self, screen, cols, rows, t):
+    """LANTERN FEST: solid paper lanterns (red, gold, white) drifting up from the temple roofs, swaying, with soft warm halos."""
+    rc = self.rowcol
+    for i in range(30):
+        ph = (t * (0.04 + (i % 5) * 0.01) + i * 0.173) % 1.0
+        x = int((i * 37 + 9) % cols + math.sin(t * 0.8 + i) * 2)
+        y = int(rows * 0.9 - ph * rows * 0.88)
+        if not (1 <= x < cols - 3 and 2 <= y < rows - 4):
+            continue
+        glow = 0.7 + 0.3 * math.sin(t * 3 + i * 1.7)
+        base = ((255, 90, 50), (255, 190, 80), (255, 236, 200))[i % 3]
+        col = shade(base, 0.7 + 0.3 * glow)
+        for dy in (-2, -1, 0, 1, 2):                                     # soft halo
+            for dx in range(-3, 4):
+                if abs(dx) + abs(dy) * 2 <= 4 and (dx, dy) != (0, 0):
+                    cell = screen.back[y + dy][x + dx] if 0 <= y + dy < rows and 0 <= x + dx < cols else None
+                    if cell is not None:
+                        _cell(screen, x + dx, y + dy, mix(rc[y + dy], col, 0.14 * glow))
+        for dx in (0, 1):                                                # the lantern body: a solid 2x2 block with a top cap and tassel
+            _cell(screen, x + dx, y, col, "▀", mix(col, (255, 255, 255), 0.3))
+            _cell(screen, x + dx, y + 1, shade(col, 0.8), "▄", shade(col, 0.55))
+        screen.put(x, y - 1, "▂", (90, 40, 20))
+        screen.put(x, y + 2, "╵", shade(col, 0.6))
+
+
+
+def _L_worldtree(self, screen, cols, rows, t):
+    """WORLDTREE: a colossal solid trunk at the left, a canopy of glowing leaf-masses across the whole sky, veins of light pulsing
+    up the bark and petals drifting down."""
+    rc = self.rowcol
+    tx = int(cols * 0.13)
+    for y in range(0, rows - 3):
+        w_ = 5 + int((y / max(1, rows)) * 9) + int(math.sin(y * 0.5) * 1.2)
+        for dx in range(-w_, w_ + 1):
+            u = abs(dx) / max(1, w_)
+            if 0 <= tx + dx < cols:
+                _cell(screen, tx + dx, y, mix((26, 60, 50), (6, 20, 22), u ** 0.7 * 0.9 + (0.12 if (dx + y // 3) % 4 == 0 else 0)))
+        pulse = (y * 0.35 - t * 3) % 9
+        for k in range(-2, 3):
+            if pulse < 1.5 and 0 <= tx + k * 2 < cols:
+                _cell(screen, tx + k * 2 + int(math.sin(y * 0.5) * 1.5), y, mix((30, 120, 90), (150, 255, 210), 1 - pulse / 1.5))
+    for y in range(0, max(4, int(rows * 0.3))):                          # the canopy: overlapping leaf-masses
+        for x in range(0, cols):
+            v = math.sin(x * 0.16 + y * 0.9 + t * 0.15) + math.sin(x * 0.06 - y * 0.55 + 1.3) * 0.9 + math.cos(x * 0.11 + t * 0.1) * 0.5
+            if v > 0.45 - y * 0.05:
+                k = clamp((v - 0.2) / 2.2, 0, 1)
+                _cell(screen, x, y, mix(rc[y], mix((14, 90, 70), (80, 230, 160), k), 0.55 + 0.35 * k), "▒" if k > 0.5 else "░", mix((120, 255, 200), (255, 255, 255), k * 0.5))
+    for i in range(22):                                                  # glowing petals
+        ph = (t * 0.06 + i * 0.137) % 1.0
+        x = int((i * 41 + 7) % cols + math.sin(t + i) * 3)
+        y = int(ph * (rows - 4))
+        if 0 <= x < cols and 0 <= y < rows - 3:
+            screen.put(x, y, "✿" if i % 2 else "❀", mix((150, 255, 200), (255, 255, 255), 0.5 + 0.5 * math.sin(t * 4 + i)))
+
+
+
+def _L_whale(self, screen, cols, rows, t):
+    """SKY WHALE: a vast solid whale sailing slowly through the stars (belly lighter than its back, flukes sweeping, glowing spots,
+    a calf drifting far behind it)."""
+    rc = self.rowcol
+    for scale, yf, spd, off, dim in ((1.0, 0.30, 0.010, 0.25, 0.0), (0.4, 0.62, 0.016, 0.55, 0.5)):
+        L_ = max(20, int(cols * 0.98 * scale))
+        x0 = int((cols + L_) * ((off + t * spd) % 1.0) - L_)
+        cy = int(rows * yf + math.sin(t * 0.3) * 1.3)
+        for i in range(L_):
+            u = i / L_
+            hgt = max(0.0, math.sin(min(1.0, u * 1.08) * math.pi)) ** 0.7 * (rows * 0.26 * scale) * (1.0 - 0.6 * max(0.0, u - 0.7) / 0.3)
+            if u > 0.86:
+                hgt += (u - 0.86) * 20 * scale * (0.5 + 0.5 * math.sin(t * 1.6))      # the flukes sweeping
+            x = x0 + i
+            for dy in range(-int(hgt), int(hgt * 0.75) + 1):
+                if 0 <= x < cols and 0 <= cy + dy < rows - 3:
+                    f = (dy + hgt) / max(1.0, hgt * 1.75)                                 # 0 at the back, 1 at the belly
+                    col = mix((18, 34, 84), (150, 190, 235), f ** 1.5)
+                    _cell(screen, x, cy + dy, mix(rc[cy + dy], col, 1.0 - dim * 0.6))
+            if i % 6 == 0 and 0 <= x < cols and 0 <= cy - int(hgt * 0.35) < rows:
+                screen.put(x, cy - int(hgt * 0.35), "•", shade((150, 235, 255), (0.45 + 0.55 * math.sin(t * 2 + i)) * (1 - dim * 0.5)))
+            if int(hgt * 0.7) > 1 and i % 3 == 0 and 0 <= x < cols and 0 <= cy + int(hgt * 0.45) < rows:        # throat grooves
+                screen.put(x, cy + int(hgt * 0.45), "─", (170, 205, 245))
+        ex = x0 + int(L_ * 0.13)
+        if 0 <= ex < cols - 1 and 0 <= cy < rows:
+            _cell(screen, ex, cy - 1, (240, 250, 255), "●", (20, 40, 90))
+
+
+
+def _L_shards(self, screen, cols, rows, t):
+    """SHATTERLINE: big slabs of translucent glass drifting over a cracked moon; each facet flashes its own prism colour as it turns."""
+    rc = self.rowcol
+    mx_, my_ = int(cols * 0.5), int(rows * 0.34)
+    for a in range(9):                                                   # cracks radiating from the moon across the whole sky
+        ang = a * math.tau / 9 + 0.4
+        for s in range(3, int(rows * 0.62)):
+            x, y = mx_ + int(math.cos(ang) * s * 2), my_ + int(math.sin(ang) * s)
+            if 0 <= x < cols and 0 <= y < rows - 3 and (s + a) % 3:
+                screen.put(x, y, "╱" if (a % 2) else "╲", (214, 204, 255))
+    for i in range(12):
+        cx_ = int((i * 61 + 5) % cols + math.sin(t * 0.3 + i) * 3)
+        cy_ = int(rows * (0.1 + (i * 29 % 50) / 100) + math.sin(t * 0.5 + i * 2) * 1.5)
+        w_ = 5 + (i * 7) % 7
+        tilt = math.sin(t * 0.6 + i)
+        for dx in range(-w_, w_ + 1):
+            for dy in range(-2, 3):
+                if abs(dx) + abs(dy) * 3 <= w_ + 1 and 0 <= cx_ + dx < cols and 0 <= cy_ + dy < rows - 3:
+                    k = (dx * tilt * 0.25 + dy * 0.4) + t * 0.35 + i * 0.2
+                    edge = abs(dx) + abs(dy) * 3 >= w_
+                    _cell(screen, cx_ + dx, cy_ + dy, mix(rc[cy_ + dy], rainbow(k), 0.30 if not edge else 0.7),
+                          "◆" if (dx + dy + i) % 5 == 0 else " ", (255, 255, 255))
+
+
+class _Px:
+    """A half-block pixel layer over the home screen (top-down pixel coordinates, 2 pixels per text row).
+    Starts from the screen's current backgrounds so everything can be alpha-blended, and writes back only changed cells."""
+
+    def __init__(self, screen, cols: int, rows: int) -> None:
+        self.screen, self.W, self.H = screen, cols, rows * 2
+        self.rows = []
+        for r in range(rows):
+            line = [screen.back[r][c][2] for c in range(cols)]
+            self.rows.append(line)
+            self.rows.append(line[:])
+        self.base = [row[:] for row in self.rows]
+
+    def blend(self, x: float, y: float, c: RGB, a: float) -> None:
+        xi, yi = int(x), int(y)
+        if 0 <= xi < self.W and 0 <= yi < self.H and a > 0.02:
+            row = self.rows[yi]
+            row[xi] = mix(row[xi], c, min(1.0, a))
+
+    def put(self, x: float, y: float, c: RGB) -> None:
+        xi, yi = int(x), int(y)
+        if 0 <= xi < self.W and 0 <= yi < self.H:
+            self.rows[yi][xi] = c
+
+    def get(self, x: int, y: int) -> RGB:
+        return self.rows[max(0, min(self.H - 1, y))][max(0, min(self.W - 1, x))]
+
+    def line(self, x0: float, y0: float, x1: float, y1: float, c: RGB, a: float = 1.0) -> None:
+        n = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for j in range(n + 1):
+            self.blend(x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n, c, a)
+
+    def disc(self, cx: float, cy: float, r: float, c: RGB, a: float = 1.0, glow: float = 0.0, glow_c: Optional[RGB] = None) -> None:
+        R = r + glow
+        for y in range(int(cy - R) - 1, int(cy + R) + 2):
+            for x in range(int(cx - R) - 1, int(cx + R) + 2):
+                d = math.hypot(x + 0.5 - cx, y + 0.5 - cy)
+                if d <= r:
+                    self.blend(x, y, c, a)
+                elif glow and d <= R:
+                    self.blend(x, y, glow_c or c, a * 0.45 * (1 - (d - r) / glow) ** 2)
+
+    def ellipse(self, cx: float, cy: float, rx: float, ry: float, fn) -> None:
+        """fn(u, v) -> (colour, alpha) or None, with u, v in -1..1 across the ellipse."""
+        for y in range(int(cy - ry) - 1, int(cy + ry) + 2):
+            for x in range(int(cx - rx) - 1, int(cx + rx) + 2):
+                u, v = (x + 0.5 - cx) / max(0.5, rx), (y + 0.5 - cy) / max(0.5, ry)
+                if u * u + v * v <= 1.0:
+                    res = fn(u, v)
+                    if res:
+                        self.blend(x, y, res[0], res[1])
+
+    def poly(self, pts: list, c: RGB, a: float = 1.0) -> None:
+        """Filled polygon (even-odd scanline)."""
+        if len(pts) < 3:
+            return
+        y0, y1 = int(min(p[1] for p in pts)), int(max(p[1] for p in pts)) + 1
+        for y in range(max(0, y0), min(self.H, y1 + 1)):
+            yc, xs = y + 0.5, []
+            for i in range(len(pts)):
+                (ax, ay), (bx, by) = pts[i], pts[(i + 1) % len(pts)]
+                if (ay <= yc < by) or (by <= yc < ay):
+                    xs.append(ax + (yc - ay) * (bx - ax) / (by - ay))
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                for x in range(int(xs[k] + 0.5), int(xs[k + 1] + 0.5)):
+                    self.blend(x, y, c, a)
+
+    def commit(self) -> None:
+        scr = self.screen
+        q = lambda c: (c[0] & 0xFC, c[1] & 0xFC, c[2] & 0xFC)          # 6-bit channels: steadier cells, less terminal traffic
+        for r in range(self.H // 2):
+            top, bot, b0, b1 = self.rows[2 * r], self.rows[2 * r + 1], self.base[2 * r], self.base[2 * r + 1]
+            for c in range(self.W):
+                if top[c] != b0[c] or bot[c] != b1[c]:
+                    scr.back[r][c] = ("▀", q(top[c]), q(bot[c]))
+
+
+def _L_abyss(self, screen, cols, rows, t):
+    """BIOLUME TRENCH: shafts of light from a surface far above, giant jellyfish pulsing as they drift up through the
+    dark (translucent bells, radial canals, frilled arms, long tendrils), plankton, bubbles and an angler's lure below."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    for k in range(7):                                                   # god-rays swaying from the surface
+        x0 = W * (-0.05 + k * 0.17) + math.sin(t * 0.3 + k * 1.7) * 6
+        for y in range(0, int(H * 0.75)):
+            f = y / (H * 0.75)
+            xc = x0 + y * 0.45
+            w_ = 2 + f * 8
+            for dx in range(int(-w_), int(w_) + 1):
+                P.blend(xc + dx, y, (110, 210, 230), 0.13 * (1 - f) * (1 - abs(dx) / (w_ + 1)) * (0.7 + 0.3 * math.sin(t * 0.8 + k)))
+    for i in range(80):                                                  # plankton
+        x = (i * 97.3 + math.sin(t * 0.4 + i) * 4) % W
+        y = (i * 53.1 - t * (1.5 + i % 4)) % H
+        tw = 0.5 + 0.5 * math.sin(t * 3 + i * 2.1)
+        P.blend(x, y, (120, 255, 230) if i % 3 else (200, 160, 255), 0.25 + 0.6 * tw)
+    S = min(1.4, max(0.7, H / 80))
+    for j, (xf, sz, spd, hue) in enumerate(((0.13, 1.0, 1.0, (255, 130, 220)), (0.87, 1.15, 0.75, (130, 220, 255)), (0.76, 0.55, 1.4, (190, 255, 210)),
+                                            (0.25, 0.45, 1.7, (255, 210, 140)))):
+        span = H * 1.5
+        cy = H * 0.95 - ((t * spd * 2.4 + j * span * 0.31) % span) + H * 0.1
+        cx = W * xf + math.sin(t * 0.5 + j * 2) * 4
+        pulse = 0.5 + 0.5 * math.sin(t * 2.2 + j * 1.3)
+        rx, ry = 12 * sz * S * (1.0 + 0.12 * pulse), 9 * sz * S * (1.0 - 0.15 * pulse)
+        for k in range(10):                                              # long trailing tendrils
+            tx = cx + (k - 4.5) * rx * 0.19
+            ln = int(36 * sz * S)
+            for s in range(ln):
+                sw = math.sin(s * 0.2 - t * 2.0 + k) * (0.6 + s * 0.07)
+                P.blend(tx + sw, cy + ry * 0.15 + s, mix(hue, (255, 255, 255), 0.25), 0.55 * (1 - s / ln))
+        for k in range(4):                                               # frilled oral arms
+            tx = cx + (k - 1.5) * rx * 0.22
+            for s in range(int(16 * sz * S)):
+                w_ = 1.6 * (1 - s / (16 * sz * S))
+                for dw in (-1, 0, 1):
+                    P.blend(tx + math.sin(s * 0.45 + t * 2.6 + k) * 1.8 + dw * w_, cy + 1 + s, mix(hue, (255, 255, 255), 0.5), 0.5 * (1 - s / (16 * sz * S)))
+
+        def bell(u, v, hue=hue):
+            if v > 0.2:
+                return None
+            d = u * u + v * v
+            canal = 0.25 if abs(math.sin(math.atan2(v, u) * 4)) < 0.18 else 0.0
+            return (mix(hue, (255, 255, 255), 0.6 * (1 - d) + canal), 0.30 + 0.45 * d + canal)
+        P.ellipse(cx, cy, rx, ry, bell)
+        P.ellipse(cx, cy - ry * 0.25, rx * 0.45, ry * 0.4, lambda u, v, hue=hue: (mix(hue, (255, 255, 255), 0.7), 0.35 * (1 - (u * u + v * v))))
+        for k in range(30):                                              # glowing rim lights, chasing round the bell
+            a_ = math.pi + k * math.pi / 29
+            P.blend(cx + math.cos(a_) * rx, cy + math.sin(a_) * ry * 0.98 + 0.5, (255, 255, 255), 0.35 + 0.6 * max(0.0, math.sin(t * 4 - k * 0.5)))
+        for k in range(16):
+            P.blend(cx - rx + k * rx * 2 / 15, cy + ry * 0.2, mix(hue, (255, 255, 255), 0.5), 0.8)
+    for b in range(5):                                                   # bubble columns
+        bx = W * (0.04 + b * 0.23)
+        for i in range(9):
+            y = H - ((t * 9 + i * 7 + b * 13) % (H * 0.9))
+            P.disc(bx + math.sin(y * 0.3 + b) * 1.5, y, 0.6 + (i % 3) * 0.3, (200, 240, 255), 0.5)
+    lx, ly = W * 0.30 + math.sin(t * 0.6) * 3, H * 0.60 + math.sin(t * 1.1) * 2     # the angler waiting in the dark
+    P.ellipse(lx + 10, ly + 9, 15, 7, lambda u, v: ((3, 8, 18), 0.9))
+    for k in range(8):
+        P.blend(lx + 1 + k * 1.6, ly + 8 + (k % 2), (220, 230, 240), 0.75)          # needle teeth
+    P.disc(lx + 17, ly + 6, 1.0, (255, 250, 210), 0.9)                                 # a pale eye
+    for k in range(10):
+        f = k / 9
+        P.blend(lx + 8 - f * 8 + math.sin(t * 1.3) * f * f * 2, ly + 3 - f * 6, (40, 90, 110), 0.85)
+    glow = 0.7 + 0.3 * math.sin(t * 3.1)
+    P.disc(lx + math.sin(t * 1.3) * 2, ly - 4, 1.5, (210, 255, 245), glow, 6, (60, 210, 220))
+    P.commit()
+
+
+def _L_shrine(self, screen, cols, rows, t):
+    """SPIRIT SHRINE: a huge moon, a vermilion path of torii gates climbing the right-hand mountain to a lantern-lit shrine,
+    a stone lantern and a cherry tree on the left, petals on the wind and blue foxfire wisps drifting between the gates."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    mx, my, mr = W * 0.86, H * 0.20, min(W * 0.11, H * 0.17)
+    P.disc(mx, my, mr, (255, 244, 222), 1.0, mr * 1.1, (255, 214, 200))
+    for k in range(6):                                                   # moon maria
+        P.disc(mx + math.cos(k * 1.9) * mr * 0.5, my + math.sin(k * 2.7) * mr * 0.45, mr * 0.15, (236, 224, 204), 0.7)
+    for layer, (base, amp, col) in enumerate(((0.52, 0.14, (62, 42, 92)), (0.64, 0.10, (40, 26, 64)))):   # far ranges
+        pts = [(0, H)] + [(x, H * base - amp * H * (0.5 + 0.5 * math.sin(x * 0.035 + layer * 2) * math.cos(x * 0.013 + layer))) for x in range(0, W + 4, 4)] + [(W, H)]
+        P.poly(pts, col, 1.0)
+    peak_x, peak_y = W * 0.86, H * 0.36                                  # the shrine mountain on the right
+    P.poly([(W * 0.62, H), (W * 0.74, H * 0.55), (peak_x - 6, peak_y + 3), (peak_x + 6, peak_y + 3), (W * 1.02, H * 0.5), (W * 1.02, H)], (30, 18, 46), 1.0)
+    P.poly([(peak_x - 9, peak_y), (peak_x + 9, peak_y), (peak_x + 6, peak_y - 5), (peak_x - 6, peak_y - 5)], (160, 32, 30), 1.0)   # shrine roof
+    P.poly([(peak_x - 6, peak_y), (peak_x + 6, peak_y), (peak_x + 6, peak_y + 5), (peak_x - 6, peak_y + 5)], (60, 18, 22), 1.0)
+    P.disc(peak_x, peak_y + 2.5, 1.3, (255, 220, 140), 1.0, 4, (255, 170, 80))
+    gates = [(W * (0.64 + 0.046 * k), H * (0.74 - 0.066 * k), 1.0 - 0.12 * k) for k in range(5)]
+    for gx, gy, s in reversed(gates):
+        red, dark, blk = (226, 58, 40), (128, 26, 22), (28, 16, 18)
+        hw, hh = 8 * s, 15 * s
+        for side in (-1, 1):                                             # pillars
+            for y in range(int(gy - hh), int(gy) + 1):
+                P.put(gx + side * hw * 0.62, y, red)
+                if s > 0.5:
+                    P.put(gx + side * hw * 0.62 + 1, y, dark)
+        for x in range(int(gx - hw * 1.2), int(gx + hw * 1.2) + 1):    # kasagi (curved top beam) and nuki (tie beam)
+            lift = ((x - gx) / (hw * 1.2)) ** 4 * 2.4 * s
+            P.put(x, gy - hh - lift - 1, blk)
+            P.put(x, gy - hh - lift, red)
+            if abs(x - gx) <= hw * 0.85:
+                P.put(x, gy - hh + 4 * s, red)
+        P.put(gx, gy - hh + 2 * s, blk)
+    lx, ly = W * 0.14, H * 0.70                                          # a stone lantern (toro) with a living flame
+    P.poly([(lx - 6, ly), (lx + 6, ly), (lx + 4, ly - 3), (lx - 4, ly - 3)], (120, 116, 130), 1.0)
+    P.poly([(lx - 2, ly - 3), (lx + 2, ly - 3), (lx + 2, ly - 12), (lx - 2, ly - 12)], (110, 106, 120), 1.0)
+    P.poly([(lx - 5, ly - 12), (lx + 5, ly - 12), (lx + 5, ly - 18), (lx - 5, ly - 18)], (130, 126, 140), 1.0)
+    fl = 0.75 + 0.25 * math.sin(t * 9) * math.sin(t * 4)
+    P.disc(lx, ly - 15, 1.8, (255, 220, 150), fl, 6, (255, 170, 80))
+    P.poly([(lx - 8, ly - 18), (lx + 8, ly - 18), (lx + 2, ly - 23), (lx - 2, ly - 23)], (100, 96, 112), 1.0)
+    for b, (bx, by, ang, ln) in enumerate(((0, H * 0.06, 0.22, W * 0.26), (W * 0.05, H * 0.16, -0.12, W * 0.16), (W * 0.15, H * 0.10, 0.6, W * 0.07))):
+        for s in range(int(ln)):                                         # cherry branches, heavy with blossom
+            x, y = bx + s * math.cos(ang), by + s * math.sin(ang) + math.sin(s * 0.08 + b) * 3
+            P.put(x, y, (44, 24, 28))
+            if s < ln * 0.5:
+                P.put(x, y + 1, (44, 24, 28))
+            if s % 2 == 0:
+                for k in range(3):
+                    P.blend(x + math.sin(s * 1.7 + k * 2 + b) * 3, y + math.cos(s * 2.3 + k) * 2.6 - 1, (255, 176 + (s * 7 % 50), 210), 0.9)
+    for i in range(16):                                                  # foxfire wisps between the gates
+        ph = t * 0.35 + i * 0.83
+        x = W * (0.62 + (i * 0.061) % 0.36) + math.sin(ph * 2) * 4 if i % 2 else W * (0.03 + (i * 0.043) % 0.26) + math.sin(ph * 2) * 4
+        y = H * (0.38 + 0.3 * ((i * 0.37) % 1)) + math.sin(ph * 1.3) * 3
+        fl = 0.6 + 0.4 * math.sin(t * 7 + i * 2.3)
+        P.disc(x, y, 0.8, (232, 246, 255), fl, 3, (80, 140, 255))
+        P.blend(x, y + 1.5, (100, 160, 255), 0.5 * fl)
+    for i in range(40):                                                  # petals on the wind
+        x = (i * 41.7 + t * (5 + i % 3) + math.sin(t + i) * 6) % W
+        y = (i * 23.3 + t * (6 + i % 4)) % H
+        P.blend(x, y, (255, 194, 218), 0.85)
+        P.blend(x + 1, y, (255, 150, 190), 0.4)
+    P.commit()
+
+
+def _L_holocity(self, screen, cols, rows, t):
+    """HOLO CITY: a rain-soaked megacity: three depths of towers with flickering windows, enormous scrolling hologram
+    billboards, a hologram koi swimming between the spires, and streams of flying traffic."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    r = random.Random(77)
+    for depth, (col, lit, hmin, hmax, wmin, wmax) in enumerate((((44, 24, 70), (120, 80, 160), 0.25, 0.5, 6, 12),
+                                                                ((26, 14, 46), (255, 120, 220), 0.3, 0.65, 8, 16),
+                                                                ((12, 8, 24), (90, 230, 255), 0.35, 0.8, 10, 20))):
+        x = -r.randint(0, 6)
+        while x < W:
+            bw, bh = r.randint(wmin, wmax), H * r.uniform(hmin, hmax)
+            top = H - bh
+            P.poly([(x, H), (x + bw, H), (x + bw, top), (x, top)], col, 1.0)
+            if r.random() < 0.4:
+                P.line(x + bw // 2, top, x + bw // 2, top - r.randint(4, 10), col, 1.0)
+                if (int(t * 2) + x) % 3:
+                    P.blend(x + bw // 2, top - 10, (255, 60, 80), 1.0)
+            for wy in range(int(top) + 3, H - 2, 3):
+                for wx in range(x + 2, x + bw - 1, 3):
+                    seed = (wx * 31 + wy * 17 + depth) % 97
+                    if seed % 3 == 0 and (seed + int(t * 0.5 + seed)) % 11:
+                        P.blend(wx, wy, lit, 0.35 + depth * 0.15)
+            x += bw + r.randint(1, 4)
+    for j, (bx, by, bw, bh, c1, c2) in enumerate(((W * 0.08, H * 0.18, 22, 26, (90, 230, 255), (255, 70, 210)),
+                                                   (W * 0.78, H * 0.30, 26, 18, (255, 70, 210), (255, 220, 90)))):
+        for y in range(int(bh)):                                         # hologram billboards: scrolling glyph columns
+            for x in range(int(bw)):
+                g = (x // 3 * 7 + (y + int(t * 8 * (1 + j))) // 3 * 13) % 9
+                on = g < 4 and x % 3 != 2 and y % 3 != 2
+                scan = 0.25 if (y + int(t * 20)) % 5 == 0 else 0.0
+                if on or scan:
+                    P.blend(bx + x, by + y, c1 if (x // 6 + j) % 2 else c2, (0.55 if on else 0) + scan)
+        for x in range(int(bw) + 2):
+            P.blend(bx - 1 + x, by - 1, c1, 0.8)
+            P.blend(bx - 1 + x, by + bh, c1, 0.8)
+    kx, ky = W * 0.5 + math.sin(t * 0.35) * W * 0.22, H * 0.22 + math.sin(t * 0.7) * 6     # the hologram koi
+    head = math.copysign(1, math.cos(t * 0.35))
+    for s in range(26):
+        f = s / 25
+        x = kx - head * s * 1.2
+        y = ky + math.sin(t * 3 - s * 0.35) * 2.5 * f
+        w_ = 4.5 * math.sin(min(1, f * 1.4 + 0.15) * math.pi) + (3 * f if f > 0.85 else 0)
+        for dy in range(-int(w_), int(w_) + 1):
+            glitch = 2 if (int(t * 6) + s) % 23 == 0 else 0
+            P.blend(x + glitch, y + dy, (255, 120, 80) if (s // 4) % 2 else (240, 250, 255), 0.45 if abs(dy) < w_ - 1 else 0.8)
+    for lane in range(4):                                                # flying traffic
+        y = H * (0.25 + lane * 0.1)
+        for car in range(5):
+            spd = (14 + lane * 5) * (1 if lane % 2 else -1)
+            x = (car * W / 5 + t * spd) % (W + 20) - 10
+            col = (255, 240, 220) if spd > 0 else (255, 60, 60)
+            for k in range(7):
+                P.blend(x - math.copysign(k, spd), y, col, 0.9 - k * 0.12)
+    for i in range(90):                                                  # rain
+        x = (i * 37.1 + t * 18) % W
+        y = (i * 61.7 + t * 70) % H
+        P.blend(x, y, (150, 170, 220), 0.35)
+        P.blend(x - 0.5, y - 1, (150, 170, 220), 0.25)
+    P.commit()
+
+
+def _L_hyper(self, screen, cols, rows, t):
+    """THE TESSERACT: a true four-dimensional hypercube turning through two planes at once, its far cell bleeding violet
+    and its near cell white-hot, over a receding light-grid and a slow nebula."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    for k in range(3):                                                   # nebula clouds
+        cx, cy = W * (0.2 + k * 0.33), H * (0.25 + 0.08 * k)
+        P.ellipse(cx + math.sin(t * 0.1 + k) * 6, cy, W * 0.18, H * 0.12, lambda u, v, k=k: (((90, 40, 170), (40, 90, 190), (170, 50, 140))[k], 0.18 * (1 - (u * u + v * v))))
+    hz = int(H * 0.58)                                                   # synth grid floor
+    for i in range(-16, 17):
+        P.line(W / 2 + i * 3, hz, W / 2 + i * W * 0.09, H, (170, 90, 255), 0.35)
+    for j in range(1, 12):
+        y = hz + (H - hz) * ((j + (t * 0.6) % 1) / 12) ** 2
+        for x in range(W):
+            P.blend(x, y, (200, 110, 255), 0.35)
+    P.line(0, hz, W, hz, (255, 160, 255), 0.7)
+    cx, cy, S = W * 0.84, H * 0.36, min(W * 0.085, H * 0.16)
+    a, b = t * 0.45, t * 0.31
+    verts = []
+    for i in range(16):
+        v = [(1 if i >> k & 1 else -1) for k in range(4)]
+        x, y, z, w = v
+        x, w = x * math.cos(a) - w * math.sin(a), x * math.sin(a) + w * math.cos(a)        # rotate in XW
+        y, z = y * math.cos(b) - z * math.sin(b), y * math.sin(b) + z * math.cos(b)        # and YZ
+        z, w = z * math.cos(a * 0.7) - w * math.sin(a * 0.7), z * math.sin(a * 0.7) + w * math.cos(a * 0.7)
+        k4 = 2.2 / (3.2 - w)                                             # 4D -> 3D perspective
+        x3, y3, z3 = x * k4, y * k4, z * k4
+        k3 = 3.0 / (4.2 - z3)                                            # 3D -> 2D
+        verts.append((cx + x3 * k3 * S * 1.6, cy + y3 * k3 * S, w))
+    for i in range(16):
+        for j in range(i + 1, 16):
+            if bin(i ^ j).count("1") == 1:
+                (x0, y0, w0), (x1, y1, w1) = verts[i], verts[j]
+                f = clamp((w0 + w1) / 4 + 0.5, 0, 1)
+                P.line(x0, y0, x1, y1, mix((150, 80, 255), (240, 240, 255), f), 0.55 + 0.4 * f)
+    for x, y, w in verts:
+        P.disc(x, y, 0.9, (255, 255, 255), 0.9, 2.5, (190, 140, 255))
+    for i in range(30):                                                  # motes falling into it
+        ang = i * 2.39 + t * 0.2
+        rr = (S * 2.4) * (1 - ((t * 0.15 + i * 0.033) % 1))
+        P.blend(cx + math.cos(ang) * rr * 1.6, cy + math.sin(ang) * rr, (220, 200, 255), 0.7)
+    P.commit()
+
+
+def _L_kaiju(self, screen, cols, rows, t):
+    """KAIJU BAY: a storm over a harbour city. A colossal monster wades in the bay, the plates on its back flaring blue from
+    tail to crown; every few seconds it rears back and breathes a beam of atomic fire over the city. Searchlights hunt it,
+    lightning shows its whole outline."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    cyc = t % 9.0
+    bolt = (int(t * 10) % 61) in (0, 1)
+    for i in range(6):                                                   # storm clouds rolling
+        cx = (i * W * 0.23 + t * 3) % (W * 1.3) - W * 0.15
+        P.ellipse(cx, H * 0.08 + (i % 3) * 5, W * 0.17, 8, lambda u, v: ((52, 58, 78), 0.55 * (1 - v * v)))
+    r = random.Random(9)
+    x, gnd = 0, H * 0.74
+    while x < W * 0.30:                                                  # the city on the left shore
+        bw, bh = r.randint(5, 10), H * r.uniform(0.14, 0.36)
+        P.poly([(x, gnd), (x + bw, gnd), (x + bw, gnd - bh), (x, gnd - bh)], (14, 16, 26), 1.0)
+        for wy in range(int(gnd - bh) + 2, int(gnd), 3):
+            for wx in range(x + 1, x + bw - 1, 2):
+                if (wx * 7 + wy * 3) % 5 == 0:
+                    P.blend(wx, wy, (255, 210, 120), 0.65)
+        if r.random() < 0.5:
+            P.blend(x + bw // 2, gnd - bh - 2, (255, 60, 60), 1.0 if int(t * 2 + x) % 2 else 0.3)
+        x += bw + 1
+    for k in range(2):                                                   # searchlights sweeping toward the monster
+        bx, by = W * (0.08 + k * 0.14), gnd - 2
+        ang = -math.pi / 2 + 0.55 + math.sin(t * 0.5 + k * 2) * 0.45
+        for s in range(int(H * 0.8)):
+            for dw in range(-int(s * 0.07), int(s * 0.07) + 1):
+                P.blend(bx + math.cos(ang) * s - math.sin(ang) * dw, by + math.sin(ang) * s + math.cos(ang) * dw, (220, 230, 255), 0.08)
+    sc = min(1.1, max(0.7, H / 80)) * 0.85
+    kx, ky = W * 0.82, gnd + 2                                           # the monster, facing the city
+    X = lambda dx: kx - dx * sc
+    Y = lambda dy: ky - dy * sc
+    rear = clamp((cyc - 5.2) / 0.8, 0, 1) * (1 - clamp((cyc - 8.0) / 0.8, 0, 1))
+    body = [(X(-22), Y(0)), (X(-20), Y(22)), (X(-13), Y(36)), (X(-4), Y(44 + rear * 4)), (X(6), Y(48 + rear * 8)),
+            (X(14), Y(46 + rear * 10)), (X(19), Y(40 + rear * 9)), (X(15), Y(35)), (X(10), Y(31)), (X(12), Y(23)),
+            (X(22), Y(14)), (X(24), Y(0))]
+    sil = (6, 8, 10) if not bolt else (2, 2, 4)
+    P.poly(body, sil, 1.0)
+    P.poly([(X(-20), Y(20)), (X(-34), Y(18)), (X(-40), Y(12)), (X(-24), Y(12))], sil, 1.0)    # tail sweeping behind
+    P.poly([(X(10), Y(31)), (X(19), Y(27)), (X(21), Y(23)), (X(12), Y(25))], sil, 1.0)        # a clawed arm
+    for i in range(len(body) - 1):                                       # rim light from the plates and the storm
+        (x0, y0), (x1, y1) = body[i], body[i + 1]
+        if y1 < Y(10) or y0 < Y(10):
+            P.line(x0, y0, x1, y1, (90, 130, 180) if not bolt else (230, 240, 255), 0.55)
+    charge = (t * 1.6) % 4.0
+    for k in range(9):                                                   # dorsal plates, lit in a wave from tail to crown
+        f = k / 8
+        px_, py_ = X(-17 + f * 22), Y(21 + f * 25 + rear * 6 * f)
+        lit = max(0.0, 1 - abs(charge - f * 3.2) * 1.5) + rear * 0.8
+        h_ = (5 + 3 * math.sin(f * math.pi)) * sc
+        P.poly([(px_ - 2 * sc, py_), (px_ + 2 * sc, py_), (px_ + 0.6 * sc, py_ - h_)], mix((50, 74, 100), (210, 244, 255), min(1, lit)), 1.0)
+        if lit > 0.3:
+            P.disc(px_, py_ - h_ * 0.5, 1.5, (120, 200, 255), 0.45 * lit, 5, (60, 140, 255))
+    ex, ey = X(13), Y(42 + rear * 9)
+    P.disc(ex, ey, 0.9, (255, 140, 70), 1.0, 2.5, (255, 70, 30))
+    if 6.0 < cyc < 7.6:                                                  # ATOMIC BREATH over the city
+        mx_, my_ = X(19), Y(40 + rear * 9)
+        grow = clamp((cyc - 6.0) / 0.35, 0, 1)
+        fade = 1 - clamp((cyc - 7.25) / 0.35, 0, 1)
+        for s in range(int(W * 0.72 * grow)):
+            y = my_ + s * 0.22 + math.sin(s * 0.3 + t * 30) * 0.6
+            for dw in range(-3, 4):
+                P.blend(mx_ - s, y + dw, mix((255, 255, 255), (80, 160, 255), abs(dw) / 3), (0.95 - abs(dw) * 0.22) * fade)
+        P.disc(mx_, my_, 3, (255, 255, 255), 0.95 * fade, 7, (120, 190, 255))
+        for y in range(int(H * 0.75)):                                   # the whole sky lit blue
+            for x in range(0, W, 2):
+                P.blend(x + (y % 2), y, (90, 150, 255), 0.06 * fade)
+    for k in range(6):                                                   # ripples where it stands
+        rx = (34 - k * 4 + (t * 4) % 4) * sc
+        for j in range(48):
+            a_ = j * math.pi / 47
+            P.blend(kx + math.cos(a_) * rx, ky - 1 + math.sin(a_) * 1.2, (120, 150, 190), 0.25)
+    for i in range(130):                                                 # driving rain
+        x = (i * 29.3 - t * 30) % W
+        y = (i * 71.9 + t * 80) % H
+        P.blend(x, y, (170, 180, 210), 0.32)
+        P.blend(x + 0.4, y - 1, (170, 180, 210), 0.2)
+    if bolt:
+        bx = W * (0.4 + 0.5 * ((int(t) * 37) % 10) / 10)
+        y, x = 0.0, bx
+        while y < H * 0.6:
+            nx, ny = x + (((int(y) * 13 + int(t)) % 7) - 3), y + 4
+            P.line(x, y, nx, ny, (240, 245, 255), 1.0)
+            x, y = nx, ny
+        for y in range(int(H * 0.75)):
+            for x in range(0, W, 2):
+                P.blend(x + (y % 2), y, (200, 210, 255), 0.18)
+    P.commit()
+
+
+def _L_shrooms(self, screen, cols, rows, t):
+    """GLOWSHROOM GROVE: a forest of giant mushrooms whose caps glow and breathe, gills shining underneath, spores rising
+    in slow spirals, fireflies and a drifting ground mist."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    shrooms = ((0.07, 0.78, 1.15, (150, 60, 230)), (0.24, 0.80, 0.7, (40, 200, 170)), (0.91, 0.80, 1.25, (60, 170, 255)),
+               (0.74, 0.82, 0.65, (240, 80, 170)), (0.17, 0.84, 0.4, (120, 240, 130)), (0.99, 0.84, 0.55, (240, 80, 170)))
+    for i, (xf, yf, s, col) in enumerate(shrooms):
+        bx, by = W * xf, H * yf
+        h_ = 34 * s
+        sway = math.sin(t * 0.5 + i) * 1.5 * s
+        for y in range(int(h_)):                                         # the stem, gently curved
+            f = y / h_
+            w_ = (2.2 + 1.2 * (1 - f)) * s
+            cx_ = bx + sway * f * f
+            for dx in range(-int(w_), int(w_) + 1):
+                P.blend(cx_ + dx, by - y, mix((230, 220, 200), (140, 130, 120), abs(dx) / (w_ + 1)), 1.0)
+        top = by - h_
+        glow = 0.75 + 0.25 * math.sin(t * 1.3 + i * 1.7)
+        rx, ry = 13 * s, 7 * s
+        P.ellipse(bx + sway, top + ry * 0.2, rx * 1.6, ry * 1.8, lambda u, v, col=col: (col, 0.10 * glow * (1 - (u * u + v * v))))      # aura
+        P.ellipse(bx + sway, top, rx, ry, lambda u, v, col=col: ((mix(col, (255, 255, 255), 0.35 * (1 - (u * u + v * v)) * glow), 1.0) if v <= 0.3 else None))
+        for k in range(int(rx * 1.8)):                                   # gills
+            gx = bx + sway - rx * 0.9 + k
+            P.blend(gx, top + ry * 0.3 + 1, mix(col, (255, 255, 255), 0.5) if k % 2 else shade(col, 0.5), 0.9 * glow)
+        for k in range(7):                                               # spots
+            a_ = k * 2.4 + i
+            sx = bx + sway + math.cos(a_) * rx * 0.6
+            sy = top - ry * 0.45 + math.sin(a_ * 1.3) * ry * 0.3
+            P.disc(sx, sy, 1.1 * s, (255, 250, 230), 0.8 * glow)
+    for i in range(50):                                                  # rising spores
+        ph = (t * 0.05 + i * 0.137) % 1.0
+        x = W * ((i * 0.071) % 1) + math.sin(t + i) * 4
+        y = H * (0.85 - ph * 0.8)
+        P.blend(x, y, (190, 255, 220) if i % 2 else (230, 190, 255), 0.4 + 0.5 * math.sin(t * 3 + i))
+    for k in range(3):                                                   # mist bands
+        y0 = H * (0.66 + k * 0.05)
+        for x in range(W):
+            P.blend(x, y0 + math.sin(x * 0.05 + t * 0.4 + k) * 2, (150, 200, 210), 0.10)
+            P.blend(x, y0 + 1 + math.sin(x * 0.05 + t * 0.4 + k) * 2, (150, 200, 210), 0.07)
+    P.commit()
+
+
+def _L_wormsea(self, screen, cols, rows, t):
+    """THE DEEP DESERT: three moons over endless dunes. Every few seconds a colossal ringed sandworm breaches, arcs
+    across the sky with sand pouring off its rings, opens its blazing maw, and dives back under."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    for mx_, my_, mr_, mc in ((0.18, 0.16, 7, (255, 236, 200)), (0.30, 0.10, 3.5, (220, 200, 255)), (0.86, 0.14, 5, (255, 190, 150))):
+        P.disc(W * mx_, H * my_, mr_, mc, 1.0, mr_ * 1.2, mc)
+    for layer, (base, col) in enumerate(((0.56, (160, 104, 74)), (0.64, (122, 76, 54)))):   # far dunes
+        pts = [(0, H)] + [(x, H * base - 5 * math.sin(x * 0.04 + layer * 1.3 + t * 0.02) - 3 * math.sin(x * 0.11 + layer)) for x in range(0, W + 3, 3)] + [(W, H)]
+        P.poly(pts, col, 1.0)
+    cyc = (t % 12.0) / 12.0
+    if 0.08 < cyc < 0.75:                                                # the breach
+        p = (cyc - 0.08) / 0.67
+        x0, x1 = W * 0.35, W * 0.95
+        ground = H * 0.66
+        hgt = H * 0.52
+        n = 70
+        pts = []
+        for k in range(n):
+            f = k / (n - 1)
+            u = clamp(p * 1.6 - (1 - f) * 0.9, 0, 1)                  # the head leads, the body follows out of the sand
+            if u <= 0:
+                continue
+            x = x0 + (x1 - x0) * u
+            y = ground - math.sin(u * math.pi) * hgt
+            pts.append((x, y, f))
+        for x, y, f in pts:                                              # body: thick ringed segments
+            w_ = 5.5 + 2.5 * f
+            ring = math.sin(f * 50 - t * 4)
+            for dy in range(-int(w_), int(w_) + 1):
+                sh = 0.55 + 0.45 * (1 - abs(dy) / (w_ + 1))
+                c = mix((110, 72, 40), (222, 180, 110), (0.5 + 0.5 * ring) * sh)
+                P.blend(x, y + dy, c, 1.0)
+            if (int(f * 70) % 3) == 0:                                   # sand pouring off the rings
+                for s in range(1, 10):
+                    P.blend(x + math.sin(s + t * 3) * 0.7, y + w_ + s * 1.4, (226, 196, 140), 0.5 * (1 - s / 10))
+        if pts:
+            hx, hy, _ = pts[-1]
+            P.disc(hx, hy, 7.5, (90, 50, 30), 1.0)
+            P.disc(hx, hy, 5.5, (255, 130, 50), 1.0, 4, (255, 90, 30))   # the blazing maw
+            P.disc(hx, hy, 2.5, (255, 230, 170), 1.0)
+            for k in range(12):
+                a_ = k * math.tau / 12 + t
+                P.line(hx + math.cos(a_) * 5.5, hy + math.sin(a_) * 5.5, hx + math.cos(a_) * 7.8, hy + math.sin(a_) * 7.8, (250, 240, 220), 0.9)
+        for k in range(30):                                              # sand fountains where it breaks the surface
+            for xx in (x0, x0 + (x1 - x0) * clamp(p * 1.6, 0, 1)):
+                P.blend(xx + math.sin(k * 7.1) * 6, ground - (k * 1.7 + t * 9) % 20, (230, 200, 150), 0.4)
+    for i in range(80):                                                  # blowing sand
+        x = (i * 43.3 + t * 26) % W
+        y = H * 0.4 + (i * 17.9) % (H * 0.4) + math.sin(t + i) * 2
+        P.blend(x, y, (240, 210, 160), 0.35)
+        P.blend(x - 1, y, (240, 210, 160), 0.2)
+    P.commit()
+
+
+def _L_jadetemple(self, screen, cols, rows, t):
+    """JADE TEMPLE: a stepped pyramid on the right, a blazing carved sun-disc on the left, jungle crowns on both flanks,
+    and a feathered serpent coiling round and round the pyramid - in front of it, then behind it."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    sx, sy, sr = W * 0.14, H * 0.27, min(W * 0.08, H * 0.13)
+    for k in range(24):                                                  # sun rays
+        a_ = k * math.tau / 24 + t * 0.05
+        P.line(sx + math.cos(a_) * sr * 1.25, sy + math.sin(a_) * sr * 1.25, sx + math.cos(a_) * sr * 2.4, sy + math.sin(a_) * sr * 2.4,
+               (255, 214, 120), 0.3 if k % 2 else 0.14)
+    P.disc(sx, sy, sr, (255, 220, 120), 1.0, sr * 0.8, (255, 180, 80))
+    P.disc(sx, sy, sr * 0.62, (240, 170, 70), 0.6)
+    for k in range(8):                                                   # carved glyph ring on the sun
+        a_ = k * math.tau / 8 + t * 0.1
+        P.disc(sx + math.cos(a_) * sr * 0.8, sy + math.sin(a_) * sr * 0.8, 1.0, (170, 100, 40), 0.9)
+    P.disc(sx, sy, sr * 0.25, (255, 240, 200), 0.9)
+    base, px = H * 0.74, W * 0.84                                        # the pyramid
+    tiers, tw, th_ = 7, min(W * 0.14, H * 0.24), max(3.0, H * 0.055)
+    serp = []
+    n = 90
+    for k in range(n):                                                   # the serpent's coil: an ellipse around the pyramid
+        f = k / (n - 1)
+        u = t * 0.55 - f * 2.6
+        r_ = tw * 1.45
+        x = px + math.cos(u) * r_
+        y = base - tiers * th_ * 0.62 + math.sin(u) * r_ * 0.22 - f * 3 + math.sin(k * 0.35 - t * 3) * 1.4
+        serp.append((x, y, f, math.sin(u) >= 0))
+    def draw_serpent(front: bool) -> None:
+        for k, (x, y, f, fr) in enumerate(serp):
+            if fr != front:
+                continue
+            w_ = 3.2 * (1 - f * 0.65)
+            for dy in range(-int(w_), int(w_) + 1):
+                c = (250, 214, 120) if (k + dy) % 5 == 0 else mix((20, 140, 90), (110, 230, 160), 0.5 + 0.5 * math.sin(k * 0.7 + dy))
+                P.blend(x, y + dy, c if front else shade(c, 0.6), 1.0)
+            if k % 4 == 0 and 4 < k < n - 3:
+                P.line(x, y - w_, x + 1.5, y - w_ - 3.5, hsv(0.38 + 0.08 * math.sin(k), 0.8, 0.9 if front else 0.55), 0.85)
+            if k == 0:
+                P.disc(x, y, 3.2, (40, 170, 110), 1.0)
+                P.blend(x - 1.5, y - 1, (255, 60, 40), 1.0)
+                for s in range(6):                                       # quetzal crest
+                    P.line(x + 1, y - 3, x + 2 + s, y - 8 - s * 0.6, hsv(0.36 + s * 0.02, 0.85, 0.95), 0.9)
+            if k == n - 1:
+                for s in range(5):                                       # tail plumes
+                    P.line(x, y, x + 9, y - 6 + s * 3 + math.sin(t * 3 + s) * 2, (230, 60, 50) if s % 2 else (60, 220, 150), 0.85)
+    draw_serpent(False)
+    for k in range(tiers):
+        w_, y_ = tw - k * tw / (tiers + 1.5), base - k * th_
+        P.poly([(px - w_, y_), (px + w_, y_), (px + w_ - 2, y_ - th_), (px - w_ + 2, y_ - th_)], mix((58, 88, 66), (116, 146, 104), k / tiers), 1.0)
+        P.line(px - w_ + 2, y_ - th_, px + w_ - 2, y_ - th_, (160, 190, 140), 0.85)
+        P.line(px - w_, y_ - 1, px + w_, y_ - 1, (40, 60, 46), 0.6)
+    top = base - tiers * th_
+    P.poly([(px - 3, base), (px + 3, base), (px + 2, top), (px - 2, top)], (150, 130, 96), 1.0)        # stairs
+    for y in range(int(top), int(base), 2):
+        P.line(px - 2.5, y, px + 2.5, y, (96, 80, 62), 0.8)
+    P.poly([(px - 5, top), (px + 5, top), (px + 5, top - 7), (px - 5, top - 7)], (74, 104, 84), 1.0)   # the temple
+    P.poly([(px - 6, top - 7), (px + 6, top - 7), (px, top - 11)], (96, 130, 100), 1.0)
+    P.poly([(px - 1.5, top), (px + 1.5, top), (px + 1.5, top - 4), (px - 1.5, top - 4)], (16, 20, 16), 1.0)
+    fl = 0.7 + 0.3 * math.sin(t * 8)
+    P.disc(px, top - 2, 0.8, (255, 180, 80), fl, 3, (255, 130, 40))
+    draw_serpent(True)
+    for side, x0 in ((0, 0.0), (1, W * 0.66)):                          # jungle crowns with sunlit tops
+        for i in range(12):
+            cx = x0 + (i * W * 0.03) if side else (i * W * 0.028)
+            if side and cx > W * 0.73 and cx < W * 0.95:
+                continue
+            cy = H * (0.66 + 0.04 * math.sin(i * 1.7 + side))
+            rx_, ry_ = 7 + (i * 5) % 4, 5 + (i * 3) % 3
+            P.ellipse(cx, cy, rx_, ry_, lambda u, v, i=i: (mix((18, 60, 36), (70, 150, 80), clamp(-v * 0.8 + 0.2 + 0.15 * math.sin(u * 9 + i), 0, 1)), 1.0))
+    for i in range(24):                                                  # drifting mist and tiny birds
+        x = (i * 47.7 + t * 3) % W
+        y = H * 0.55 + (i * 13.3) % (H * 0.15)
+        P.blend(x, y, (230, 220, 200), 0.18)
+    for b in range(3):
+        bx = (t * (6 + b) + b * 40) % (W + 20) - 10
+        by = H * (0.12 + b * 0.05) + math.sin(t * 2 + b) * 2
+        wing = 1 if int(t * 6 + b) % 2 else -1
+        P.blend(bx, by, (30, 30, 40), 1.0)
+        P.blend(bx - 1, by + wing * 0.6, (30, 30, 40), 0.8)
+        P.blend(bx + 1, by + wing * 0.6, (30, 30, 40), 0.8)
+    P.commit()
+
+
+def _L_orrery(self, screen, cols, rows, t):
+    """THE ORRERY: a brass astrolabe filling the right of the sky. Tilted rings turn at their own speeds carrying their
+    planets, the sun burns at its heart, and the twelve constellations of the zodiac glitter behind it, drawn in gold."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    r = random.Random(12)
+    for c in range(12):                                                  # constellations, kept to the left half and the top
+        cx = W * (0.04 + (c % 4) * 0.08) if c < 8 else W * (0.30 + (c - 8) * 0.12)
+        cy = H * (0.20 + (c // 4) * 0.20) if c < 8 else H * 0.06
+        pts = [(cx + r.uniform(-7, 7), cy + r.uniform(-5, 5)) for _ in range(r.randint(4, 6))]
+        for i in range(len(pts) - 1):
+            P.line(*pts[i], *pts[i + 1], (200, 160, 80), 0.22)
+        for i, (x, y) in enumerate(pts):
+            P.blend(x, y, (255, 250, 220), 0.5 + 0.5 * math.sin(t * 2 + c + i))
+    cx, cy = W * 0.84, H * 0.36
+    k_ = min(W * 0.15 / 60.0, H * 0.30 / 40.0)
+    rings = ((14, 0.9, 0.35, (230, 180, 90), (150, 200, 255)), (22, -0.55, 0.30, (210, 160, 70), (255, 150, 100)),
+             (31, 0.32, 0.26, (190, 140, 60), (200, 255, 210)), (40, -0.2, 0.22, (170, 120, 50), (255, 220, 160)))
+    for i in range(3):                                                   # meridian arcs (the astrolabe's frame), turning slowly
+        R = (44 + i * 2) * k_
+        for k in range(160):
+            a_ = math.tau * k / 159
+            P.blend(cx + math.cos(a_) * R * 1.5 * math.cos(t * 0.15 + i * 1.1), cy + math.sin(a_) * R, (200, 150, 60), 0.28)
+    for R0, spd, tilt, brass, planet in rings:
+        R = R0 * k_
+        n = int(R * 9) + 12
+        for k in range(n):
+            a_ = k * math.tau / n
+            x, y = cx + math.cos(a_) * R * 1.5, cy + math.sin(a_) * R * tilt * 1.4
+            P.blend(x, y, brass, 0.9 if math.sin(a_) > 0 else 0.45)
+            if k % max(1, n // 12) == 0:
+                P.blend(x, y - 1, (255, 230, 150), 0.75)                 # tick marks
+    P.disc(cx, cy, 5 * k_ + 1, (255, 220, 120), 1.0, 6 * k_ + 1, (255, 170, 60))   # the sun
+    for k in range(8):
+        a_ = k * math.tau / 8 + t * 0.4
+        P.line(cx + math.cos(a_) * (6 * k_ + 1.5), cy + math.sin(a_) * (6 * k_ + 1.5), cx + math.cos(a_) * (9 * k_ + 2), cy + math.sin(a_) * (9 * k_ + 2), (255, 200, 90), 0.6)
+    for R0, spd, tilt, brass, planet in rings:                           # planets on brass arms
+        R = R0 * k_
+        a_ = t * spd + R0
+        x, y = cx + math.cos(a_) * R * 1.5, cy + math.sin(a_) * R * tilt * 1.4
+        P.line(cx, cy, x, y, (150, 110, 50), 0.4)
+        P.disc(x, y, 1.2 + R0 * 0.035, planet, 1.0, 2.2, planet)
+    cm = (t * 0.07) % 1.0                                                # a comet crossing the top
+    hx, hy = W * (1.1 - cm * 1.3), H * (0.03 + cm * 0.12)
+    for s in range(30):
+        P.blend(hx + s * 1.4, hy - s * 0.2, (200, 230, 255), 0.8 * (1 - s / 30))
+    P.disc(hx, hy, 1.2, (255, 255, 255), 1.0, 2.5, (160, 210, 255))
+    P.commit()
+
+
+def _L_armada(self, screen, cols, rows, t):
+    """GHOST ARMADA: a sea of moonlit cloud, a green moon, and a fleet of spectral galleons ghosting through the fog with
+    tattered glowing sails, swinging lanterns and a wake of green light."""
+    P = _Px(screen, cols, rows)
+    W, H = P.W, P.H
+    P.disc(W * 0.86, H * 0.2, min(W * 0.09, H * 0.14), (196, 255, 216), 1.0, min(W * 0.09, H * 0.14), (90, 220, 150))
+    for k in range(4):                                                   # cloud sea bands drifting
+        y0 = H * (0.54 + k * 0.06)
+        for x in range(W):
+            hgt = 3 + 2.5 * math.sin(x * 0.07 + t * (0.3 + k * 0.1) + k * 2) + 1.5 * math.sin(x * 0.19 - t * 0.2)
+            for dy in range(int(hgt) + 6):
+                P.blend(x, y0 - hgt + dy, mix((160, 200, 190), (60, 90, 96), k / 3), 0.6 if dy < 2 else 0.32)
+    sc = min(1.3, max(0.7, H / 80))
+    ships = ((0.07, 0.36, 0.42, 0.010), (0.80, 0.44, 0.62, 0.006), (0.16, 0.54, 1.0, 0.004))
+    for i, (xf, yf, s, spd) in enumerate(ships):
+        s *= sc
+        x = ((xf + t * spd) % 1.25 - 0.1) * W
+        if W * 0.30 < x < W * 0.70 and s > 0.9:
+            x = W * 0.16 + (x - W * 0.3) * 0.1                           # the flagship keeps clear of the menu
+        y = H * yf + math.sin(t * 0.9 + i) * 1.5
+        L_, hh = 30 * s, 6 * s
+        hull = [(x - L_ * 0.5, y - hh), (x - L_ * 0.38, y - hh * 1.6), (x + L_ * 0.5, y - hh * 1.4), (x + L_ * 0.62, y - hh * 0.6), (x + L_ * 0.4, y), (x - L_ * 0.36, y)]
+        P.poly(hull, (20, 36, 38), 0.95)
+        for a_, b_ in zip(hull, hull[1:] + hull[:1]):
+            P.line(*a_, *b_, (110, 255, 170), 0.45)
+        for k in range(5):                                               # glowing gunports
+            P.disc(x - L_ * 0.28 + k * L_ * 0.15, y - hh * 0.5, 0.6, (160, 255, 190), 0.95)
+        for m, mh in ((-0.24, 0.9), (0.06, 1.2), (0.33, 0.85)):         # masts and tattered sails
+            mx_ = x + m * L_
+            mtop = y - hh - 26 * s * mh
+            P.line(mx_, y - hh, mx_, mtop, (60, 84, 80), 1.0)
+            for row in range(3):
+                sy0 = mtop + 2 * s + row * 8 * s * mh
+                sw = (6.5 - row * 1.2) * s
+                sh = 6.5 * s * mh
+                belly = (1.4 + 0.8 * math.sin(t * 1.5 + m * 5 + row)) * s
+                quad = [(mx_ - sw, sy0), (mx_ + sw, sy0), (mx_ + sw * 0.9 + belly, sy0 + sh), (mx_ - sw * 0.9 + belly, sy0 + sh)]
+                P.poly(quad, (170, 255, 210), 0.22)
+                P.line(*quad[0], *quad[1], (200, 255, 225), 0.6)
+                P.line(*quad[3], *quad[2], (150, 240, 200), 0.45)
+                for h_ in range(2):                                      # rips in the canvas
+                    hx = mx_ + ((i * 7 + row * 3 + h_ * 5) % 9 - 4) * sw / 5
+                    hy = sy0 + sh * (0.35 + 0.3 * h_)
+                    P.disc(hx + belly * 0.5, hy, 0.9 * s, (16, 30, 32), 0.75)
+        P.line(x + L_ * 0.5, y - hh * 1.4, x + L_ * 0.9, y - hh * 2.4, (60, 84, 80), 0.9)     # bowsprit
+        lx = x - L_ * 0.42 + math.sin(t * 2 + i) * 0.8                   # swinging stern lantern
+        P.disc(lx, y - hh * 2.0, 0.9, (220, 255, 220), 1.0, 3.5, (90, 255, 150))
+        for k in range(int(34 * s)):                                     # the wake of green light
+            P.blend(x - L_ * 0.4 - k * 1.2, y + 0.5 + math.sin(k * 0.4 + t * 3) * 0.6, (100, 255, 160), 0.45 * (1 - k / (34 * s)))
+    for i in range(24):                                                  # fog wisps and ghost lights
+        x = (i * 53.7 + t * 5) % W
+        y = H * 0.3 + (i * 19.3) % (H * 0.3)
+        P.blend(x, y, (170, 255, 200), 0.3 + 0.3 * math.sin(t * 2 + i))
+    P.commit()
+
+
+LAYER_DRAWERS = {"twinsuns": _L_twinsuns, "lanterns": _L_lanterns, "worldtree": _L_worldtree, "whale": _L_whale, "shards": _L_shards, "sanctum": _L_sanctum, "moon": _L_moon, "sun": _L_sun, "city": _L_city, "mountains": _L_mountains, "grid": _L_grid, "ocean": _L_ocean,
                  "planet": _L_planet, "pyramids": _L_pyramids, "trees": _L_trees, "rain": _L_rain, "lightning": _L_lightning,
                  "tower": _L_tower, "comet": _L_comet, "glitch": _L_glitch, "volcano": _L_volcano, "isles": _L_isles,
-                 "riftring": _L_riftring, "hourglass": _L_hourglass, "sunburst": _L_sunburst, "arcane": _L_arcane}
+                 "riftring": _L_riftring, "hourglass": _L_hourglass, "sunburst": _L_sunburst, "arcane": _L_arcane,
+                 "abyss": _L_abyss, "shrine": _L_shrine, "holocity": _L_holocity, "hyper": _L_hyper, "kaiju": _L_kaiju,
+                 "shrooms": _L_shrooms, "wormsea": _L_wormsea, "jadetemple": _L_jadetemple, "orrery": _L_orrery, "armada": _L_armada}
 
 
 class ThemeBackdrop:
@@ -7159,6 +8942,10 @@ class ThemeBackdrop:
             ang = 38 + 9 * math.sin(self.clock * 0.7)                      # the angle the hero's barrel is showing right now
             ox, oy = muzzle_point(15.0, 3 + visual_lift(design, self.clock, 2), ang, design, 2)
             a = math.radians(ang)
+            cap = min(self.size[1] * 2, 72) - 10
+            apex = oy + (v * math.sin(a)) ** 2 / 80
+            if apex > cap > oy:
+                v *= math.sqrt((cap - oy) / (apex - oy))                 # keep the whole arc inside the canvas
             self.shells.append({"l": Launch(ox, oy, v * math.cos(a), v * math.sin(a), 40.0), "t": 0.0})
         for s in self.shells[:]:
             s["t"] += dt
@@ -7223,7 +9010,7 @@ class ThemeBackdrop:
                                mix(self.rowcol[y], (255, 244, 210), 0.4 * k))
 
     def _hero(self, screen: Screen, cols: int, rows: int) -> None:
-        th, h = self.th, 40
+        th, h = self.th, min(rows * 2, 72)
         cv = PixelCanvas(cols, h, (0, 0, 0))
         for x in range(cols):
             cv.plot(x, 0, th.ground)
@@ -7347,6 +9134,986 @@ def draw_secret_menu(screen: Screen, menu: "MenuList", cx: int, y: int, t: float
 # ============================================================================
 def wallet_text(save: "SaveData") -> str:
     return f"◉ {save.coins:,}   ◈ {save.credits:,}"
+
+
+SONG_GROUP_LABEL = {"menu": "HOME SCREEN", "battle": "BATTLEFIELD", "tbos": "TOURNAMENT BOSS", "mission": "MISSION", "ticket": "ANCIENT HOARDER",
+                    "martyr": "THE MARTYR", "story": "STORY"}
+
+
+_NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_SCALE_NAMES = {"maj": "MAJOR", "min": "MINOR", "dor": "DORIAN", "phr": "PHRYGIAN", "lyd": "LYDIAN", "mix": "MIXOLYDIAN", "hmin": "HARMONIC MINOR",
+                "phd": "PHRYGIAN DOMINANT", "hung": "HUNGARIAN MINOR", "pent": "PENTATONIC", "mpent": "MINOR PENTATONIC", "wt": "WHOLE TONE",
+                "loc": "LOCRIAN", "insen": "IN SEN"}
+
+
+_CV_RULES = (
+    # (words in the song's name or blurb, layers it asks for). First match per layer wins; the name is read before the blurb.
+    ("kernel_panic glitch paradox", "sky=void icon=glitch fx=glitch"),
+    ("protector universe eternal", "sky=gold orb=nova icon=shield fx=stars"),
+    ("blessing martyr's", "sky=gold orb=nova icon=cross fx=rays"),
+    ("time_machine arcane", "sky=night icon=hourglass fx=stars"),
+    ("rift portal hypergate gate horizon wormhole", "icon=portal sky=space"),
+    ("quasar pulsar supernova", "orb=nova sky=space"),
+    ("volcano volcanic caldera eruption", "ground=volcano"),
+    ("tesseract cube dimensions", "sky=space icon=cube fx=stars"),
+    ("orrery astrolabe", "sky=space icon=orrery fx=stars"),
+    ("chronos clockwork clock gear gears magistrate court", "sky=dusk icon=gear"),
+    ("throne crown tyrant king regent emperor pharaoh master's", "icon=crown"),
+    ("master", "icon=crown sky=inferno"),
+    ("kaiju", "icon=kaiju ground=city sky=night fx=rays"),
+    ("whale whalefall", "icon=whale"),
+    ("worm worm's maw", "icon=worm ground=dunes"),
+    ("serpent snake rattler jade", "icon=snake"),
+    ("torii shrine spirit", "icon=torii fx=fireflies"),
+    ("lantern lanterns", "icon=lantern fx=lanterns sky=dusk"),
+    ("jellyfish biolume", "icon=jelly sky=deep fx=bubbles"),
+    ("shroom glowshroom mushroom mycelia spores", "icon=mushroom fx=spores sky=fog"),
+    ("worldtree roots tree canopy", "icon=tree"),
+    ("armada ship ships corsair shanty sailors", "icon=ship ground=sea"),
+    ("mothership flagship", "icon=mothership sky=night"),
+    ("saucer saucers ufo invasion contact", "icon=saucer"),
+    ("radar dish dishes", "icon=radar"),
+    ("ghost ghosts specter haunt haunted dancers voice", "icon=ghost fx=fog"),
+    ("skull bone bones yard revenant graveyard", "icon=skull"),
+    ("eye overseer sentinel watching", "icon=eye"),
+    ("crystal crystals geode prism shatterline glass", "icon=crystal"),
+    ("stinger buzz", "icon=bee"),
+    ("warden gate gates key", "icon=key"),
+    ("colossus titan titans giant", "icon=colossus"),
+    ("bastion fortress walls citadel ramparts keep castle", "ground=castle"),
+    ("zephyr gale wind tornado cyclone maelstrom", "icon=swirl sky=storm"),
+    ("tempest storm thunder lightning volt capacitor spire", "icon=bolt sky=storm fx=rain"),
+    ("helios nova solar solaris corona", "orb=nova sky=inferno"),
+    ("wrath rage fury", "sky=inferno"),
+    ("sun sunset sunrise evening", "orb=sun sky=dusk"),
+    ("glacier frost frozen ice snow arctic tundra winter cryo", "icon=snowflake fx=snow sky=night"),
+    ("magma lava volcano molten volcanic caldera ember embers forge obsidian inferno cinders ash", "icon=flame fx=embers sky=inferno"),
+    ("toxic sludge miasma baron poison", "icon=skull sky=toxic fx=bubbles"),
+    ("arcade cartridge chip eight_bits", "icon=invader sky=neon"),
+    ("armory shop", "icon=shell sky=dusk"),
+    ("workshop spanners sparks", "icon=wrench fx=sparks"),
+    ("training", "icon=target sky=day"),
+    ("tank tanks treads artillery anthem", "icon=tank"),
+    ("squad co-op", "icon=tanks2"),
+    ("boss_rush", "icon=crowns"),
+    ("tavern ale", "icon=mug fx=embers sky=dusk"),
+    ("lullaby music_box", "icon=note fx=snow"),
+    ("pyramid pharaoh sand desert dune dunes mirage", "ground=dunes sky=dusk"),
+    ("twin_suns twin", "orb=twinsun"),
+    ("three_moons", "orb=threemoon"),
+    ("harvest_moon", "orb=bigmoon"),
+    ("moon moonlight moonscape lunar", "orb=moon"),
+    ("star stars starlight starfall nebula galaxy cosmic orbital orbit space void astral rift light-years", "sky=space fx=stars"),
+    ("city cities neon cyber cyberpunk megacity holo holograms skyline rooftops gridlock tokyo metro", "ground=city fx=rain sky=neon"),
+    ("sea ocean reef tide tidebreaker waves wave undertow harbor harbour bay lagoon coast", "ground=sea"),
+    ("trench mariana abyss sunken drowned leviathan underwater", "sky=deep fx=bubbles ground=reef"),
+    ("jungle bamboo forest green leaves pine pines grove", "ground=pines"),
+    ("hills hill meadow field fields fields prairie hedgerow farm valley spring", "ground=hills"),
+    ("mountain mountains peak ridge cliff cliffs", "ground=mountains"),
+    ("mesa mesas plateau canyon badlands", "ground=mesa"),
+    ("bridge span skybridge", "ground=bridge"),
+    ("stairs staircase steps terraces temple", "ground=stairs"),
+    ("tower towers needle watchtower obelisk spires spire", "ground=needles"),
+    ("spikes fang fangs sawtooth teeth spines spine", "ground=spikes"),
+    ("ruins cathedral nave pipe organ mausoleums", "ground=ruins"),
+    ("grave graves cemetery tombs mausoleum", "ground=graves"),
+    ("trench trenches foxholes ditch bunker pits sinkholes craters shelled", "ground=trenches"),
+    ("quarry mine pit funnel gorge maw", "ground=pit"),
+    ("scrap scrapyard rust rivets factory industrial rail yard copper", "ground=factory"),
+    ("rain", "fx=rain"),
+    ("fireflies", "fx=fireflies"),
+    ("sakura blossom petals", "fx=petals"),
+    ("aurora", "sky=aurora"),
+    ("fog mist ghostly midnight", "sky=fog"),
+)
+_CV_FAMILY = {"fire": ("inferno", "mountains", "embers", 0.03), "frost": ("night", "spikes", "snow", 0.56),
+              "desert": ("dusk", "dunes", "sand", 0.09), "water": ("day", "sea", "bubbles", 0.55),
+              "cosmic": ("space", "moonscape", "stars", 0.75), "city": ("neon", "city", "rain", 0.86),
+              "storm": ("storm", "hills", "rain", 0.62), "wild": ("dawn", "pines", "fireflies", 0.33),
+              "dark": ("fog", "graves", "fog", 0.78), "pastoral": ("day", "hills", "petals", 0.24),
+              "plain": ("dusk", "hills", "none", 0.08)}
+_CV_STYLE_ICON = {"chip": "invader", "glitch": "glitch", "hymn": "cross", "lullaby": "note", "clock": "gear", "jig": "fiddle",
+                  "waltz": "note", "dub": "speaker", "techno": "speaker", "trap": "speaker", "house": "speaker", "funk": "note",
+                  "synthwave": "gridsun", "metal": "flame", "metal2": "bolt", "horror": "ghost", "gothic": "skull",
+                  "western": "cactus", "balkan": "swirl", "eastern": "torii", "desert": "cactus", "march": "shield",
+                  "fanfare": "crown", "ambient": "none", "cosmic": "none", "industrial": "gear", "dnb": "bolt", "hyper": "bolt",
+                  "epic": "sword", "folk": "tree", "jig2": "fiddle"}
+_COVER_CACHE: dict = {}
+
+
+def _cv_words(s: str) -> set:
+    return set(re.findall(r"[a-z][a-z'-]*", s.lower()))
+
+
+def _cover_plan(sid: str) -> dict:
+    """Read the song: which sky, which orb, which ground, which centrepiece and which weather its cover gets."""
+    sp = SONGS[sid]
+    desc = sp.desc
+    for pre in ("Home screen. ", "Battlefield. ", "Battlefield theme. ", "Ticket boss. "):
+        desc = desc.replace(pre, "")
+    plan: dict = {}
+    for text in (sp.name, desc):
+        ws = _cv_words(text)
+        joined = " " + " ".join(re.findall(r"[a-z][a-z'-]*", text.lower())) + " "
+        for keys, sets in _CV_RULES:
+            if not any((k.replace("_", " ") in joined) if "_" in k else (k in ws) for k in keys.split(" ")):
+                continue
+            for kv in sets.split():
+                slot, val = kv.split("=")
+                plan.setdefault(slot, val)
+    fam = _family_of(f"{sp.name} {desc}", "")
+    sky, ground, fx, hue = _CV_FAMILY.get(fam, _CV_FAMILY["plain"])
+    seed = zlib.crc32(sid.encode())
+    if fam in ("plain", "pastoral", "desert") and "sky" not in plan:
+        sky = ("dusk", "day", "dawn", "night", "dusk", "day")[seed % 6]
+    plan.setdefault("sky", sky)
+    plan.setdefault("ground", ground)
+    plan.setdefault("fx", fx)
+    if "icon" not in plan and not sid.startswith(("map_", "home_")):
+        plan["icon"] = _CV_STYLE_ICON.get(sp.style, "none")
+    plan.setdefault("icon", "none")
+    if "orb" not in plan:
+        plan["orb"] = ("sun", "moon", "crescent", "planet", "none", "sun", "moon", "bigsun")[seed % 8] if plan["sky"] not in ("deep", "void", "paper") else "none"
+    plan["fam"] = fam
+    plan["hue"] = (hue + ((seed >> 4) % 1000) / 1000 * 0.12 - 0.06) % 1.0
+    plan["seed"] = seed
+    return plan
+
+
+def _cv_sky(kind: str, u: float, v: float, hue: float, rnd: float) -> RGB:
+    if kind == "night":
+        return mix(hsv(hue, 0.7, 0.16), hsv(hue, 0.55, 0.42), v ** 1.4)
+    if kind == "dusk":
+        return gradient(((0, hsv((hue + 0.72) % 1, 0.6, 0.3)), (0.55, hsv((hue + 0.95) % 1, 0.6, 0.85)), (1, (255, 196, 120))), v)
+    if kind == "dawn":
+        return gradient(((0, hsv(hue, 0.35, 0.55)), (1, (255, 214, 170))), v)
+    if kind == "day":
+        return mix(hsv(0.58, 0.55, 0.85), (220, 236, 250), v ** 1.2)
+    if kind == "space":
+        neb = max(0.0, math.sin(u * 4.1 + rnd * 6) * math.sin(v * 3.3 + rnd * 4)) * 0.45
+        return mix((6, 6, 16), hsv(hue, 0.7, 0.7), neb)
+    if kind == "deep":
+        ray = max(0.0, math.sin((u - v * 0.35) * 14 + rnd * 5)) ** 6 * (1 - v) * 0.35
+        return mix(mix((10, 70, 110), (2, 8, 26), v ** 0.8), (160, 230, 255), ray)
+    if kind == "inferno":
+        return gradient(((0, (20, 4, 6)), (0.6, (120, 20, 14)), (1, (255, 110, 30))), v)
+    if kind == "storm":
+        return mix((26, 30, 44), (80, 88, 110), abs(math.sin(u * 3 + v * 2 + rnd * 5)) * 0.5 * (1 - v) + 0.2 * v)
+    if kind == "aurora":
+        band = max(0.0, 1 - abs(v - 0.3 - 0.12 * math.sin(u * 7 + rnd * 6)) * 7)
+        return mix((6, 10, 22), mix((60, 240, 160), (170, 90, 255), u), band * 0.85)
+    if kind == "fog":
+        return mix(hsv(hue, 0.25, 0.22), hsv(hue, 0.18, 0.55), v)
+    if kind == "neon":
+        return gradient(((0, (16, 6, 34)), (0.7, hsv(hue, 0.75, 0.55)), (1, (255, 120, 190))), v)
+    if kind == "toxic":
+        return mix((10, 22, 8), (110, 220, 60), v ** 2 * 0.8)
+    if kind == "gold":
+        return gradient(((0, (40, 24, 8)), (0.6, (200, 140, 40)), (1, (255, 236, 170))), 1 - abs(v - 0.5) * 2)
+    if kind == "void":
+        return (8, 8, 10)
+    return mix((235, 225, 205), (210, 196, 170), v)
+
+
+def _cv_orb(kind: str, u: float, v: float, hue: float, rnd: float) -> Optional[RGB]:
+    ox = 0.25 + rnd * 0.5
+    if kind in ("sun", "bigsun"):
+        r = 0.15 if kind == "sun" else 0.26
+        d = math.hypot(u - ox, v - 0.32)
+        if d < r:
+            return gradient(((0, (255, 244, 190)), (1, (255, 150, 70))), d / r)
+        if d < r + 0.08:
+            return None if d > r + 0.04 else (255, 200, 120)
+        return None
+    if kind == "twinsun":
+        for cx, cy, r, col in ((0.3, 0.3, 0.13, (255, 236, 160)), (0.7, 0.22, 0.09, (255, 160, 110))):
+            if math.hypot(u - cx, v - cy) < r:
+                return col
+        return None
+    if kind in ("moon", "bigmoon"):
+        r = 0.15 if kind == "moon" else 0.27
+        if math.hypot(u - ox, v - 0.3) < r:
+            return (255, 168, 70) if kind == "bigmoon" else mix((240, 238, 222), (190, 192, 200), max(0.0, u - ox + 0.05) * 3)
+        return None
+    if kind == "crescent":
+        if math.hypot(u - ox, v - 0.28) < 0.15 and math.hypot(u - ox - 0.07, v - 0.24) > 0.13:
+            return (245, 240, 215)
+        return None
+    if kind == "threemoon":
+        for cx, cy, r in ((0.22, 0.2, 0.08), (0.5, 0.14, 0.11), (0.8, 0.24, 0.06)):
+            if math.hypot(u - cx, v - cy) < r:
+                return (236, 226, 200)
+        return None
+    if kind == "planet":
+        x, y = u - ox, v - 0.3
+        ring = abs((x * 0.95 + y * 0.3) ** 2 / 0.06 + (y - x * 0.3) ** 2 / 0.004 - 1) < 0.6
+        body = math.hypot(x, y) < 0.13
+        if ring and (y - x * 0.3 > 0 or not body):
+            return (255, 226, 170)
+        if body:
+            return mix(hsv((hue + 0.4) % 1, 0.55, 0.95), (20, 14, 30), clamp((x + y + 0.12) * 2.5, 0, 0.8))
+        return None
+    if kind == "nova":
+        d = math.hypot(u - 0.5, v - 0.42)
+        ang = math.atan2(v - 0.42, u - 0.5)
+        if d < 0.14:
+            return (255, 255, 236)
+        ray = max(0.0, math.cos(ang * 6 + rnd * 3)) ** 4
+        if d < 0.14 + 0.35 * ray:
+            return mix((255, 236, 160), (255, 150, 60), d * 2.2)
+        return None
+    if kind == "eclipse":
+        d = math.hypot(u - ox, v - 0.32)
+        if d < 0.15:
+            return (6, 6, 8)
+        if d < 0.2:
+            return (255, 240, 200)
+        return None
+    return None
+
+
+def _cv_ground(kind: str, u: float, v: float, hue: float, rnd: float, sk: str) -> Optional[RGB]:
+    dark = mix(hsv(hue, 0.6, 0.18), (0, 0, 0), 0.4)
+    mid = hsv(hue, 0.5, 0.36)
+    s = rnd * 6.28
+    if kind == "hills":
+        h1 = 0.62 + 0.08 * math.sin(u * 5 + s)
+        h2 = 0.76 + 0.06 * math.sin(u * 7 + s * 2)
+        if v > h2:
+            return hsv(0.3 + rnd * 0.06, 0.6, 0.35)
+        if v > h1:
+            return hsv(0.3 + rnd * 0.06, 0.5, 0.55)
+        return None
+    if kind == "mountains":
+        tri = lambda c, w_, top: top + abs(u - c) / w_ * (1 - top)
+        if v > min(tri(0.3 + rnd * 0.2, 0.55, 0.3), tri(0.78, 0.4, 0.46)):
+            snow = v < min(tri(0.3 + rnd * 0.2, 0.55, 0.3), tri(0.78, 0.4, 0.46)) + 0.05 and v < 0.5
+            return (236, 240, 250) if snow else mix(dark, mid, 0.5 * (1 - v))
+        return None
+    if kind == "moonscape":
+        h = 0.74 + 0.04 * math.sin(u * 9 + s)
+        if v > h:
+            crater = math.hypot((u - 0.3 - rnd * 0.4) * 1.0, (v - 0.86) * 2.4) < 0.12
+            return (70, 70, 84) if crater else (130, 130, 146)
+        return None
+    if kind == "dunes":
+        h1 = 0.62 + 0.07 * math.sin(u * 4 + s)
+        h2 = 0.78 + 0.05 * math.sin(u * 6 + s + 1)
+        if v > h2:
+            return (176, 112, 52)
+        if v > h1:
+            return (226, 164, 84)
+        return None
+    if kind == "sea":
+        if v > 0.66:
+            wave = math.sin(u * 22 + v * 40 + s) > 0.82
+            return (220, 240, 255) if wave else mix(hsv(0.57, 0.7, 0.6), (4, 20, 50), (v - 0.66) * 2.6)
+        return None
+    if kind == "reef":
+        h = 0.78 + 0.06 * math.sin(u * 13 + s)
+        if v > h:
+            return mix(hsv((hue + 0.9) % 1, 0.6, 0.6), (20, 10, 30), (v - h) * 3)
+        if abs((u * 7 + s) % 1 - 0.5) < 0.08 and v > 0.58 + 0.1 * math.sin(u * 30):
+            return hsv((hue + 0.1) % 1, 0.7, 0.75)
+        return None
+    if kind in ("city", "factory"):
+        col = int(u * 9)
+        rr = (zlib.crc32(bytes([col % 256, int(rnd * 200)])) % 100) / 100
+        top = 0.38 + rr * 0.34 if kind == "city" else 0.55 + rr * 0.2
+        if kind == "factory" and col in (2, 6) and v > 0.2 and abs((u * 9) % 1 - 0.5) < 0.22:
+            return (40, 38, 44)
+        if v > top:
+            win = ((int(u * 27) + int(v * 22) * 3 + col) % 4 == 0) and v < 0.94
+            return mix((255, 220, 120), hsv(hue, 0.4, 1), 0.3) if win and kind == "city" else (14, 12, 22)
+        return None
+    if kind == "pines":
+        for i in range(5):
+            cx = (i + 0.5) / 5 + (rnd - 0.5) * 0.08
+            top = 0.4 + ((i * 7 + int(rnd * 10)) % 4) * 0.06
+            if v > top and abs(u - cx) < (v - top) * 0.45:
+                return mix((10, 40, 24), (30, 90, 50), 0.4 * (1 - v))
+        return (8, 26, 16) if v > 0.9 else None
+    if kind == "spikes":
+        for i in range(6):
+            cx = (i + 0.3 + rnd * 0.4) / 6
+            top = 0.38 + ((i * 5 + int(rnd * 10)) % 3) * 0.12
+            if v > top and abs(u - cx) < (v - top) * 0.18:
+                return mix((200, 230, 255), (90, 130, 190), (v - top) * 2)
+        return (180, 210, 236) if v > 0.9 else None
+    if kind == "mesa":
+        for cx, w_, top in ((0.25 + rnd * 0.1, 0.18, 0.48), (0.72, 0.14, 0.58)):
+            if abs(u - cx) < w_ + (v - top) * 0.25 and v > top:
+                return mix((160, 70, 40), (90, 34, 24), (v - top) * 2)
+        return (120, 52, 30) if v > 0.86 else None
+    if kind == "bridge":
+        if 0.58 < v < 0.64 and not 0.44 < u < 0.56:
+            return (40, 34, 40)
+        if v > 0.58 and abs(u - 0.5) < 0.04:
+            return (40, 34, 40)
+        return None
+    if kind == "stairs":
+        step = int(abs(u - 0.5) * 8)
+        if v > 0.42 + step * 0.09:
+            return mix((150, 70, 50), (70, 30, 30), step / 4)
+        return None
+    if kind == "needles":
+        for cx, top in ((0.3 + rnd * 0.1, 0.2), (0.72, 0.4)):
+            if v > top and abs(u - cx) < 0.03 + (v - top) * 0.07:
+                return (24, 20, 34)
+        return (24, 20, 34) if v > 0.88 else None
+    if kind == "ruins":
+        for i in range(4):
+            cx = 0.16 + i * 0.23
+            top = 0.4 + ((i * 3 + int(rnd * 5)) % 3) * 0.12
+            if v > top and abs(u - cx) < 0.05:
+                return (150, 140, 130) if v < top + 0.04 else (100, 94, 96)
+        return (60, 56, 60) if v > 0.88 else None
+    if kind == "graves":
+        for i in range(3):
+            cx = 0.2 + i * 0.3 + (rnd - 0.5) * 0.06
+            if 0.66 < v < 0.9 and abs(u - cx) < 0.025:
+                return (150, 150, 160)
+            if 0.71 < v < 0.75 and abs(u - cx) < 0.08:
+                return (150, 150, 160)
+        return (20, 26, 22) if v > 0.88 else None
+    if kind == "castle":
+        if v > 0.5 and 0.15 < u < 0.85 and not (v < 0.56 and int(u * 14) % 2 == 0):
+            gate = abs(u - 0.5) < 0.08 and v > 0.74
+            return (20, 14, 16) if gate else (60, 56, 64)
+        return None
+    if kind == "trenches":
+        if v > 0.7:
+            dip = abs(math.sin(u * 9 + s)) > 0.82 and v < 0.82
+            return None if dip else mix((80, 64, 40), (40, 30, 20), (v - 0.7) * 3)
+        return None
+    if kind == "volcano":
+        top = 0.42
+        if v > top and abs(u - 0.5) < 0.08 + (v - top) * 0.75:
+            if v < top + 0.06 and abs(u - 0.5) < 0.09:
+                return (255, 150, 40)
+            lava = abs(u - 0.5 - 0.05 * math.sin(v * 20)) < 0.025 and v < 0.8
+            return (255, 110, 30) if lava else mix((60, 30, 26), (20, 10, 12), (v - top) * 1.5)
+        return (30, 14, 12) if v > 0.9 else None
+    if kind == "pit":
+        if v > 0.6:
+            d = abs(u - 0.5)
+            if d < 0.3 - (v - 0.6) * 0.5:
+                return (10, 6, 8)
+            return mix((130, 100, 70), (70, 50, 40), (v - 0.6) * 2)
+        return None
+    return None
+
+
+def _cv_icon(kind: str, u: float, v: float, hue: float, rnd: float) -> Optional[RGB]:
+    x, y = u - 0.5, v - 0.5
+    acc = hsv((hue + 0.5) % 1, 0.6, 1.0)
+    light = (240, 240, 236)
+    if kind == "skull":
+        if math.hypot(x, y + 0.05) < 0.25 or (abs(x) < 0.14 and 0.1 < y < 0.28):
+            if math.hypot(abs(x) - 0.1, y + 0.03) < 0.07 or (abs(x) < 0.03 and 0.06 < y < 0.12):
+                return (10, 8, 12)
+            if 0.18 < y < 0.28 and int((x + 0.2) * 25) % 2 == 0:
+                return (10, 8, 12)
+            return light
+        return None
+    if kind == "ghost":
+        if (math.hypot(x, y + 0.08) < 0.22 or (abs(x) < 0.22 and -0.08 < y < 0.22 + 0.05 * math.sin(x * 40))):
+            if math.hypot(abs(x) - 0.08, y + 0.08) < 0.045:
+                return (20, 20, 40)
+            return (226, 236, 255)
+        return None
+    if kind == "eye":
+        if abs(y) < 0.2 * math.sqrt(max(0.0, 1 - (x / 0.4) ** 2)):
+            d = math.hypot(x, y)
+            return (10, 6, 10) if d < 0.07 else acc if d < 0.15 else light
+        return None
+    if kind in ("crown", "crowns"):
+        for c in ((0.0,) if kind == "crown" else (-0.2, 0.2)):
+            sc = 1.0 if kind == "crown" else 0.55
+            xx, yy = (x - c) / sc, (y - (0.0 if kind == "crown" else 0.05)) / sc
+            if 0.04 < yy < 0.22 and abs(xx) < 0.3:
+                if abs(yy - 0.13) < 0.035 and int((xx + 0.3) / 0.15) % 2 == 1:
+                    return (230, 40, 70)
+                return (255, 196, 50) if yy > 0.17 else (255, 220, 90)
+            for px in (-0.26, 0.0, 0.26):
+                if -0.24 < yy <= 0.04 and abs(xx - px) < 0.075 * (yy + 0.24) / 0.28:
+                    return (255, 220, 90)
+                if math.hypot(xx - px, yy + 0.27) < 0.04:
+                    return (255, 250, 220)
+        return None
+    if kind == "flame":
+        r = 0.22 * (1 - max(0.0, -y - 0.05) * 1.6)
+        if r > 0 and abs(x + 0.04 * math.sin(v * 12)) < r * math.sqrt(max(0.0, 1 - ((y - 0.1) / 0.32) ** 2)) * 1.4:
+            return gradient(((0, (255, 248, 190)), (0.5, (255, 160, 40)), (1, (230, 50, 30))), clamp(abs(x) / 0.2 + max(0.0, -y) * 1.5, 0, 1))
+        return None
+    if kind == "bolt":
+        pts = ((0.1, -0.38), (-0.12, 0.04), (0.04, 0.04), (-0.1, 0.38), (0.14, -0.06), (-0.02, -0.06))
+        if _cv_inpoly(x, y, pts):
+            return (255, 236, 110)
+        return None
+    if kind == "snowflake":
+        d, a = math.hypot(x, y), math.atan2(y, x)
+        arm = abs(math.sin(a * 3)) < 0.18 / max(d, 0.05) * 0.12 + 0.05
+        if d < 0.32 and (arm or d < 0.06):
+            return (230, 244, 255)
+        return None
+    if kind == "ship":
+        if 0.14 < y < 0.26 and abs(x) < 0.3 - (y - 0.14) * 0.9:
+            return (70, 48, 34)
+        if -0.3 < y < 0.14 and 0 < (x + 0.02) < 0.2 * (y + 0.3) / 0.44 + 0.02:
+            return (230, 226, 210)
+        if -0.24 < y < 0.12 and -0.22 * (y + 0.24) / 0.36 < x + 0.04 < 0:
+            return (210, 206, 190)
+        return None
+    if kind in ("tank", "tanks2"):
+        offs = ((0.0, acc, 1),) if kind == "tank" else ((-0.22, (90, 200, 255), 1), (0.22, (255, 120, 90), -1))
+        sc = 1.0 if kind == "tank" else 0.6
+        for o, col, face in offs:
+            xx, yy = (x - o) / sc * face, (y - 0.1) / sc
+            if 0.08 < yy < 0.2 and abs(xx) < 0.3:
+                return (40, 40, 46) if int((xx + 1) * 18) % 2 else (90, 90, 96)
+            if -0.04 < yy <= 0.08 and abs(xx) < 0.26:
+                return col
+            if math.hypot(xx, yy + 0.04) < 0.13 and yy < -0.04:
+                return col
+            if abs((yy + 0.1) + (xx - 0.05) * 0.55) < 0.035 and 0.05 < xx < 0.36:
+                return mix(col, (0, 0, 0), 0.3)
+        return None
+    if kind in ("saucer", "mothership"):
+        sc = 1.0 if kind == "saucer" else 1.6
+        xx, yy = x / sc, (y + 0.08) / sc
+        if (xx / 0.32) ** 2 + (yy / 0.08) ** 2 < 1:
+            return (180, 190, 210) if int((xx + 1) * 20) % 3 else (120, 255, 200)
+        if math.hypot(xx, yy + 0.06) < 0.13 and yy < 0:
+            return (140, 230, 255)
+        if kind == "saucer" and yy > 0.08 and abs(xx) < (yy - 0.04) * 0.9 and yy < 0.5:
+            return mix((140, 255, 200), (0, 0, 0), 0.55)
+        return None
+    if kind == "tree":
+        if abs(x) < 0.05 and 0 < y < 0.36:
+            return (80, 50, 34)
+        if math.hypot(x, y + 0.08) < 0.28 + 0.03 * math.sin(math.atan2(y, x) * 7):
+            return mix((60, 170, 90), (20, 70, 40), clamp(y + 0.3, 0, 1))
+        return None
+    if kind == "mushroom":
+        if abs(x) < 0.07 and 0 < y < 0.3:
+            return (236, 226, 210)
+        if y < 0.02 and (x / 0.32) ** 2 + ((y + 0.0) / 0.26) ** 2 < 1:
+            dot = math.hypot((x * 6) % 1 - 0.5, (y * 6) % 1 - 0.5) < 0.2
+            return (255, 255, 236) if dot else hsv((hue + 0.1) % 1, 0.7, 0.95)
+        return None
+    if kind == "whale":
+        if ((x + 0.04) / 0.38) ** 2 + (y / 0.16) ** 2 < 1:
+            if math.hypot(x + 0.26, y + 0.03) < 0.025:
+                return (10, 10, 20)
+            return (200, 220, 240) if y > 0.06 else (90, 120, 170)
+        if 0.3 < x < 0.46 and abs(y + (x - 0.3) * 1.2) < 0.06 + (x - 0.3) * 0.5:
+            return (90, 120, 170)
+        return None
+    if kind == "kaiju":
+        body = ((x - 0.12) / 0.26) ** 2 + ((y - 0.2) / 0.4) ** 2 < 1
+        head = math.hypot(x + 0.16, y + 0.2) < 0.13
+        if body or head:
+            if math.hypot(x + 0.2, y + 0.23) < 0.035:
+                return (255, 60, 40)
+            return mix((40, 70, 64), (110, 150, 130), clamp(-x * 2 + 0.3, 0, 1))
+        if 0.04 < x < 0.36 and -0.3 < y < 0.1 and abs(((y + 0.3) * 10) % 1 - 0.5) < (x - 0.04) * 0.6 and x < 0.06 + (y + 0.3) * 0.3:
+            return (90, 200, 230)
+        return None
+    if kind == "worm":
+        if v > 0.36 and abs(x - 0.06 * math.sin(v * 9)) < 0.17 + 0.05 * v:
+            if v < 0.5 and abs(x) < 0.11:
+                ring = int(math.hypot(x, v - 0.36) * 40) % 2
+                return (40, 10, 12) if ring else (230, 210, 180)
+            return mix((190, 140, 90), (120, 80, 50), int(v * 16) % 2 * 0.6)
+        return None
+    if kind == "snake":
+        a = y * 9 + rnd * 6
+        if abs(x - 0.16 * math.sin(a)) < 0.07 and -0.34 < y < 0.36:
+            return (60, 200, 110) if int((y + 1) * 14) % 2 else (240, 210, 70)
+        if math.hypot(x - 0.16 * math.sin(-0.34 * 9 + rnd * 6), y + 0.36) < 0.09:
+            return (60, 200, 110)
+        return None
+    if kind == "torii":
+        red = (220, 50, 40)
+        if -0.26 < y < -0.19 and abs(x) < 0.38 - (y + 0.26) * 0:
+            return red
+        if -0.12 < y < -0.07 and abs(x) < 0.28:
+            return red
+        if -0.19 < y < 0.36 and abs(abs(x) - 0.2) < 0.045:
+            return red
+        return None
+    if kind == "lantern":
+        if (x / 0.18) ** 2 + (y / 0.24) ** 2 < 1:
+            return mix((255, 230, 140), (240, 90, 40), abs(x) / 0.18) if int((y + 1) * 12) % 3 else (200, 60, 30)
+        if abs(x) < 0.08 and (abs(y + 0.26) < 0.03 or abs(y - 0.26) < 0.03):
+            return (60, 30, 20)
+        return None
+    if kind in ("gear", "clock", "orrery"):
+        d, a = math.hypot(x, y), math.atan2(y, x)
+        if kind == "orrery":
+            if d < 0.08:
+                return (255, 214, 90)
+            for r_, sp_, col in ((0.18, 1.0, (120, 200, 255)), (0.3, 0.6, (255, 140, 110)), (0.4, 0.35, (200, 170, 255))):
+                if abs(d - r_) < 0.015:
+                    return (170, 140, 90)
+                px, py = r_ * math.cos(rnd * 9 * sp_ + r_ * 9), r_ * math.sin(rnd * 9 * sp_ + r_ * 9)
+                if math.hypot(x - px, y - py) < 0.05:
+                    return col
+            return None
+        teeth = 0.3 + (0.06 if math.cos(a * 8) > 0.2 else 0)
+        if d < teeth and d > 0.1:
+            return (210, 170, 90) if d < 0.26 else (180, 140, 70)
+        return None
+    if kind == "hourglass":
+        if abs(y) < 0.36 and abs(x) < 0.04 + abs(y) * 0.6:
+            sand = (y > 0.12) or (y < -0.0 and y > -0.16)
+            return (255, 210, 120) if sand else (180, 220, 240)
+        if 0.36 <= abs(y) < 0.42 and abs(x) < 0.3:
+            return (130, 90, 50)
+        return None
+    if kind == "portal":
+        d = math.hypot(x / 0.75, y)
+        if 0.24 < d < 0.34:
+            return mix(hsv(hue, 0.6, 1.0), (255, 255, 255), 0.4 * (1 - abs(d - 0.29) * 20))
+        if d <= 0.24:
+            sw = math.sin(math.atan2(y, x) * 3 + d * 30 + rnd * 6)
+            return mix((20, 10, 40), hsv((hue + 0.15) % 1, 0.6, 0.9), 0.4 + 0.3 * sw)
+        return None
+    if kind == "cube":
+        def sq(cx, cy, r):
+            return max(abs(x - cx), abs(y - cy)) < r and max(abs(x - cx), abs(y - cy)) > r - 0.05
+        if sq(-0.08, 0.08, 0.22):
+            return (130, 240, 255)
+        if sq(0.08, -0.08, 0.22):
+            return (255, 140, 240)
+        for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            ax_, ay_ = -0.08 + sx * 0.2, 0.08 + sy * 0.2
+            t_ = (x - ax_) / 0.16
+            if 0 <= t_ <= 1 and abs(y - (ay_ - 0.16 * t_)) < 0.03:
+                return (200, 200, 255)
+        return None
+    if kind == "crystal":
+        pts = ((0.0, -0.4), (0.18, -0.1), (0.1, 0.36), (-0.1, 0.36), (-0.18, -0.1))
+        if _cv_inpoly(x, y, pts):
+            return mix(hsv(hue, 0.5, 1.0), (255, 255, 255), 0.5 if x < 0 else 0.0)
+        return None
+    if kind == "cross":
+        if (abs(x) < 0.05 and -0.36 < y < 0.36) or (abs(y + 0.12) < 0.05 and abs(x) < 0.22):
+            return (255, 246, 210)
+        return None
+    if kind == "shield":
+        if abs(x) < 0.26 * (1 - max(0.0, y) ** 1.5 * 6) and -0.3 < y < 0.36:
+            return (255, 214, 90) if abs(x) < 0.04 or abs(y + 0.05) < 0.04 else acc
+        return None
+    if kind == "sword":
+        if abs(x) < 0.03 and -0.38 < y < 0.16:
+            return (220, 230, 240)
+        if abs(y - 0.16) < 0.03 and abs(x) < 0.14:
+            return (255, 200, 80)
+        if abs(x) < 0.03 and 0.16 < y < 0.32:
+            return (120, 70, 40)
+        return None
+    if kind == "bee":
+        if ((x) / 0.2) ** 2 + (y / 0.14) ** 2 < 1:
+            return (30, 24, 20) if int((x + 1) * 14) % 2 else (255, 210, 50)
+        if ((x + 0.04) / 0.1) ** 2 + ((y + 0.18) / 0.12) ** 2 < 1:
+            return (220, 240, 255)
+        if 0.18 < x < 0.32 and abs(y) < 0.02:
+            return (30, 24, 20)
+        return None
+    if kind == "key":
+        if math.hypot(x + 0.18, y) < 0.13 and math.hypot(x + 0.18, y) > 0.06:
+            return (255, 200, 80)
+        if abs(y) < 0.035 and -0.05 < x < 0.32:
+            return (255, 200, 80)
+        if 0.12 < x < 0.32 and 0 < y < 0.12 and int((x + 1) * 20) % 2:
+            return (255, 200, 80)
+        return None
+    if kind == "colossus":
+        if math.hypot(x, y + 0.24) < 0.1:
+            return (60, 64, 76) if abs(y + 0.24) > 0.02 or abs(x) > 0.06 else (255, 120, 60)
+        if abs(x) < 0.24 and -0.14 < y < 0.16:
+            return (70, 74, 88)
+        if 0.16 <= y < 0.4 and abs(abs(x) - 0.12) < 0.07:
+            return (56, 58, 70)
+        return None
+    if kind == "swirl":
+        d, a = math.hypot(x, y), math.atan2(y, x)
+        if d < 0.38 and abs(((a / 6.283 + d * 2.2 + rnd) % 0.5) - 0.25) < 0.07:
+            return mix((220, 240, 255), (120, 150, 200), d * 2)
+        return None
+    if kind == "jelly":
+        if y < 0 and (x / 0.24) ** 2 + (y / 0.2) ** 2 < 1:
+            return mix(hsv(hue, 0.5, 1.0), (255, 255, 255), 0.4 * (1 + y * 3))
+        if 0 <= y < 0.38 and abs(((x + 0.24) % 0.1) - 0.05 + 0.02 * math.sin(y * 20)) < 0.013 and abs(x) < 0.22:
+            return hsv(hue, 0.5, 0.85)
+        return None
+    if kind == "glitch":
+        row = int(v * 10)
+        off = ((zlib.crc32(bytes([row % 256, int(rnd * 99)])) % 7) - 3) * 0.03
+        if abs(x + off) < 0.3 and abs(y) < 0.3 and row % 3 != 1:
+            return ((255, 40, 120), (40, 255, 200), (255, 255, 255))[row % 3 if row % 3 else 0]
+        return None
+    if kind == "invader":
+        grid = ("..#...#..", "...#.#...", "..#####..", ".##.#.##.", "#########", "#.#####.#", "#.#...#.#", "...##.##.")
+        gx, gy = int((x + 0.36) / 0.72 * 9), int((y + 0.3) / 0.6 * 8)
+        if 0 <= gx < 9 and 0 <= gy < 8 and grid[gy][gx] == "#":
+            return mix(acc, (120, 255, 120), 0.5)
+        return None
+    if kind == "note":
+        if math.hypot((x + 0.1) / 1.3, y - 0.22) < 0.1:
+            return light
+        if abs(x - 0.03) < 0.03 and -0.3 < y < 0.22:
+            return light
+        if -0.32 < y < -0.2 and 0.03 < x < 0.03 + 0.18 - (y + 0.32) * 0.6:
+            return light
+        return None
+    if kind == "speaker":
+        d = math.hypot(x, y + 0.02)
+        if abs(x) < 0.28 and abs(y) < 0.38:
+            if d < 0.2:
+                return (40, 40, 48) if d > 0.08 and int(d * 40) % 2 == 0 else (90, 90, 104)
+            if math.hypot(x, y + 0.28) < 0.05:
+                return (110, 110, 124)
+            return (24, 24, 30)
+        return None
+    if kind == "gridsun":
+        d = math.hypot(x, y + 0.06)
+        if d < 0.3 and not (y > -0.02 and (y * 100) % 9 < 2.8):
+            return gradient(((0, (255, 230, 110)), (1, (255, 60, 150))), clamp((y + 0.3) / 0.5, 0, 1))
+        return None
+    if kind == "fiddle":
+        if ((x) / 0.15) ** 2 + ((y - 0.14) / 0.16) ** 2 < 1 or ((x) / 0.12) ** 2 + ((y + 0.06) / 0.12) ** 2 < 1:
+            return (180, 90, 40) if abs(x) > 0.02 else (40, 20, 10)
+        if abs(x) < 0.025 and -0.38 < y < -0.1:
+            return (40, 20, 10)
+        return None
+    if kind == "cactus":
+        if abs(x) < 0.06 and -0.3 < y < 0.38:
+            return (60, 150, 70)
+        if abs(x + 0.17) < 0.045 and -0.16 < y < 0.06 or (-0.17 < x < 0 and abs(y - 0.06) < 0.045):
+            return (60, 150, 70)
+        if abs(x - 0.17) < 0.045 and -0.24 < y < -0.02 or (0 < x < 0.17 and abs(y + 0.02) < 0.045):
+            return (60, 150, 70)
+        return None
+    if kind == "shell":
+        if abs(x) < 0.12 and -0.06 < y < 0.34:
+            return (210, 170, 80) if y > 0.22 else (150, 160, 170)
+        if y <= -0.06 and abs(x) < 0.12 * math.sqrt(max(0.0, 1 - ((y + 0.06) / 0.3) ** 2)):
+            return (190, 200, 210)
+        return None
+    if kind == "wrench":
+        if abs(x + y) < 0.06 and abs(x - y) < 0.6:
+            d = math.hypot(x + 0.22, y + 0.22)
+            return None if d < 0.06 else (180, 190, 200)
+        if math.hypot(x + 0.22, y + 0.22) < 0.13 and math.hypot(x + 0.27, y + 0.27) > 0.07:
+            return (180, 190, 200)
+        return None
+    if kind == "target":
+        d = math.hypot(x, y)
+        if d < 0.34:
+            return (240, 60, 60) if int(d / 0.085) % 2 == 0 else light
+        return None
+    if kind == "mug":
+        if abs(x + 0.04) < 0.17 and -0.18 < y < 0.3:
+            return (255, 250, 236) if y < -0.08 else (230, 160, 40)
+        if math.hypot(x - 0.17, y - 0.05) < 0.12 and math.hypot(x - 0.17, y - 0.05) > 0.06 and x > 0.13:
+            return (200, 150, 60)
+        return None
+    if kind == "radar":
+        if y < 0.06 and math.hypot(x, y + 0.02) < 0.3 and math.hypot(x - 0.14, y + 0.17) > 0.3:
+            return (210, 216, 226)
+        if abs(x) < 0.03 and 0 < y < 0.34:
+            return (130, 136, 150)
+        return None
+    return None
+
+
+def _cv_inpoly(x: float, y: float, pts) -> bool:
+    inside = False
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _cv_fx(kind: str, u: float, v: float, hue: float, rnd: float, seed: int) -> Optional[RGB]:
+    cell = zlib.crc32(seed.to_bytes(8, "little")) % 97 + 2
+    if kind == "stars":
+        return (236, 236, 255) if cell < 4 and v < 0.7 else None
+    if kind == "snow":
+        return (240, 246, 255) if cell < 6 else None
+    if kind == "rain":
+        return (150, 180, 230) if cell < 12 else None
+    if kind == "embers":
+        return (255, 170, 60) if cell < 5 and v > 0.25 else None
+    if kind == "fireflies":
+        return (230, 255, 120) if cell < 4 and v > 0.35 else None
+    if kind == "bubbles":
+        return (180, 230, 255) if cell < 4 else None
+    if kind == "spores":
+        return (220, 255, 200) if cell < 5 else None
+    if kind == "petals":
+        return (255, 190, 210) if cell < 4 else None
+    if kind == "sparks":
+        return (255, 236, 160) if cell < 4 else None
+    if kind == "lanterns":
+        return (255, 190, 90) if cell < 5 and v < 0.6 else None
+    if kind == "sand":
+        return (240, 200, 140) if cell < 3 and v < 0.6 else None
+    return None
+
+
+def song_cover(sid: str, size: int = 10) -> list:
+    """The sleeve for one song: a little picture built from the song's own name and blurb (sky, sun or moon, the land,
+    a centrepiece and the weather), supersampled 3 x 3 and cached. Every song gets a different one."""
+    key = (sid, size)
+    if key in _COVER_CACHE:
+        return _COVER_CACHE[key]
+    p = _cover_plan(sid)
+    hue, seed = p["hue"], p["seed"]
+    rnd = (seed % 997) / 997
+    icon = p["icon"]
+    big = icon in ("kaiju", "whale", "worm", "mothership", "tree", "torii")
+    sc = 1.0 if big else 0.86
+    lift = 0.0 if big or icon == "none" else 0.03
+    orb = p["orb"] if icon in ("none", "kaiju", "whale", "torii", "ship", "tree", "worm", "lantern", "mushroom", "radar", "cactus") else "none"
+    if icon == "gridsun":
+        orb = "none"
+    gshift = 0.0 if icon in ("none", "kaiju", "worm", "ship", "tree", "torii", "radar", "cactus", "mushroom") else 0.14
+    flat = p["icon"] in ("cube", "glitch", "orrery", "eye", "hourglass", "cross", "shield", "nova") and p["sky"] in ("space", "void", "gold", "night")
+
+    def icon_at(u, v):
+        if icon == "none":
+            return None
+        return _cv_icon(icon, 0.5 + (u - 0.5) / sc, 0.5 + (v - 0.5) / sc + lift, hue, rnd)
+    grid = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            acc = [0, 0, 0]
+            for i in range(3):
+                for j in range(3):
+                    u, v = (px + (i + 0.5) / 3) / size, (py + (j + 0.5) / 3) / size
+                    col = _cv_sky(p["sky"], u, v, hue, rnd)
+                    o = _cv_orb(orb, u, v, hue, rnd)
+                    if o:
+                        col = o
+                    if p["fx"] == "fog" and abs(math.sin(v * 9 + u * 3 + rnd * 5)) < 0.25:
+                        col = mix(col, (200, 210, 220), 0.25)
+                    g = None if flat else _cv_ground(p["ground"], u, v - gshift, hue, rnd, p["sky"])
+                    if g:
+                        col = g
+                    ic = icon_at(u, v)
+                    if ic:
+                        col = ic
+                    elif icon != "none":                         # a dark rim so the centrepiece reads at this size
+                        e = 0.045
+                        if any(icon_at(u + du, v + dv) for du, dv in ((e, 0), (-e, 0), (0, e), (0, -e))):
+                            col = mix(col, (6, 6, 12), 0.75)
+                    acc[0] += col[0]; acc[1] += col[1]; acc[2] += col[2]
+            c = (acc[0] // 9, acc[1] // 9, acc[2] // 9)
+            f = _cv_fx(p["fx"], (px + 0.5) / size, (py + 0.5) / size, hue, rnd, seed % 100000 * 1000 + px * 31 + py)
+            if f and not icon_at((px + 0.5) / size, (py + 0.5) / size):
+                c = mix(c, f, 0.8)
+            row.append(c)
+        grid.append(row)
+    _COVER_CACHE[key] = grid
+    return grid
+
+
+class NowPlaying:
+    """Racing-game NOW PLAYING card: the song's own album cover with the record sliding out and spinning, the title decoding into place,
+    an oscilloscope, a live analyser, key/tempo/style, a beat-pulsed frame, motion streaks, a landing sweep, a burning edge."""
+    IN, HOLD, OUT = 0.42, 4.6, 0.45
+    GROUP_HUE = {"menu": 0.53, "battle": 0.03, "tbos": 0.12, "mission": 0.36, "ticket": 0.78, "martyr": 0.14, "story": 0.70}
+    GLYPHS = "▓▒░█▚▞#%&@$*+=?<>"
+
+    def __init__(self) -> None:
+        self.sid: Optional[str] = None
+        self.t = 99.0
+
+    def show(self, sid: str) -> None:
+        self.sid, self.t = sid, 0.0
+
+    @property
+    def active(self) -> bool:
+        return self.sid is not None and self.t < self.IN + self.HOLD + self.OUT
+
+    def draw(self, screen: Screen, dt: float, spec: str, now: float, y0: int = 1) -> None:
+        if not self.active or self.sid not in SONGS:
+            return
+        self.t += dt
+        sid, sp, t = self.sid, SONGS[self.sid], self.t
+        grp = song_group(sid)
+        meter = {"44": "4/4", "34": "3/4", "68": "6/8", "78": "7/8", "54": "5/4", "98": "9/8", "128": "12/8", "58": "5/8"}.get(sp.meter, sp.meter)
+        title = sp.name
+        sub = f"{SONG_GROUP_LABEL.get(grp, 'MUSIC')}  ·  {sp.bpm} BPM  ·  {meter}"
+        blurb = sp.desc
+        for pre in ("Home screen. ", "Battlefield theme. ", "Battlefield. ", "Ticket boss. "):
+            blurb = blurb.replace(pre, "")
+        info = f"{_NOTE_NAMES[sp.root % 12]} {_SCALE_NAMES.get(sp.scale, sp.scale.upper())}  ·  {sp.style.upper()}"
+        order = list(SONGS)
+        track = f" TRACK {order.index(sid) + 1:03d}/{len(order)} "
+        hue = (self.GROUP_HUE.get(grp, 0.5) + (zlib.crc32(sid.encode()) % 1000) / 1000 * 0.18 - 0.09) % 1.0
+        scol = hsv(hue, 0.65, 1.0)
+        H, LEFT, VIS = 7, 21, 8                                     # rows; art column; analyser width
+        w = min(screen.cols - 2, max(56, LEFT + max(len(title), len(sub), len(info), len(blurb)) + VIS + 4))
+        room = w - LEFT - VIS - 4
+        if len(blurb) > room:                                       # keep whole sentences, then whole clauses
+            keep = ""
+            for part in re.split(r"(?<=[.!?]) ", blurb):
+                if len(keep) + len(part) + 1 > room:
+                    break
+                keep = (keep + " " + part).strip()
+            if not keep:
+                first = re.split(r"(?<=[.!?]) ", blurb)[0]
+                bits = first.split(", ")
+                while bits and len(", ".join(bits)) + 1 > room:
+                    bits.pop()
+                keep = (", ".join(bits).rstrip(".") + ".") if bits else ""
+            blurb = keep
+        if t < self.IN:
+            k = 1 - ease_out(t / self.IN)
+        elif t < self.IN + self.HOLD:
+            k = 0.0
+        else:
+            k = clamp((t - self.IN - self.HOLD) / self.OUT, 0, 1) ** 2
+        x0 = screen.cols - w - 1 + int(round(k * (w + 2)))
+        moving = 0.02 < k < 0.98
+        beat = (now * sp.bpm / 60.0) % 1.0
+        pulse = (1 - beat) ** 3
+        since = t - self.IN
+        flash = clamp(1 - since / 0.3, 0, 1) if since >= 0 else 0.0
+        base = (10, 12, 24)
+        frame = mix(mix((56, 62, 96), scol, 0.45 + 0.4 * pulse), (255, 255, 255), 0.75 * flash)
+        gold = mix(GOLD, (255, 255, 255), 0.25 * pulse)
+        sweep_x = (since - 0.05) * 90 if 0 <= since < 1.2 else -99    # a light sweep across the glass as it lands
+
+        def bg_at(c: int, r: int = 0) -> RGB:
+            u_ = c / max(1, w - 1)
+            col = mix(base, scol, 0.24 * (1 - u_) ** 1.5)
+            band = c - sweep_x + r * 2
+            if -3 < band < 3:
+                col = mix(col, (255, 255, 255), 0.22 * (1 - abs(band) / 3))
+            return mix(col, (255, 255, 255), 0.2 * flash * (1 - u_))
+
+        def put(x, y, ch, col, back=None):
+            if 0 <= x < screen.cols and 0 <= y < screen.rows:
+                screen.put(x, y, ch, col, back if back is not None else bg_at(x - x0, y - y0))
+        if moving:                                                  # motion streaks trailing the slide
+            for r in (1, 2, 3, 4, 5):
+                for c in range(1, int(k * 18) + 2):
+                    xx = x0 + w + c * 2 + (r % 2)
+                    if xx < screen.cols and 0 <= y0 + r < screen.rows:
+                        screen.put(xx, y0 + r, "━", mix(scol, (255, 255, 255), 0.3), screen.back[y0 + r][xx][2])
+        for r in range(H):
+            for c in range(w):
+                put(x0 + c, y0 + r, " ", (0, 0, 0))
+        for c in range(1, w - 1):
+            put(x0 + c, y0, "─", frame)
+            put(x0 + c, y0 + H - 1, "─", mix(frame, base, 0.5))
+        for r in range(1, H - 1):
+            put(x0, y0 + r, "│", frame)
+            put(x0 + w - 1, y0 + r, "│", frame)
+        for (cx, cy, ch) in ((0, 0, "╭"), (w - 1, 0, "╮"), (0, H - 1, "╰"), (w - 1, H - 1, "╯")):
+            put(x0 + cx, y0 + cy, ch, frame)
+        label = " ♫ NOW PLAYING "
+        for i, ch in enumerate(label):
+            put(x0 + 2 + i, y0, ch, gold if ch.strip() else frame)
+        for i, ch in enumerate(track):
+            put(x0 + w - 2 - len(track) + i, y0, ch, mix((150, 160, 196), scol, 0.3) if ch.strip() else frame)
+        # --- the sleeve (10 x 10 px, art made for this song) with the record sliding out of it and spinning
+        out = 7.0 * ease_out(clamp((since if since > 0 else 0) / 0.6, 0, 1)) if t >= self.IN else 0.0
+        spin = now * 3.5
+        rec_cx, rec_cy, R = 5.0 + out, 5.0, 4.8
+        ax, ay = x0 + 2, y0 + 1
+        art = song_cover(sid, 10)
+        for r in range(5):
+            for c in range(18):
+                cols2 = []
+                for sy in (0, 1):
+                    px_, py_ = c + 0.5, r * 2 + sy + 0.5
+                    if c < 10:                                      # sleeve in front
+                        col = art[r * 2 + sy][c]
+                        if c == 9:
+                            col = mix(col, (0, 0, 0), 0.3)          # the sleeve's open edge, in shadow
+                        cols2.append(col)
+                        continue
+                    d = math.hypot(px_ - rec_cx, py_ - rec_cy) / R
+                    if d > 1.0:
+                        cols2.append(None)
+                        continue
+                    ang = math.atan2(py_ - rec_cy, px_ - rec_cx)
+                    if d < 0.14:
+                        col = (16, 16, 20)
+                    elif d < 0.42:
+                        col = mix(scol, (255, 255, 255), 0.2 + 0.25 * math.sin(ang * 2 - spin))
+                    else:
+                        groove = 0.5 + 0.5 * math.sin(d * 28)
+                        glint = max(0.0, math.cos(ang - spin)) ** 8
+                        col = mix(mix((12, 12, 16), (44, 44, 54), groove * 0.6), (232, 238, 255), glint * 0.8)
+                    cols2.append(col)
+                top, bot = cols2
+                if top is None and bot is None:
+                    continue
+                back = bg_at(2 + c, r + 1)
+                put(ax + c, ay + r, "▀", top or back, bot or back)
+        tx = x0 + LEFT
+        # --- title: decodes from noise into place, then a gold shimmer travels across it
+        reveal = clamp((t - 0.1) / 0.7, 0, 1)
+        sh = ((t - 0.8) * 24) % (len(title) + 34) - 4
+        rng = random.Random(int(now * 24))
+        for i, ch in enumerate(title):
+            if ch == " ":
+                continue
+            settled = i / max(1, len(title)) < reveal * 1.15 - 0.15
+            if not settled:
+                put(tx + i, y0 + 1, rng.choice(self.GLYPHS), mix(scol, (255, 255, 255), rng.random() * 0.5))
+                continue
+            glow = max(0.0, 1 - abs(i - sh) / 3.0)
+            col = gradient(((0, (255, 255, 255)), (1, mix(scol, (255, 255, 255), 0.35))), i / max(1, len(title) - 1))
+            put(tx + i, y0 + 1, ch, mix(col, gold, 0.7 * glow))
+        for i, ch in enumerate(sub):
+            put(tx + i, y0 + 2, ch, scol if ch == "·" else (160, 170, 204))
+        for i, ch in enumerate(blurb):
+            put(tx + i, y0 + 3, ch, (196, 200, 220))
+        for i, ch in enumerate(info):
+            put(tx + i, y0 + 5, ch, scol if ch == "·" else mix((120, 128, 160), scol, 0.25))
+        # --- oscilloscope: a trace that breathes with the mix and the beat
+        lvl = sum(int(c) for c in spec if c.isdigit()) / max(1, 9 * len(spec)) if spec else 0.0
+        amp = 0.35 + 0.65 * max(lvl, 0.35 * (0.4 + 0.6 * pulse))
+        ow = w - LEFT - VIS - 3
+        for i in range(ow):
+            y_ = math.sin(i * 0.55 - now * 7) * 0.6 + math.sin(i * 0.23 + now * 3.1) * 0.4
+            y_ = 0.5 + 0.5 * y_ * amp
+            put(tx + i, y0 + 4, "▁▂▃▄▅▆▇█"[max(0, min(7, int(y_ * 8)))], hsv((hue + i * 0.01 - now * 0.08) % 1.0, 0.55, 0.65 + 0.35 * pulse))
+        # --- four-row analyser on the right
+        vx = x0 + w - 2 - VIS
+        for i in range(VIS):
+            si = int(i * 16 / VIS)
+            live = spec and any(c not in "0" for c in spec)
+            v = (int(spec[si]) / 9.0) if live and si < len(spec) and spec[si].isdigit() else \
+                0.2 + 0.7 * abs(math.sin(now * (2.1 + i * 0.41) + i)) * (0.5 + 0.5 * pulse)
+            hgt = v * 5 * 8
+            for r in range(5):
+                fill = clamp(hgt - (4 - r) * 8, 0, 8)
+                if fill <= 0:
+                    continue
+                col = gradient(((0, (60, 220, 160)), (0.6, (255, 214, 90)), (1, (255, 90, 120))), (4 - r) / 4)
+                put(vx + i, y0 + 1 + r, " ▁▂▃▄▅▆▇█"[int(fill)], col)
+        # --- the bottom edge burns down while the card is up
+        life = clamp(1 - t / (self.IN + self.HOLD), 0, 1)
+        lit = int((w - 2) * life)
+        for c in range(lit):
+            put(x0 + 1 + c, y0 + H - 1, "━", mix(gold, scol, c / max(1, w - 2)))
+        if lit > 0:
+            put(x0 + lit, y0 + H - 1, "╸", (255, 255, 255))
 
 
 def draw_wallet(screen: Screen, save: "SaveData", flash: float = 0.0) -> None:
@@ -7508,7 +10275,7 @@ class TitleScene(HomeScene):
 class MenuScene(HomeScene):
     def __init__(self, app) -> None:
         super().__init__(app)
-        self.menu = MenuList(["SINGLE PLAYER", "TWO PLAYER", "LAN PLAY", "TOURNAMENT", "MISSIONS", "SHOP", "WORKSHOP", "HOW TO PLAY", "TUTORIAL", "PROFILES", "SETTINGS", "CHEAT CODES", "LINKS", "QUIT"])
+        self.menu = MenuList(["SINGLE PLAYER", "TWO PLAYER", "LAN PLAY", "TOURNAMENT", "MISSIONS", "SHOP", "WORKSHOP", "HOW TO PLAY", "TUTORIAL", "JUKEBOX", "PROFILES", "SETTINGS", "CHEAT CODES", "LINKS", "QUIT"])
 
     def handle(self, ev: InputEvent) -> None:
         if ev.raw in ("h", "H", "TAB"):
@@ -7553,6 +10320,8 @@ class MenuScene(HomeScene):
             app.goto(TutorialScene(app))
         elif label == "PROFILES":
             app.goto(ProfilesScene(app))
+        elif label == "JUKEBOX":
+            app.goto(JukeboxScene(app))
         elif label == "HOW TO PLAY":
             app.goto(HowToScene(app))
         elif label == "SETTINGS":
@@ -7604,7 +10373,7 @@ class MenuScene(HomeScene):
         self.draw_footer(screen, screen.rows - 2)
         pt = int(self.app.save.playtime)
         pn = next((p["name"] for p in self.app.profiles.profiles if p["id"] == self.app.profiles.active), "")
-        screen.text(2, screen.rows - 1, f"{pn}  ·  PLAYTIME {pt // 3600}H {pt // 60 % 60:02d}M", Palette.MUTED)
+        screen.text(2, screen.rows - 1, f"{pn}  ·  PLAYTIME {fmt_playtime(pt)}", Palette.MUTED)
 
 
 class HowToScene(BackdropScene):
@@ -7657,8 +10426,8 @@ class HowToScene(BackdropScene):
             ('Twenty levels, each opened by the one before. Beat a boss to unlock', Palette.TEXT),
             ('its exact tank + ammo. Usually 2 strikes; some levels bend the rules.', Palette.TEXT),
             ('MISSIONS', Palette.AMBER),
-            ('50 missions (open after you beat the Master): marathons, 2v1, UFO, co-op, rushes.', Palette.TEXT),
-            ('Coins only. Co-op: local, LAN or an AI wingman. Grand prize: a UFO.', Palette.TEXT),
+            ('50 missions open after the Master: marathons, 2v1, UFOs and rushes.', Palette.TEXT),
+            ('First clears pay coins and credits. Co-op: local, LAN or an AI wingman.', Palette.TEXT),
             ('SHOP', Palette.AMBER),
             ('Spend coins (◉) and tournament credits (◈) on kits, maps and screens.', Palette.TEXT),
         ]
@@ -7754,14 +10523,31 @@ def draw_swatches(screen: Screen, x: int, y: int, idx: int, taken: Optional[int]
             screen.text(sx, sy, "███", col, Palette.PANEL)
 
 
+def is_special_ammo(key: str) -> bool:
+    """'Special' = an ammo with real effects (the ✦ ones). Cosmetic-only ammo counts as regular."""
+    a = AMMO_BY_KEY.get(key)
+    return bool(a is not None and a.mechanics)
+
+
+def cpu_ammo_pool(save: SaveData, player_ammo: str, ammo_fx: bool) -> Optional[list]:
+    """Single Player: the CPU mirrors you. You on a special ammo (with SPECIAL AMMO on) -> it always draws a special ammo;
+    otherwise -> None, meaning a plain standard shell. Vault, secret, Ancient and the Blessing are never handed to the CPU."""
+    if not (ammo_fx and is_special_ammo(player_ammo)):
+        return None
+    banned = {BLESSING_KEY} | {a.key for a in ANCIENT_AMMOS + TICKET_AMMOS + SECRET_AMMOS}
+    pool = sorted(k for k in save.unlocked_ammo() if k not in banned and is_special_ammo(k))
+    return pool or sorted(k for k, a in AMMO_BY_KEY.items() if k not in banned and a.mechanics)    # MUST be special even if you own few
+
+
 def pick_ai_kit(save: SaveData, rng: random.Random, difficulty: Difficulty, player_color: int, ammo_pool: Optional[list] = None) -> PlayerSetup:
     """Opponent for a normal Single Player match. Master difficulty always fields the Master kit."""
     if difficulty is Difficulty.MASTER:
         lv = TOURNAMENT[-1]
         body, shot, design, ammo = lv.boss_color, lv.boss_shot, lv.tank, lv.ammo
+        ammo = rng.choice(ammo_pool) if ammo_pool else DEFAULT_AMMO.key          # the Master kit still mirrors your ammo choice
     else:
         design = rng.choice(DESIGNS[:BASE_KITS]).key
-        ammo = rng.choice(ammo_pool) if ammo_pool else rng.choice(AMMOS[:BASE_KITS]).key
+        ammo = rng.choice(ammo_pool) if ammo_pool else DEFAULT_AMMO.key
         body = rng.choice([n for n, _ in COLOR_CHOICES])
         shot = rng.choice([n for n, _ in COLOR_CHOICES])
     bi = color_index(body)
@@ -7924,11 +10710,8 @@ class SetupScene(BackdropScene):
         if self.mode == "single":
             diff = app.settings.difficulty
             r = self.rules or Rules()
-            pool = None
-            if r.ammo_fx:                                    # SPECIAL AMMO on: the CPU fights with special ammo too (anything you own except the vault/secret/ultimate kinds)
-                banned = {BLESSING_KEY} | {a.key for a in ANCIENT_AMMOS + TICKET_AMMOS + SECRET_AMMOS}
-                pool = sorted(k for k in app.save.unlocked_ammo() if k not in banned) or None
-            players = [mk(0, "PLAYER", "YOU"), replace(pick_ai_kit(app.save, app.rng, diff, pcol, pool), hp=r.hp)]
+            me_setup = mk(0, "PLAYER", "YOU")
+            players = [me_setup, replace(pick_ai_kit(app.save, app.rng, diff, pcol, cpu_ammo_pool(app.save, me_setup.ammo, r.ammo_fx)), hp=r.hp)]
             cfg = MatchConfig(players, True, diff, "single", target=r.target, label=r.label, ammo_fx=r.ammo_fx, special=r.special, pick_maps=r.pick_maps,
                               blessing=r.blessing and app.save.blessing_unlocked())
             app.start_match(cfg, r.mapdef, r.wind_value(app.settings))        # the rules screen already chose map + wind
@@ -7976,7 +10759,7 @@ class SetupScene(BackdropScene):
                 label = f"◄ {label} ►" if sel else label
                 screen.text(x + 41 - len(label), ry, label, Palette.DANGER if bad else Palette.AMBER, bg)
                 hint = unlock_hint("tank" if name == "TANK" else "ammo", kit.key) if bad else kit.blurb
-                for k2, ln in enumerate(textwrap.wrap(hint, 39)[:2]):
+                for k2, ln in enumerate(textwrap.wrap(hint, 39)[:3]):
                     screen.text(x + 3, ry + 1 + k2, ln, Palette.DANGER if bad else Palette.MUTED, Palette.PANEL)
                 ry += 4
             elif name in ("HULL COLOR", "SHELL COLOR"):
@@ -8226,6 +11009,39 @@ def make_ammo_launch(w: "BattleWorld", tank: Tank, angle: float, power: float, w
     return L
 
 
+def _nearest_foe(w: "BattleWorld", tank: Tank, x: float, ahead: float = 0.0, reach: float = 1e9) -> Optional[Tank]:
+    """The closest living enemy to world-x `x` (optionally only those up to `reach` px in direction `ahead`)."""
+    best = None
+    for t in w.tanks:
+        if not t.alive or t.team == tank.team:
+            continue
+        dx = t.x - x
+        if ahead and not (0 < dx * ahead <= reach):
+            continue
+        if best is None or abs(dx) < abs(best.x - x):
+            best = t
+    return best
+
+
+def _reaim(w: "BattleWorld", tank: Tank, L: Launch, x: float, y: float, vx: float, vy: float, k: float) -> Launch:
+    """SEEK: from (x, y) with velocity (vx, vy), bend the horizontal speed `k` of the way toward the nearest enemy."""
+    foe = _nearest_foe(w, tank, x)
+    sub = replace(L, x0=x, y0=y, vx=vx, vy=vy, wa=0.0)
+    if foe is None or k <= 0:
+        return sub
+    ty = foe.y + foe.height * 0.5
+    g = max(1e-3, L.g)
+    disc = vy * vy + 2 * g * (y - ty)
+    if disc <= 0:
+        return sub
+    tf = (vy + math.sqrt(disc)) / g                                   # time to fall to the target's height
+    want = (foe.x - x - 0.5 * L.ax * tf * tf) / max(0.05, tf)
+    tf_land = tf
+    shift = clamp(k, 0, 1) * (want - vx) * tf_land                # how far the landing point moves...
+    shift = clamp(shift, -18.0, 18.0)                            # ...but a lure only bends so far
+    return replace(sub, vx=vx + shift / max(0.05, tf_land))
+
+
 def plan_shot(w: "BattleWorld", tank: Tank, special: bool = False) -> list:
     """A special attack is a plain arc ending in one huge 3-damage blast (the ammo's own looks, scaled up)."""
     M, phys = ({} if (special or not getattr(w, "ammo_fx", True)) else tank.ammo.mechanics), w.physics
@@ -8233,37 +11049,99 @@ def plan_shot(w: "BattleWorld", tank: Tank, special: bool = False) -> list:
     probe = lambda: w.owner_probe(tank.index)
     tr = phys.trace(L, probe(), 0.02, 0.0, 12.0)
     flights: list = []
+    W = w.width
 
     def main_ev(imp: Impact, first: bool, radius: float, mode: Optional[str] = None) -> Ev:
         if special:
             return Ev(imp.x, imp.y, imp.kind, imp.tank, SPECIAL_RADIUS, SPECIAL_DMG, "blast", 0.0, first, 0.0, False, True)
         return Ev(imp.x, imp.y, imp.kind, imp.tank, radius, int(M.get("dmg", 1)), mode or M.get("terrain", "blast"), 0.0, first,
-                  float(M.get("pull", 0.0)), bool(M.get("multi", 0)))
+                  float(M.get("pull", 0.0)) - float(M.get("push", 0.0)), bool(M.get("multi", 0)))
 
-    def finale(imp: Impact, first: bool, vx: float) -> list:
+    def finale(imp: Impact, first: bool, vx: float, vy: float = -1.0) -> list:
         evs = [main_ev(imp, first, M.get("radius", 1.0))]
         if imp.kind is ImpactKind.OUT:
             return evs
         if M.get("cluster"):
-            n, sp = int(M["cluster"]), float(M.get("cspace", 5.5))
+            n, sp, cd = int(M["cluster"]), float(M.get("cspace", 5.5)), float(M.get("cdelay", 0.09))
             for k in range(n):
-                bx = clamp(imp.x + (k - (n - 1) / 2) * sp, 2, w.width - 3)
-                evs.append(Ev(bx, w.terrain.height_at(bx) + 1.0, ImpactKind.TERRAIN, -1, M.get("cr", 0.55), 1, "blast", 0.09 + 0.07 * k))
+                bx = clamp(imp.x + (k - (n - 1) / 2) * sp, 2, W - 3)
+                evs.append(Ev(bx, w.terrain.height_at(bx) + 1.0, ImpactKind.TERRAIN, -1, M.get("cr", 0.55), 1, "blast", (cd if k == 0 else 0.09) + 0.07 * k))
         if M.get("chain"):
             n, st = int(M["chain"]), float(M.get("cstep", 7.0))
             d = 1.0 if vx >= 0 else -1.0
             for k in range(1, n + 1):
-                bx = clamp(imp.x + d * k * st, 2, w.width - 3)
+                bx = clamp(imp.x + d * k * st, 2, W - 3)
                 evs.append(Ev(bx, w.terrain.height_at(bx) + 1.0, ImpactKind.TERRAIN, -1, M.get("cr", 0.6), 1, "blast", 0.1))
+        if M.get("pierce"):                                          # HARDLIGHT: the lance keeps going, carving a shaft
+            sp = math.hypot(vx, vy) or 1.0
+            ux, uy, st = vx / sp, vy / sp, float(M.get("pstep", 4.5))
+            for k in range(1, int(M["pierce"]) + 1):
+                px_, py_ = clamp(imp.x + ux * st * k, 2, W - 3), max(1.0, imp.y + uy * st * k)
+                evs.append(Ev(px_, py_, ImpactKind.TERRAIN, -1, 0.55, 1 if k == int(M["pierce"]) else 0, "blast", 0.05))
         if M.get("fuse"):
             evs.append(Ev(imp.x, imp.y, ImpactKind.TERRAIN, -1, M.get("fr", 1.5), int(M.get("dmg", 1)), "blast", float(M["fuse"])))
         return evs
+
+    def after_landing(imp: Impact, t_land: float, vx: float) -> None:
+        """Follow-up flights that start where the shell came down (BURROWER, SERPENT, CONSTELLATION)."""
+        if special or imp.kind is ImpactKind.OUT:
+            return
+        if M.get("burrow") and imp.kind is ImpactKind.TERRAIN:       # the worm tunnels just under the surface toward the first foe ahead
+            d = 1.0 if vx >= 0 else -1.0
+            reach = float(M["burrow"])
+            foe = _nearest_foe(w, tank, imp.x, d, reach)
+            ex = foe.x if foe is not None else clamp(imp.x + d * reach, 3, W - 4)
+            dist = abs(ex - imp.x)
+            if dist >= 2:
+                y0 = w.terrain.height_at(imp.x) - 2.5
+                speed = 34.0
+                sub = Launch(imp.x, y0, d * speed, 0.0, 0.0)
+                ty = w.terrain.height_at(ex) + 1.0
+                kind, ti = (ImpactKind.TANK, foe.index) if foe is not None else (ImpactKind.TERRAIN, -1)
+                erupt = Ev(ex, ty, kind, ti, M.get("radius", 1.3), int(M.get("dmg", 1)), "blast", 0.0, False)
+                flights.append(FlightSpec(sub, TraceResult(Impact(ex, y0, ImpactKind.OUT), [], dist / speed), t_land + 0.25, [erupt]))
+        if M.get("slither") and imp.kind is ImpactKind.TERRAIN:      # hops that steer toward the nearest enemy
+            x, y, t0 = imp.x, imp.y, t_land
+            for k in range(int(M["slither"])):
+                foe = _nearest_foe(w, tank, x)
+                if foe is None or imp.kind is ImpactKind.OUT:
+                    break
+                dx = foe.x - x
+                hop = clamp(abs(dx), 4.0, 16.0)
+                vy0 = 26.0
+                tf = 2 * vy0 / max(1e-3, L.g)
+                sub = Launch(x, y + 1.5, math.copysign(hop / tf, dx), vy0, L.g, 0.0)
+                st = phys.trace(sub, probe(), 0.02, 0.0, 6.0)
+                last = k == int(M["slither"]) - 1
+                flights.append(FlightSpec(sub, st, t0 + 0.12, [main_ev(st.impact, False, M.get("radius", 0.9) if last else 0.55)]))
+                t0 += 0.12 + st.time
+                x, y = st.impact.x, st.impact.y
+                if st.impact.kind is not ImpactKind.TERRAIN:
+                    break
+        if M.get("stars"):                                           # a pentagon of stars falls from the top of the sky
+            n = int(M["stars"])
+            for k in range(n):
+                ang = math.pi / 2 + k * math.tau / n
+                sx = clamp(imp.x + math.cos(ang) * 15.0, 3, W - 4)
+                top = w.height + 4.0
+                sub = Launch(sx + 4.0, top, -4.0, -48.0, L.g, 0.0)
+                st = phys.trace(sub, probe(), 0.02, 0.0, 8.0)
+                flights.append(FlightSpec(sub, st, t_land + 0.3 + 0.14 * k, [main_ev(st.impact, False, 0.65, "blast")]))
 
     apex = M.get("apex")
     t_ap = L.vy / L.g if L.g > 0 else 0.0
     if apex and 0.35 < t_ap < tr.time - 0.2:
         ax, ay = L.at(t_ap)
         vxa, vya = L.vx + L.ax * t_ap, L.vy - L.g * t_ap
+        if apex[0] == "mirror":                                      # PARADOX: the shell flies on; its twin falls across the centre line
+            vxi, vyi = L.vx + L.ax * tr.time, L.vy - L.g * tr.time
+            flights.append(FlightSpec(L, tr, 0.0, finale(tr.impact, True, vxi, vyi)))
+            mx = clamp(W - ax, 4, W - 5)
+            twin = replace(L, x0=mx, y0=ay, vx=-vxa, vy=vya, ax=-L.ax, wa=0.0)
+            st = phys.trace(twin, probe(), 0.02, 0.0, 12.0)
+            flights.append(FlightSpec(twin, TraceResult(Impact(mx, ay, ImpactKind.OUT), [], 0.0), t_ap, [Ev(mx, ay, ImpactKind.OUT, -1, 0.5, 0, "fx")]))
+            flights.append(FlightSpec(twin, st, t_ap + 0.02, [main_ev(st.impact, False, M.get("radius", 1.0))]))
+            return flights
         portal = [Ev(ax, ay, ImpactKind.OUT, -1, 0.5, 0, "fx")] if apex[0] == "jump" else []
         flights.append(FlightSpec(L, TraceResult(Impact(ax, ay, ImpactKind.OUT), [], t_ap), 0.0, portal))
         if apex[0] == "split":
@@ -8271,26 +11149,49 @@ def plan_shot(w: "BattleWorld", tank: Tank, special: bool = False) -> list:
             for k in range(n):
                 f = (k - (n - 1) / 2) / max(1.0, (n - 1) / 2)
                 sub = replace(L, x0=ax + f * 1.5, y0=ay, vx=vxa * (1 + spread * f) + f * spread * 6, vy=vya + 1.0 - abs(f) * 3.0, wa=0.0)
+                if M.get("seek"):
+                    sub = _reaim(w, tank, sub, sub.x0, sub.y0, sub.vx, sub.vy, float(M["seek"]))
                 st = phys.trace(sub, probe(), 0.02, 0.0, 12.0)
                 flights.append(FlightSpec(sub, st, t_ap + 0.04 * k, [main_ev(st.impact, k == 0, M.get("subr", 0.6), "blast")]))
             return flights
         dirx = 1.0 if vxa >= 0 else -1.0
-        nx = clamp(ax + dirx * float(apex[1]), 4, w.width - 5)
+        nx = clamp(ax + dirx * float(apex[1]), 4, W - 5)
         sub = replace(L, x0=nx, y0=ay, vx=vxa, vy=vya, wa=0.0)
         st = phys.trace(sub, probe(), 0.02, 0.0, 12.0)
         flights.append(FlightSpec(sub, TraceResult(Impact(nx, ay, ImpactKind.OUT), [], 0.0), t_ap + 0.1,
                                   [Ev(nx, ay, ImpactKind.OUT, -1, 0.5, 0, "fx")]))
         flights.append(FlightSpec(sub, st, t_ap + 0.12, finale(st.impact, True, vxa)))
         return flights
+    if M.get("seek") and 0.35 < t_ap < tr.time - 0.2:              # ANGLER'S LURE: at the top of the arc the lure turns toward its prey
+        ax, ay = L.at(t_ap)
+        vxa, vya = L.vx + L.ax * t_ap, L.vy - L.g * t_ap
+        flights.append(FlightSpec(L, TraceResult(Impact(ax, ay, ImpactKind.OUT), [], t_ap), 0.0, [Ev(ax, ay, ImpactKind.OUT, -1, 0.35, 0, "fx")]))
+        sub = _reaim(w, tank, L, ax, ay, vxa, vya, float(M["seek"]))
+        st = phys.trace(sub, probe(), 0.02, 0.0, 12.0)
+        flights.append(FlightSpec(sub, st, t_ap, finale(st.impact, True, sub.vx, -1.0)))
+        after_landing(st.impact, t_ap + st.time, sub.vx)
+        return flights
+    if M.get("volley"):                                              # BROADSIDE: short, true and long, fired together
+        n = int(M["volley"])
+        for k in range(n):
+            f = (k - (n - 1) / 2) * 0.085
+            sub = replace(L, vx=L.vx * (1 + f), vy=L.vy * (1 + f))
+            st = phys.trace(sub, probe(), 0.02, 0.0, 12.0)
+            flights.append(FlightSpec(sub, st, 0.11 * k, [main_ev(st.impact, k == (n - 1) // 2, M.get("radius", 0.8))]))
+        return flights
     bounces, cur, st, tcum = int(M.get("bounce", 0)), L, tr, 0.0
     for b in range(bounces + 1):
         imp = st.impact
         vxi, vyi = cur.vx + cur.ax * st.time, cur.vy - cur.g * st.time
         last = b == bounces or imp.kind is not ImpactKind.TERRAIN or vyi > -4
-        evs = finale(imp, b == 0, vxi) if last else [Ev(imp.x, imp.y, ImpactKind.TERRAIN, -1, M.get("br", 0.4), 1, "blast", 0.0, b == 0)]
+        if last and M.get("burrow") and imp.kind is ImpactKind.TERRAIN and not special:
+            evs = [Ev(imp.x, imp.y, imp.kind, imp.tank, 0.5, int(M.get("dmg", 1)), "trench", 0.0, b == 0)]       # the worm's entry hole
+        else:
+            evs = finale(imp, b == 0, vxi, vyi) if last else [Ev(imp.x, imp.y, ImpactKind.TERRAIN, -1, M.get("br", 0.4), 1, "blast", 0.0, b == 0)]
         flights.append(FlightSpec(cur, st, tcum, evs))
         tcum += st.time
         if last:
+            after_landing(imp, tcum, vxi)
             break
         cur = replace(cur, x0=imp.x, y0=imp.y + 1.5, vx=vxi * 0.82, vy=-vyi * 0.55)
         st = phys.trace(cur, probe(), 0.02, 0.0, 12.0)
@@ -8298,49 +11199,48 @@ def plan_shot(w: "BattleWorld", tank: Tank, special: bool = False) -> list:
 
 
 class BlessingFX:
-    """MARTYR'S BLESSING: the cosmic-clock barrage. A direct hit opens an enormous Roman-numeral clock; stars spiral out of its
-    ring, duplicate, and are flung across half the battlefield, each crashing down in a golden starburst that really carves the
-    terrain; stars strike every opposing tank. Pure screen-cell drawing driven by BattleScene (no raw output, no terminal state to
-    restore). Everything is bounded: <=12 numerals, 4 rings, <=48 spiral stars, <=MAXT barrage stars (+ <=MAXT/2 twins).
-    `full=False` (SCREEN EFFECTS off) keeps the same gameplay beats on a short, calm timeline."""
+    """MARTYR'S BLESSING, a four-act spectacle drawn on terminal cells (no raw output, nothing to restore):
+      I   THE CLOCK  - an enormous Roman-numeral dial opens around the impact; hands sweep, rings turn.
+      II  THE SUN    - 24 stars (12 that duplicate into 24) spiral in from the dial and fuse into a swelling golden sun.
+      III THE JUDGMENT - the sun cracks; a reticle marks each victim, then a column of light falls on it. Tanks are struck first,
+                         then pillars sweep outward across half the battlefield, each one carving a real crater.
+      IV  THE FINALE - the dial implodes into the centre and a colossal white nova erases what is left.
+    Everything is bounded (<=12 numerals, 4 rings, 24 stars, <=MAXT pillars) and `full=False` (SCREEN EFFECTS off) keeps the same
+    gameplay beats on a short, calm timeline. Gameplay (kills, craters) is applied by BattleScene from the events below."""
     ROMAN = ("XII", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI")
     GOLDC, VIOLET, PURPLE, WHITEC = (255, 214, 90), (176, 120, 255), (104, 46, 180), (255, 255, 255)
-    CHAIN_N, MAXT = 12, 24
+    CHAIN_N, MAXT = 12, 14
 
-    def __init__(self, wx: float, wy: float, targets: list, full: bool = True) -> None:
+    def __init__(self, wx: float, wy: float, targets: list, full: bool = True, wipes: tuple = ()) -> None:
         self.wx, self.wy, self.full, self.t = wx, wy, full, 0.0
-        self.targets = list(targets)[:self.MAXT]                     # (world x, world y, tank index or None)
+        self.targets = list(targets)[:self.MAXT]                     # (world x, world y, tank index or None): victims first
+        self.wipes = list(wipes)[:16]                                # (world x, world y): the final firewall's craters across the whole field
         if full:
-            self.T_STAR, self.T_BANG, self.step, self.flight, tail = 0.9, 3.0, 0.07, 0.8, 1.5
+            self.T_SUN, self.T_BANG, self.first, self.gap, self.tel, tail = 1.6, 3.0, 0.7, 0.1, 0.6, 2.6
         else:
-            self.T_STAR, self.T_BANG, self.step, self.flight, tail = 99.0, 0.4, 0.02, 0.25, 0.5
-        self.arrive = [self.T_BANG + self.step * i + self.flight for i in range(len(self.targets))]
-        self.T_CONV = (max(self.arrive) if self.arrive else self.T_BANG) + 0.3
-        self.T_END = self.T_CONV + tail
+            self.T_SUN, self.T_BANG, self.first, self.gap, self.tel, tail = 99.0, 0.4, 0.2, 0.04, 0.2, 0.5
+        self.arrive = [self.T_BANG + self.first + self.gap * i for i in range(len(self.targets))]
+        self.T_CONV = (max(self.arrive) if self.arrive else self.T_BANG) + 0.45        # the finale (the nuke) starts here
+        self.wipe_t = [self.T_CONV + 0.05 + abs(x - wx) / (55.0 if full else 400.0) for x, _ in self.wipes]
+        self.T_END = max([self.T_CONV + tail] + [w_ + 0.7 for w_ in self.wipe_t])
         self.killed, self.skipped, self._fired = False, False, set()
-        self.cell = (0, 0, 6, 3)                  # last drawn (cx, cy, rx, ry)
-        self.tcells: list = []                    # target cells (filled by draw)
+        self.cell = (0, 0, 6, 3)
 
     def skip(self) -> None:
-        """Jump to the end. Every hit and the kills still resolve (the scene applies them instantly, without the spectacle)."""
+        """Jump to the end. Every hit and the finale still resolve (the scene applies them instantly, without the spectacle)."""
         self.skipped = True
         self.t = max(self.t, self.T_END)
 
     def events(self) -> list:
+        keys = [("bang", self.T_BANG)] + [(f"hit{i}", a) for i, a in enumerate(self.arrive)] + [("finale", self.T_CONV)] \
+            + [(f"wipe{i}", w_) for i, w_ in enumerate(self.wipe_t)]
         out = []
-        keys = [("bang", self.T_BANG)] + [(f"hit{i}", a) for i, a in enumerate(self.arrive)] \
-            + [(f"twin{i}", a + 0.18) for i, a in enumerate(self.arrive) if i % 2 == 0 and self.full]
         for key, when in keys:
             if key not in self._fired and self.t >= when:
                 self._fired.add(key)
-                if not self.skipped or key.startswith("hit"):
+                if not self.skipped or key.startswith(("hit", "wipe")) or key == "finale":
                     out.append(key)
         return out
-
-    def ring_cell(self, i: int, k: float = 1.0) -> tuple:
-        cx, cy, rx, ry = self.cell
-        a = (i % self.CHAIN_N) * math.tau / self.CHAIN_N
-        return cx + int(round(math.sin(a) * rx * k)), cy - int(round(math.cos(a) * ry * k))
 
     @staticmethod
     def _c(v: int, lo: int, hi: int) -> int:
@@ -8356,6 +11256,7 @@ class BlessingFX:
         self.cell = (cx, cy, rx, ry)
         compact = L.fcols < 46 or L.frows < 16                      # narrow/short terminals: four numerals instead of twelve
         x0, y0, x1, y1 = L.fx, L.fy, L.fx + L.fcols, L.fy + L.frows
+        G, V, P, W = self.GOLDC, self.VIOLET, self.PURPLE, self.WHITEC
 
         def put(x: int, y: int, ch: str, col: RGB) -> None:
             if x0 <= x < x1 and y0 <= y < y1:
@@ -8365,37 +11266,36 @@ class BlessingFX:
             for j, ch in enumerate(s):
                 put(x + j, y, ch, col)
 
-        conv = clamp((t - self.T_CONV) / max(0.01, self.T_END - self.T_CONV), 0, 1) if full else 0.0
-        fade_in = clamp(t / 0.8, 0, 1)
-        k = ease_out(clamp(t / 1.0, 0, 1)) * (1 - conv * conv)
-        G, V, P, W = self.GOLDC, self.VIOLET, self.PURPLE, self.WHITEC
-        screen.tint(x0, y0, L.fcols, L.frows, (46, 12, 104), 0.40 * fade_in * (1 - 0.6 * conv))
-
         def ellipse(px: int, py: int, ax: float, ay: float, fade: float, hot: RGB) -> None:      # filled glowing blob
             for dy in range(-int(ay) - 1, int(ay) + 2):
                 for dx in range(-int(ax) - 1, int(ax) + 2):
                     d = math.hypot(dx / max(0.5, ax), dy / max(0.5, ay))
                     if d <= 1.0:
-                        col = gradient(((0.0, W), (0.35, hot), (0.75, V), (1.0, P)), d)
-                        put(px + dx, py + dy, "█▓▒░"[min(3, int(d * 4))], shade(col, 0.25 + 0.75 * fade))
+                        put(px + dx, py + dy, "█▓▒░"[min(3, int(d * 4))], mix(gradient(((0.0, W), (0.35, hot), (0.75, V), (1.0, P)), d), P, 0.8 * (1 - fade)))
 
-        # A - temporal invocation: concentric rings, arcane marks, the Roman-numeral dial and sweeping hands
+        def ring(px: int, py: int, ax: float, ay: float, n: int, col: RGB, fade: float, glyphs: str = "○◦") -> None:
+            for j in range(n):
+                a = j * math.tau / n
+                put(px + int(round(math.cos(a) * ax)), py + int(round(math.sin(a) * ay)), glyphs[j % len(glyphs)], shade(col, fade))
+
+        conv = clamp((t - self.T_CONV) / max(0.01, self.T_END - self.T_CONV), 0, 1) if full else 0.0
+        k = ease_out(clamp(t / 1.0, 0, 1)) * (1 - conv * conv)
+        screen.tint(x0, y0, L.fcols, L.frows, (46, 12, 104), 0.40 * clamp(t / 0.8, 0, 1) * (1 - 0.6 * conv))
+
+        # I - the clock: two turning rings, 12 numerals (4 on small screens), sweeping hands
         for ri, (f, col, ch, dr) in enumerate(((1.0, G, "·", 1), (0.86, V, "•", -1), (0.62, G, "·", 1), (0.3, P, "◦", -1))):
-            n = int(clamp(math.tau * rx * f * 0.9, 24, 160))
+            n = int(clamp(math.tau * rx * f * 0.9, 24, 140))
             for j in range(n):
                 a = j * math.tau / n + dr * t * (0.35 + 0.2 * ri)
                 mark = "✧" if j % 10 == 0 else ch
                 put(cx + int(round(math.sin(a) * rx * f * k)), cy - int(round(math.cos(a) * ry * f * k)), mark,
                     shade(col, 0.55 + 0.45 * math.sin(t * 5 + j * 0.7) ** 2) if mark == ch else W)
         for i, rn in enumerate(self.ROMAN):
-            if compact and i % 3:
-                continue
-            if t < 0.25 + i * 0.06:
+            if (compact and i % 3) or t < 0.25 + i * 0.06:
                 continue
             a = i * math.tau / 12 + t * 0.18
             lit = (int(t * 3) % 12) == i and conv == 0
-            text(cx + int(round(math.sin(a) * rx * 0.93 * k)) - len(rn) // 2, cy - int(round(math.cos(a) * ry * 0.93 * k)),
-                 rn, W if lit else G)
+            text(cx + int(round(math.sin(a) * rx * 0.93 * k)) - len(rn) // 2, cy - int(round(math.cos(a) * ry * 0.93 * k)), rn, W if lit else G)
         for length, spd, col in ((0.55, 2.4, G), (0.82, 0.8, W)):
             ha = t * spd * (1 - conv)
             for s in range(1, 13):
@@ -8410,103 +11310,107 @@ class BlessingFX:
                 sub = "TIME RECEIVES ITS FINAL JUDGMENT"[:max(0, L.fcols - 2)]
                 text(x0 + (L.fcols - len(sub)) // 2, y0 + 2, sub, W)
 
-        # B - the spiral star eruption: 3 arms; the stars duplicate twice (12 -> 24 -> 48), then are drawn back in
-        if full and t >= self.T_STAR:
-            stage = 0 if t < 1.7 else 1 if t < 2.3 else 2
-            p, per, arms, twins = ease_out(clamp((t - self.T_STAR) / 1.8, 0, 1)), 4, 3, 2 ** stage
-            for dup in range(twins):
-                for arm in range(arms):
-                    for i in range(per):
-                        u = (i + 1) / per
-                        base = arm * math.tau / arms + dup * math.tau / (arms * twins) + u * 2.6
-                        glyph = "✦" if i == per - 1 else "*" if i == per - 2 else "·"
-                        col = (G, W, V)[(arm + dup + i) % 3]
-                        for tr in range(4):                                     # tr 0 = the star, 1..3 = its fading trail
-                            tb = t - tr * 0.05
-                            ang = base + tb * 1.4
-                            r = rx * 0.92 * u * ease_out(clamp((tb - self.T_STAR) / 1.8, 0, 1)) * (1 - conv * conv)
-                            sx, sy = cx + int(round(math.cos(ang) * r)), cy + int(round(math.sin(ang) * r * ry / rx))
-                            if tr == 0:
-                                put(sx, sy, "✧" if (dup % 2 and stage > 0 and (t - (1.7 if stage == 1 else 2.3)) < 0.2) else glyph, col)
-                            else:
-                                put(sx, sy, "·", shade(col, 0.55 - 0.15 * tr))
-
-        # C - the initial catastrophic detonation: core, radial shockwave, starbursts
-        if t >= self.T_BANG:
-            b = t - self.T_BANG
-            fade = 1 - clamp(b / 1.8, 0, 1)
-            if full:
-                if fade > 0:
-                    rc = ease_out(clamp(b / 0.7, 0, 1))
-                    ellipse(cx, cy, rx * 0.55 * rc, ry * 0.55 * rc, fade, G)
-                if b < 1.3:
-                    rs = ease_out(clamp(b / 1.0, 0, 1)) * 1.05
-                    for j in range(80):
-                        a = j * math.tau / 80
-                        put(cx + int(round(math.sin(a) * rx * rs)), cy - int(round(math.cos(a) * ry * rs)), "○" if j % 2 else "◦",
-                            shade(mix(W, G, b / 1.3), 1 - b / 1.3))
-                if b < 1.0:
-                    for j in range(16):
-                        a = j * math.tau / 16 + 0.2 * b
-                        for s in range(2, 9):
-                            f = s / 8 * ease_out(clamp(b / 0.8, 0, 1)) * 0.9
-                            put(cx + int(round(math.sin(a) * rx * f)), cy - int(round(math.cos(a) * ry * f)), "✦" if s == 8 else "·", G if j % 2 else W)
-            else:
-                ellipse(cx, cy, rx * 0.5, ry * 0.5, fade, G)
-
-        # D - the barrage: every star leaves the clock's circumference, duplicates mid-air, then crashes down in a golden starburst
+        # II - the sun: one clean spiral of stars (12, then 24 after the duplication) winds into a swelling golden sun
+        if full and self.T_SUN <= t < self.T_BANG:
+            u_all = clamp((t - self.T_SUN) / (self.T_BANG - self.T_SUN), 0, 1)
+            twin = 2 if t >= self.T_SUN + 0.6 else 1
+            for j in range(12 * twin):
+                u = clamp(u_all * 1.15 - (j % 12) * 0.02, 0, 1)
+                ang = (j % 12) * math.tau / 12 + (math.pi / 12 if j >= 12 else 0) + u * 5.5
+                r = (1 - u) ** 1.4
+                put(cx + int(round(math.cos(ang) * rx * 0.95 * r)), cy + int(round(math.sin(ang) * ry * 0.95 * r)),
+                    "✦" if j < 12 else "✧", G if j < 12 else W)
+            sr = ease_out(u_all)
+            ellipse(cx, cy, rx * 0.34 * sr, ry * 0.34 * sr, 1.0, G)
+        # III - the judgment
         if full and t >= self.T_BANG:
-            self.tcells = [cell_of(tx, ty) for tx, ty, _ in self.targets]
-            for i, (tc, (tx, ty, ti)) in enumerate(zip(self.tcells, self.targets)):
-                t0 = self.T_BANG + self.step * i
-                u = (t - t0) / self.flight
-                sx, sy = self.ring_cell(i, max(0.05, k))
-                if 0 <= u < 1:                                                    # ring detonation + the star's flight
-                    if t - t0 < 0.35:
-                        ellipse(sx, sy, 1.5 + (t - t0) * 9, 0.8 + (t - t0) * 4, 1 - (t - t0) / 0.35, G if i % 2 == 0 else V)
-                    ex, ey = tc
-                    qx, qy = (sx + ex) / 2, min(sy, ey) - ry * 1.6 - abs(ex - sx) * 0.08
-
-                    def bez(v: float) -> tuple:
-                        return ((1 - v) ** 2 * sx + 2 * (1 - v) * v * qx + v * v * ex, (1 - v) ** 2 * sy + 2 * (1 - v) * v * qy + v * v * ey)
-                    for tr in range(4):
-                        px, py = bez(max(0.0, u - tr * 0.05))
-                        put(int(round(px)), int(round(py)), ("✦", "*", "·", "·")[tr], shade(G if i % 2 == 0 else W, 1.0 - 0.22 * tr))
-                    if i % 2 == 0 and u >= 0.45:                                   # the star DUPLICATES and a twin veers off
-                        bx, by = bez(0.45)
-                        v2 = (u - 0.45) / 0.55
-                        sg = 1 if i % 4 == 0 else -1
-                        tx2, ty2 = ex + sg * 5, ey
-                        for tr in range(3):
-                            vv = max(0.0, v2 - tr * 0.07)
-                            put(int(round(bx + (tx2 - bx) * vv)), int(round(by + (ty2 - by) * vv - math.sin(vv * math.pi) * ry * 0.6)),
-                                "✧" if tr == 0 else "·", V if tr == 0 else shade(V, 0.6))
-                age = t - self.arrive[i]
-                if 0 <= age < 0.7:                                                # impact: an eight-point golden starburst + ring
-                    ex, ey = tc
-                    big = 1.6 if ti is not None else 1.0
-                    for ray in range(8):
-                        a_ = ray * math.pi / 4 + age * 1.5
-                        ln = (3.5 if ray % 2 == 0 else 2.0) * big * ease_out(clamp(age / 0.35, 0, 1)) * 2.4
-                        for s in range(1, int(ln) + 1):
-                            put(ex + int(round(math.cos(a_) * s * 2)), ey - int(round(math.sin(a_) * s)), "✦" if s >= ln - 1 else "·",
-                                W if ray % 2 else G)
-                    rr = age * 14 * big
-                    for j in range(20):
-                        a_ = j * math.tau / 20
-                        put(ex + int(round(math.cos(a_) * rr)), ey - int(round(math.sin(a_) * rr * 0.5)), "○" if j % 2 else "◦", shade(mix(W, V, age / 0.7), 1 - age / 0.7))
-                if self.full and i % 2 == 0 and 0.18 <= age < 0.7:                  # the twin's smaller burst
-                    ex, ey = tc
-                    sg = 1 if i % 4 == 0 else -1
-                    for ray in range(6):
-                        a_ = ray * math.pi / 3 + age * 2
-                        put(ex + sg * 5 + int(round(math.cos(a_) * (age - 0.18) * 16)), ey - int(round(math.sin(a_) * (age - 0.18) * 8)), "✦", V)
-            if conv > 0:                                                            # final convergence: the ring implodes to a point
+            b = t - self.T_BANG
+            if b < 0.9:                                                          # the crack: flash, flare, shock ring
+                ellipse(cx, cy, rx * 0.34 * (1 - b / 0.9) + 1, ry * 0.34 * (1 - b / 0.9) + 1, 1 - b / 0.9, W)
+                rs = ease_out(clamp(b / 0.7, 0, 1))
+                ring(cx, cy, rx * 1.05 * rs, ry * 1.05 * rs, 64, mix(W, G, b / 0.9), 1 - b / 0.9)
+                for j in range(8):
+                    a = j * math.pi / 4
+                    for s in range(2, int(2 + 8 * rs)):
+                        put(cx + int(round(math.cos(a) * s * 2)), cy - int(round(math.sin(a) * s)), "✦" if s == int(7 * rs) else "·", G if j % 2 else W)
+            for j in range(40):                                                          # shooting stars fly out of the clock in every direction
+                age = t - (self.T_BANG + 0.12 * j)
+                if 0 <= age < 1.0:
+                    a = j * 2.399 + 0.4                                                  # golden-angle spread: even coverage, never a clump
+                    spd = 34 + (j % 5) * 9
+                    hx, hy = cx + math.cos(a) * spd * age * 1.7, cy + math.sin(a) * spd * age * 0.55 - age * age * 10
+                    for tr in range(7):
+                        a2 = max(0.0, age - tr * 0.025)
+                        put(int(round(cx + math.cos(a) * spd * a2 * 1.7)), int(round(cy + math.sin(a) * spd * a2 * 0.55 - a2 * a2 * 10)),
+                            "✦" if tr == 0 else "·", shade(G if j % 3 else W if j % 3 == 0 else V, 1 - tr * 0.13))
+            top = y0 + 3
+            for i, (tgt, arr) in enumerate(zip(self.targets, self.arrive)):
+                ex, ey = cell_of(tgt[0], tgt[1])
+                ex, ey = int(clamp(ex, x0 + 2, x1 - 3)), int(clamp(ey, y0 + 4, y1 - 2))
+                vic = tgt[2] is not None
+                age = t - arr
+                if -self.tel <= age < -0.12:                                         # the reticle contracts onto the victim
+                    p = 1 - (age + self.tel) / (self.tel - 0.12)
+                    rr = 2 + (1 - p) * 7
+                    ring(ex, ey, rr * 2, rr * 0.7, 16, G if int(t * 12) % 2 else W, 0.5 + 0.5 * p)
+                    put(ex, ey, "✛", W)
+                if -0.12 <= age < 0.45:                                              # the pillar of light
+                    drop = clamp((age + 0.12) / 0.12, 0, 1)
+                    head = int(top + (ey - top) * drop)
+                    wide = 2 if vic else 1
+                    fade = 1.0 if age < 0.12 else clamp(1 - (age - 0.12) / 0.33, 0, 1)
+                    for yy in range(top, head + 1):
+                        put(ex, yy, "┃", shade(W, 0.5 + 0.5 * fade))
+                        for sdx in range(1, wide + 1):
+                            c = mix(G, V, (sdx - 1) / max(1, wide))
+                            put(ex - sdx, yy, "│" if sdx == 1 else "╎", shade(c, 0.35 + 0.5 * fade))
+                            put(ex + sdx, yy, "│" if sdx == 1 else "╎", shade(c, 0.35 + 0.5 * fade))
+                    put(ex, head, "▼", W)
+                if 0 <= age < 0.9:                                                   # the strike: twin shock rings, rising sparks
+                    sw = (2 + age * (22 if vic else 15)) * ease_out(clamp(age / 0.5, 0, 1) + 0.2)
+                    ring(ex, ey, sw, sw * 0.4, 24, G, 1 - age / 0.9)
+                    if vic and age > 0.08:
+                        ring(ex, ey, sw * 0.62, sw * 0.25, 16, V, 1 - age / 0.9, "◦•")
+                    for j in range(6 if vic else 4):
+                        a = j * math.pi / (3 if vic else 2) + 0.3
+                        put(ex + int(round(math.cos(a) * age * 11)), ey - int(round(abs(math.sin(a)) * age * 9 - age * age * 12)), "✦", W if j % 2 else G)
+        # IV - the finale, a nuclear end of the world: the dial implodes, white-out, a rising mushroom cloud and a firewall racing
+        #      across the whole field (each wall-front crater is a real one: see the wipe events)
+        if full and t >= self.T_CONV:
+            f = t - self.T_CONV
+            if conv > 0:
                 for j in range(24):
-                    a_ = j * math.tau / 24
-                    put(cx + int(round(math.sin(a_) * rx * (1 - conv))), cy - int(round(math.cos(a_) * ry * (1 - conv))), "✦", W)
-        if t > self.T_END - 0.25:                                                   # cosmic flash marks the end
-            screen.tint(x0, y0, L.fcols, L.frows, W, clamp((t - (self.T_END - 0.25)) / 0.25, 0, 1) * 0.85)
+                    a = j * math.tau / 24
+                    put(cx + int(round(math.sin(a) * rx * (1 - conv))), cy - int(round(math.cos(a) * ry * (1 - conv))), "✦", W)
+            base = min(y1 - 2, cy + ry + 2)                                        # the ground the cloud grows from
+            if f < 0.5:                                                            # white-out fireball
+                ellipse(cx, base, rx * (0.6 + 2.2 * f), ry * (0.5 + 1.6 * f), 1 - f / 0.5 * 0.4, W)
+            p = ease_out(clamp(f / 2.2, 0, 1))
+            fade = 1 - clamp((f - 2.0) / 1.2, 0, 1)
+            top_y = int(base - (base - (y0 + 4)) * 0.8 * p)
+            if f > 0.15 and fade > 0:
+                for yy in range(top_y, base + 1):                                  # the stem: hot at the core, rolling smoke at the edges
+                    sw = max(2, int(2 + (1 - (yy - top_y) / max(1, base - top_y)) * 2 + (yy - top_y) / max(1, base - top_y) * 5))
+                    for dx in range(-sw, sw + 1):
+                        u = abs(dx) / max(1, sw)
+                        put(cx + dx, yy, "█▓▒░"[min(3, int(u * 4))], shade(gradient(((0, (255, 226, 150)), (0.5, (255, 110, 30)), (1, (120, 28, 18))), u), 0.5 + 0.5 * fade))
+                cap_rx, cap_ry = rx * 1.25 * p + 4, ry * 0.95 * p + 2                  # the cap: a boiling mushroom of fire
+                for dy in range(-int(cap_ry) - 1, int(cap_ry) + 2):
+                    for dx in range(-int(cap_rx) - 1, int(cap_rx) + 2):
+                        d = math.hypot(dx / cap_rx, dy / cap_ry + 0.25 * math.sin(dx * 0.4 + t * 6) * 0.3)
+                        if d <= 1.0:
+                            put(cx + dx, top_y + dy, "█▓▒░"[min(3, int(d * 4))],
+                                shade(gradient(((0, (255, 240, 190)), (0.3, (255, 130, 36)), (0.7, (210, 48, 20)), (1, (60, 18, 30))), d), 0.4 + 0.6 * fade))
+            for sgn in (-1, 1):                                                   # the firewall sweeping the whole field
+                wx_ = cx + sgn * int(f * 55)
+                if x0 <= wx_ < x1 and f < 2.5:
+                    for yy in range(y0 + 2, y1 - 1):
+                        k_ = (yy * 7 + int(t * 20)) % 5
+                        for th_ in range(7):                                         # a wall of fire: white-hot front, cooling trail behind it
+                            put(wx_ - sgn * th_, yy - (th_ + k_) % 2, "█▓▓▒▒░░"[th_],
+                                shade(mix((255, 245, 200), (190, 50, 20), th_ / 6), 0.55 + 0.45 * ((k_ + th_) % 3) / 2))
+        if t > self.T_END - 0.3:                                                    # cosmic flash marks the end
+            screen.tint(x0, y0, L.fcols, L.frows, W, clamp((t - (self.T_END - 0.3)) / 0.3, 0, 1) * 0.85)
 
 
 class LiveFlight:
@@ -8523,8 +11427,15 @@ class BattleScene(Scene):
     ambient = True
     INTRO_TIME = 1.8
 
+    def music(self):
+        return (battle_song(self.session), "battle")
+
     def __init__(self, app, session: MatchSession) -> None:
         super().__init__(app)
+        try:
+            app.audio.prep(["song:" + battle_song(session)])     # start rendering during the fade, so the fight opens on its music
+        except Exception:
+            pass
         self.session = session
         self.world: Optional[BattleWorld] = None
         self.phase = Phase.INTRO
@@ -8598,8 +11509,11 @@ class BattleScene(Scene):
         self.layout = L = self._layout()
         self.size = (self.app.screen.cols, self.app.screen.rows)
         s = self.app.settings
-        if self.session.wind_override is not None:           # GALE FORCE: a private settings copy with the wind pinned high
-            s = replace(s, wind=self.session.wind_override)
+        wo = self.session.wind_override
+        if isinstance(wo, (tuple, list)):                    # a match WIND band (min, max)
+            s = replace(s, wind=float(wo[1]), wind_min=float(wo[0]))
+        elif wo is not None:                                 # GALE FORCE etc.: a private settings copy with the wind pinned high
+            s = replace(s, wind=float(wo), wind_min=0.0)
         self.cfg_settings = s
         size = self.session.config.world_size or (L.fcols, L.frows * 2)
         seed = self.session.round_seed()
@@ -8652,6 +11566,15 @@ class BattleScene(Scene):
         self.order = [l[k] for k in range(max(map(len, lists))) for l in lists if k < len(l)]
         self.turn = self.order[0]
 
+    def _pan(self, x: float) -> float:
+        return clamp((x / max(1, self.world.width) - 0.5) * 1.2, -1.0, 1.0)
+
+    def _prep_audio(self) -> None:
+        items = ["song:" + battle_song(self.session)]
+        for t in self.world.tanks:
+            items += ["sfx:fire:" + t.ammo.key, "sfx:hit:" + t.ammo.key]
+        self.app.audio.prep(items + ["sfx:tank_hit", "sfx:tank_destroy", "sfx:debris", "sfx:turn_you", "sfx:turn_cpu"])
+
     def _control(self, t: Tank) -> str:
         """'local' = this keyboard, 'ai' = computed here, 'remote' = driven by the LAN peer's messages."""
         cfg = self.session.config
@@ -8678,6 +11601,13 @@ class BattleScene(Scene):
         self.banner = Banner(self._turn_text(self.turn), "SPECIAL READY - FIRE FOR 3 DAMAGE!" if ready else self._wind_text(), tank.color,
                              0.9 if volley else 1.3)
         ctl = self._control(tank)
+        if not volley:
+            if not hasattr(self, "_audio_prepped"):
+                self._audio_prepped = True
+                self._prep_audio()
+            self.app.sfx("turn_you" if ctl == "local" else "turn_cpu", 0.55)
+            if abs(self.world.wind) > 6.0 and self.cfg_settings.wind > 0:
+                self.app.sfx("wind_gust", min(1.0, abs(self.world.wind) / 10), self._pan(self.world.width * (0.8 if self.world.wind > 0 else 0.2)), gap=4)
         self._aim_sent = None
         cfg = self.session.config
         if (ctl == "ai" and cfg.mode == "single" and cfg.special and cfg.net is None and not volley and tank.index in self.ais
@@ -8707,6 +11637,7 @@ class BattleScene(Scene):
                 break
         tank.x = cand
         tank.vis_dx = old - tank.x
+        self.app.sfx("ufo_hop", 0.7, self._pan(tank.x), gap=0.2)
         w.terrain.flatten(tank.x, 10)
         tank.y = float(w.terrain.support_height(tank.x)) + tank.hover
         frac = tank.hp / tank.max_hp
@@ -8724,6 +11655,7 @@ class BattleScene(Scene):
         period = 3 if frac > 0.5 else 2
         if (tank.turns // 2) % period == 0:
             tank.volley = 2
+            self.app.sfx("ufo_volley", 0.9, self._pan(tank.x))
             self.floaters.append(FloatText(tank.x, tank.y + tank.height + 14, "VOLLEY!", Palette.DANGER))
         return False
 
@@ -8775,6 +11707,12 @@ class BattleScene(Scene):
         if net is not None and announce:
             net.send({"t": "fire", "i": tank.index, "a": tank.angle, "p": tank.power})
         tank.recoil = 0.2
+        pan = self._pan(origin[0])
+        self.app.sfx("fire:" + tank.ammo.key, 0.9, pan)
+        if self.blessing_shot:
+            self.app.sfx("bless_choir", 0.8, pan)
+        elif self.special_shot:
+            self.app.sfx("special_fire", 0.9, pan)
         w.fx.muzzle(origin[0], origin[1], tank.angle, tank.shot_color)
         if self._fx_on():
             self.shake.kick(0.9)
@@ -8798,20 +11736,23 @@ class BattleScene(Scene):
                 self.world.fx.trail(x + (k - 1) * 1.5, y + (k - 1), self.current.shot_color, self.current.ammo, f.n + k, self.app.time)
 
     def _begin_blessing(self, ev: Ev) -> None:
-        """A direct hit on an opposing tank: the clock opens and the barrage is planned (every opposing tank gets its own star,
-        and a row of stars spanning half the battlefield around the impact carves the ground)."""
+        """A direct hit on an opposing tank: the clock opens and the judgment is planned. Every opposing tank is struck first, then
+        nine pillars sweep outward across half the battlefield around the impact, each carving a real crater."""
         w, shooter = self.world, self.current
         self.proj, self.ev, self.flags = None, ev, set()
         self.impact = Impact(ev.x, ev.y, ev.kind, ev.tank)
         self.victims = [t for t in w.tanks if t.alive and t.team != shooter.team]
         self.blessing_shot, self.pending, self.flights = False, [], []
-        W, n = w.width, 14
-        span = W * 0.5
+        W, n = w.width, 10
+        span = W * 0.55
         c0 = clamp(ev.x - span / 2, 4, max(4, W - 4 - span))
         ground = sorted((c0 + span * (k + 0.5) / n for k in range(n)), key=lambda x: abs(x - ev.x))
         targets = [(v.x, v.y + v.height * 0.5, v.index) for v in self.victims]
         targets += [(x, float(w.terrain.heights[int(clamp(x, 0, W - 1))]), None) for x in ground if abs(x - shooter.x) >= 14]
-        self.bless = BlessingFX(ev.x, ev.y, targets, full=self._fx_on())
+        wipes = [(x, float(w.terrain.heights[int(x)])) for x in (4 + (W - 9) * k / 11 for k in range(12)) if abs(x - shooter.x) >= 14]
+        self.bless = BlessingFX(ev.x, ev.y, targets, full=self._fx_on(), wipes=tuple(wipes))
+        self._bless_ticks = 0
+        self.app.sfx("bless_star", 1.0, self._pan(ev.x))
         self.phase, self.t = Phase.BLESSING, 0.0
 
     def _bless_kill(self, v: "Tank") -> None:
@@ -8830,35 +11771,55 @@ class BattleScene(Scene):
         w, b, imp = self.world, self.bless, self.impact
         b.t += sdt
         R = PHYS.blast_radius
+        if not b.skipped and b.t < b.T_BANG:                                 # the clock winds: one tick per beat, faster as it closes
+            n = int((b.t / max(0.01, b.T_BANG)) ** 0.7 * 12)
+            if n > getattr(self, "_bless_ticks", 0):
+                self._bless_ticks = n
+                self.app.sfx("bless_tick", 0.7, rate=1.0 + n * 0.03)
         for key in b.events():
             if key == "bang":
+                self.app.sfx("bless_pillar", 1.0, self._pan(imp.x))
                 w.explosions.append(Explosion(imp.x, imp.y, R * 3.0, BlessingFX.GOLDC, 1.2, "blessing"))
                 self.flash = 1.0
                 if self._fx_on():
                     self.shake.kick(5.0)
                 self.app.feedback.emit("explosion")
-            elif key.startswith("hit"):                                      # a star lands: real crater, real kill if it is a tank's star
+            elif key.startswith("hit"):                                      # a pillar lands: real crater, real kill if it is a tank's
                 i = int(key[3:])
                 if i >= len(b.targets):
                     continue
                 tx, ty, ti = b.targets[i]
-                w.terrain_op("blast", tx, ty, R * (1.5 if ti is not None else 2.1))
+                if not b.skipped or i == 0:
+                    self.app.sfx("bless_pillar", 0.9 if ti is not None else 0.6, self._pan(tx), rate=1.0 - 0.02 * (i % 6), gap=0.03)
+                w.terrain_op("blast", tx, ty, R * (1.7 if ti is not None else 2.6))
                 if not b.skipped:
-                    w.explosions.append(Explosion(tx, ty, R * 2.8, BlessingFX.GOLDC if i % 2 == 0 else BlessingFX.VIOLET, 1.0, "blessing"))
-                    if i % 3 == 0:
-                        w.fx.impact(tx, ty, BlessingFX.GOLDC, w.mapdef.theme.soil, 1.6, ammo=self.current.ammo)
+                    w.explosions.append(Explosion(tx, ty, R * 3.2, BlessingFX.GOLDC if i % 2 == 0 else BlessingFX.VIOLET, 1.1, "blessing"))
+                    w.fx.impact(tx, ty, BlessingFX.GOLDC, w.mapdef.theme.soil, 1.8, ammo=self.current.ammo)
+                    self.flash = max(self.flash, 0.25 if ti is None else 0.5)
                     if self._fx_on():
-                        self.shake.kick(2.4)
+                        self.shake.kick(3.0 if ti is None else 5.0)
                 if ti is not None:
                     self._bless_kill(w.tanks[ti])
-            elif key.startswith("twin"):                                     # the duplicated star's smaller crash beside it
+            elif key == "finale":                                            # the nuke at the heart of the clock
+                self.app.sfx("bless_nuke", 1.0, self._pan(imp.x))
+                w.terrain_op("blast", imp.x, imp.y, R * 4.2)
+                if not b.skipped:
+                    w.explosions.append(Explosion(imp.x, imp.y, R * 7.5, (255, 255, 255), 2.0, "blessing"))
+                    self.flash = 1.0
+                    if self._fx_on():
+                        self.shake.kick(11.0)
+                    self.app.feedback.emit("explosion")
+            elif key.startswith("wipe"):                                     # the firewall front reaches a column: the ground is gone
                 i = int(key[4:])
-                if i < len(b.targets):
-                    tx, ty, ti = b.targets[i]
-                    sx = clamp(tx + (5 if i % 4 == 0 else -5), 3, w.width - 4)
-                    sy = float(w.terrain.heights[int(sx)])
-                    w.terrain_op("blast", sx, sy, R * 1.3)
-                    w.explosions.append(Explosion(sx, sy, R * 1.9, BlessingFX.VIOLET, 0.8, "blessing"))
+                if i < len(b.wipes):
+                    wx_, wy_ = b.wipes[i]
+                    if i == 0:
+                        self.app.sfx("bless_firewall", 1.0)
+                    w.terrain_op("blast", wx_, wy_, R * 3.4)
+                    if not b.skipped:
+                        w.explosions.append(Explosion(wx_, wy_, R * 3.4, (255, 150, 60), 1.2, "blessing"))
+                        if self._fx_on():
+                            self.shake.kick(2.0)
         if b.t >= b.T_END:
             for v in self.victims:                                           # safety net: nobody survives the Blessing
                 self._bless_kill(v)
@@ -8907,7 +11868,11 @@ class BattleScene(Scene):
         if "boom" not in self.flags:
             self.flags.add("boom")
             w.explosions.append(Explosion(imp.x, imp.y, max(2.0, R), shooter.shot_color, style=shooter.ammo.boom))
-            if self._fx_on() and ev.radius >= 0.5:
+            if imp.kind is not ImpactKind.OUT:
+                self.app.sfx("hit:" + shooter.ammo.key, clamp(0.55 + 0.35 * ev.radius, 0.4, 1.0) * (1.25 if ev.big else 1.0), self._pan(imp.x),
+                             rate=1.0 if ev.first else 1.0 + 0.04 * (len(self.pending) % 5), gap=0.04)
+                if imp.kind is ImpactKind.TERRAIN and ev.mode == "mound":
+                    self.app.sfx("mound", 0.6, self._pan(imp.x), gap=0.1)
                 self.shake.kick(5.0 if ev.big else 1.6 * min(1.4, ev.radius))
             self.app.feedback.emit("explosion")
         if self.t >= 0.06 and "burst" not in self.flags:
@@ -8929,6 +11894,7 @@ class BattleScene(Scene):
                 if v.shield > 0:
                     v.shield -= 1
                     dmg = 0
+                self.app.sfx("shield_block" if dmg == 0 else "tank_hit", 0.9 if direct else 0.7, self._pan(v.x), gap=0.05)
                 v.hp -= dmg
                 v.hurt = 0.6
                 txt = ("SHIELDED - KILL THE DRONES" if v.guard else "SHIELD ABSORBED") if dmg == 0 else (f"DIRECT HIT -{dmg}" if direct else f"HIT -{dmg}")
@@ -8946,6 +11912,15 @@ class BattleScene(Scene):
                     if t.alive and t.kind != "ufo" and abs(dx) <= ev.pull * 2.2:
                         t.x = clamp(t.x + clamp(dx * 0.6, -ev.pull, ev.pull), 9, w.width - 10) + 0.0
                         t.y = max(t.y, float(w.terrain.support_height(t.x)) + t.hover)
+            elif ev.pull < 0:                                                   # ATOMIC BREATH: the roar hurls tanks away
+                P = -ev.pull
+                for t in w.tanks:
+                    dx = t.x - imp.x
+                    if t.alive and t.kind != "ufo" and abs(dx) <= P * 2.2:
+                        shove = (P * 2.2 - abs(dx)) * 0.65
+                        t.x = clamp(t.x + math.copysign(min(P, shove), dx if dx else 1.0), 9, w.width - 10) + 0.0
+                        t.y = max(t.y, float(w.terrain.support_height(t.x)) + t.hover)
+                        t.hurt = max(t.hurt, 0.3)
         end_t = 1.0 if not (self.flights or self.pending) else 0.5
         if self.t >= end_t:
             if self.pending:
@@ -8974,6 +11949,8 @@ class BattleScene(Scene):
             d.hurt = 0.0
             w.explosions.append(Explosion(d.x, d.y + 3, 12, d.shot_color, 1.3, self.current.ammo.boom))
             w.fx.tank_debris(d.x, d.y + 3, d.color)
+            self.app.sfx("tank_destroy", 1.0, self._pan(d.x))
+            self.app.sfx("debris", 0.7, self._pan(d.x))
             w.fx.impact(d.x, d.y + 3, d.shot_color, w.mapdef.theme.soil, 1.8, self.current.ammo)
             self.flash = 1.0
             if self._fx_on():
@@ -9024,6 +12001,7 @@ class BattleScene(Scene):
             self.floaters.append(FloatText(tank.x, tank.y + tank.height + 8, "SPECIAL ALREADY READY - FIRE!", Palette.AMBER))
             return
         tank.charge += 1
+        self.app.sfx("special_charge", 0.8, self._pan(tank.x))
         self.floaters.append(FloatText(tank.x, tank.y + tank.height + 8, "SPECIAL READY!" if tank.charge >= need else f"CHARGING {tank.charge}/{need}", GOLD))
         net = self.session.config.net
         if net is not None and announce:
@@ -9281,18 +12259,22 @@ class BattleScene(Scene):
         screen.fill(0, top, cols, 2, Palette.PANEL)
         pl = self.world.tanks
         teams = sorted({t.team for t in pl})[:2]
+        left_end, right_start = 0, cols                      # how far the two name plates reach on the title row
         for side, team in enumerate(teams):
             everyone = [t for t in pl if t.team == team]
             members = everyone[:2]
             wins_text = s.hud_wins(team)
             for r, t in enumerate(members):
-                row, nm = top + (r if len(members) > 1 else 0), t.name[:12]
+                row, nm = top + (r if len(members) > 1 else 0), t.name[:16]
+                sw = s.config.special_wait if s.config.special else 0
                 if side == 0:
                     screen.text(1, row, "▌", t.color, Palette.PANEL)
                     screen.text(3, row, nm, t.color, Palette.PANEL)
                     wd = draw_hp(screen, 4 + len(nm), row, t, Palette.PANEL)
                     if s.config.special:
                         screen.text(5 + len(nm) + wd, row, "✦" * t.charge + "·" * (s.config.special_wait - t.charge), GOLD if t.charge >= s.config.special_wait else Palette.MUTED, Palette.PANEL)
+                    if row == top:
+                        left_end = max(left_end, 5 + len(nm) + wd + sw)
                 else:
                     x = cols - 2
                     screen.text(x, row, "▐", t.color, Palette.PANEL)
@@ -9300,6 +12282,8 @@ class BattleScene(Scene):
                     wd = draw_hp(screen, x - 3 - len(nm), row, t, Palette.PANEL, True)
                     if s.config.special:
                         screen.text(x - 5 - len(nm) - wd, row, "✦" * t.charge + "·" * (s.config.special_wait - t.charge), GOLD if t.charge >= s.config.special_wait else Palette.MUTED, Palette.PANEL)
+                    if row == top:
+                        right_start = min(right_start, x - 4 - len(nm) - wd - sw)
             if len(members) == 1:
                 if side == 0:
                     screen.text(3, top + 1, wins_text, Palette.MUTED, Palette.PANEL)
@@ -9307,7 +12291,12 @@ class BattleScene(Scene):
                     screen.text(cols - 2 - len(wins_text), top + 1, wins_text, Palette.MUTED, Palette.PANEL)
             else:
                 pass
-        screen.center(top, s.hud_title(), Palette.TEXT, Palette.PANEL)
+        parts = s.hud_title().split("  ·  ")                  # the title gives up its least important parts until it fits the gap
+        gap = right_start - left_end - 2
+        for cand in ["  ·  ".join(parts[:k]) for k in range(len(parts), 0, -1)] + ["  ·  ".join(parts[1:2])]:
+            if cand and len(cand) <= gap:
+                screen.text(left_end + 1 + (gap - len(cand)) // 2 + 1, top, cand, Palette.TEXT, Palette.PANEL)
+                break
         cur = self.current
         badge = f" {self._turn_text(self.turn)} "
         state = self._state_text()
@@ -9354,7 +12343,8 @@ class BattleScene(Scene):
         if self.phase is Phase.AI_THINKING:
             screen.text(2, by + 2, "AI FIRE CONTROL: " + self.plan.status, Palette.AMBER, Palette.PANEL)
         else:
-            caps = [("A/D", "AIM"), ("W/S", "POWER"), ("SHIFT", "COARSE"), ("SPACE", "FIRE")]
+            caps = ([("◄►", "AIM"), ("▲▼", "POWER"), ("SHIFT", "COARSE"), ("SPACE", "FIRE")] if isinstance(self, PracticeScene)
+                    else [("A/D", "AIM"), ("W/S", "POWER"), ("SHIFT", "COARSE"), ("SPACE", "FIRE")])
             if self.session.config.special:
                 caps.append(("X", "CHARGE"))
             draw_keycaps(screen, 2, by + 2, tuple(caps + [("ESC", "MENU")]), Palette.PANEL)
@@ -9438,7 +12428,7 @@ class PauseScene(Scene):
 # Nothing here touches the wallet, unlocks or the Tournament; the only thing saved is a "tut:N" tick in the story list.
 # ---------------------------------------------------------------------------
 TUT_LESSONS = (
-    ("1  AIMING & POWER", "Rotate with A/D (SHIFT = big steps), set power with W/S, fire with SPACE or ENTER. A higher angle lobs the shell; more power sends it farther.",
+    ("1  AIMING & POWER", "Rotate the barrel with ◄ ► (hold SHIFT for big steps), set the power with ▲ ▼, fire with SPACE or ENTER. A higher angle lobs the shell; more power sends it farther.",
      "HIT THE TARGET ONCE", "Too short? add power. Too long? lower it. Change one thing at a time."),
     ("2  WIND", "Wind pushes every shell and changes each turn. The HUD arrows show its direction and strength; the dotted aim guide ignores it.",
      "FIRE 3 SHOTS AND LAND ONE HIT", "Fire the same aim twice and compare. Aim INTO the wind to compensate."),
@@ -9566,16 +12556,22 @@ class PracticeScene(BattleScene):
         else:
             name, body, goal, tip = TUT_LESSONS[self.lesson - 1]
             prog = f"SHOTS {self.shots}  HITS {self.hits}" + (f"  CRATERS {self.craters}" if self.lesson == 4 else "")
-        w = min(L.fcols - 2, 74)
-        lines = textwrap.wrap(body, w - 4)[:3] + ["GOAL: " + goal + "   " + prog, ("DONE!  [N] " + ("BACK TO LESSONS" if self.adv is not None or self.lesson >= 4 else "NEXT LESSON")
-                                                                              + "  ·  keep practising if you like") if self.done
-                                                else self.note + "   ·   " + tip[:max(0, w - len(self.note) - 9)]]
+        w = min(L.fcols - 2, 74 if L.frows >= 26 else 96)       # short terminals: a wider, shallower coach box
+        tw = w - 4
+        lines = [(ln, Palette.WHITE) for ln in textwrap.wrap(body, tw)]
+        lines += [(ln, GOLD) for ln in textwrap.wrap("GOAL: " + goal + "   " + prog, tw)]
+        if self.done:
+            lines += [(ln, Palette.OK) for ln in textwrap.wrap("DONE!  [N] " + ("BACK TO LESSONS" if self.adv is not None or self.lesson >= 4
+                                                                                  else "NEXT LESSON") + "  ·  keep practising if you like", tw)]
+        else:
+            lines += [(ln, Palette.AMBER) for ln in textwrap.wrap(self.note, tw)] + [(ln, Palette.MUTED) for ln in textwrap.wrap(tip, tw)]
         h = len(lines) + 2
+        self.coach_h = h
         x, y = L.fx + 1, L.fy + 1
         screen.fill(x, y, w, h, Palette.PANEL)
         screen.text(x + 2, y, f" TUTORIAL · {name} ", GOLD, Palette.PANEL)
-        for k, ln in enumerate(lines):
-            screen.text(x + 2, y + 1 + k, ln[:w - 3], (Palette.OK if self.done and k == len(lines) - 1 else Palette.WHITE if k < len(lines) - 2 else GOLD if k == len(lines) - 2 else Palette.AMBER), Palette.PANEL)
+        for k, (ln, c) in enumerate(lines):
+            screen.text(x + 2, y + 1 + k, ln, c, Palette.PANEL)
         screen.text(x + w - 22, y + h - 1, " [T] HIDE  [ESC] MENU ", Palette.MUTED, Palette.PANEL)
 
 
@@ -9650,7 +12646,7 @@ class TutorialScene(BackdropScene):
             screen.text(x + 6, y + 3 + i * 2, ("▶ " if sel else "  ") + lab, GOLD if sel else Palette.TEXT, Palette.PANEL)
             if done:
                 screen.text(x + 62, y + 3 + i * 2, "✓", Palette.OK, Palette.PANEL)
-        draw_keycaps(screen, x + 8, y + 18, (("W/S", "CHOOSE"), ("ENTER", "START"), ("ESC", "BACK")), Palette.PANEL)
+        draw_keycaps(screen, x + 8, y + 18, (("▲▼", "CHOOSE"), ("ENTER", "START"), ("ESC", "BACK")), Palette.PANEL)
 
 
 # ===========================================================================
@@ -9658,6 +12654,83 @@ class TutorialScene(BackdropScene):
 # ===========================================================================
 RPS_NAMES = ("ROCK", "PAPER", "SCISSORS")
 RPS_ART = ((" ▄███▄ ", "███████", " ▀███▀ "), ("┌─────┐", "│     │", "└─────┘"), (" ╲   ╱ ", "   ╳   ", " ○   ○ "))
+
+
+def _hp_ell(cv, cx: float, cy: float, rx: float, ry: float, col: RGB, y_shade: float = 0.0) -> None:
+    for dx in range(-int(rx) - 1, int(rx) + 2):
+        for dy in range(-int(ry) - 1, int(ry) + 2):
+            if (dx / max(0.5, rx)) ** 2 + (dy / max(0.5, ry)) ** 2 <= 1.0:
+                cv.plot(int(cx + dx), int(cy + dy), shade(col, 1.0 - y_shade * (0.5 - dy / (2 * max(0.5, ry)))))
+
+
+def _hp_cap(cv, x0: float, y0: float, x1: float, y1: float, w: float, col: RGB, y_shade: float = 0.0) -> None:
+    n = int(max(abs(x1 - x0), abs(y1 - y0)) * 2) + 1
+    for i in range(n + 1):
+        u = i / n
+        _hp_ell(cv, x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, w / 2, w / 2, col, y_shade)
+
+
+def hand_sprite(kind: int, skin: RGB, sleeve: RGB, bob: float = 0.0, mirror: bool = False) -> "PixelCanvas":
+    """A 32x36 pixel-art hand (0 rock, 1 paper, 2 scissors), outlined and lit from above, wearing a coloured cuff.
+    Drawn twice (a dark expanded pass, then the skin) so every shape gets a clean outline."""
+    W, H = 32, 36
+    cv = PixelCanvas(W, H, (0, 0, 0))
+    ol = (46, 26, 24)
+
+    def parts(grow: float, col: RGB, sh: float) -> None:
+        g = grow
+        if kind == 0:                                                       # ROCK: a clenched fist
+            _hp_ell(cv, 16, 13, 9 + g, 7.5 + g, col, sh)
+            for i in range(4):
+                _hp_ell(cv, 9.6 + i * 4.3, 19.2, 2.7 + g, 3.4 + g, col, sh)
+            _hp_cap(cv, 7, 11, 15, 14.5, 4.6 + 2 * g, col, sh)               # the thumb across the front
+        elif kind == 1:                                                     # PAPER: a flat open hand, fingers fanned
+            _hp_ell(cv, 16, 12, 8.2 + g, 6.6 + g, col, sh)
+            for i, ang in enumerate((-13, -4, 5, 14)):
+                a = math.radians(ang)
+                ln = (14, 16, 15.5, 12)[i]
+                bx = 11 + i * 3.3
+                _hp_cap(cv, bx, 16, bx + math.sin(a) * ln, 16 + math.cos(a) * ln, 3.3 + 2 * g, col, sh)
+            _hp_cap(cv, 8, 10, 2.5, 19, 3.8 + 2 * g, col, sh)                # thumb out to the side
+        else:                                                               # SCISSORS: index + middle in a V, the rest curled
+            _hp_ell(cv, 16, 11, 8.2 + g, 6.2 + g, col, sh)
+            _hp_cap(cv, 12, 15, 6.5, 31, 3.6 + 2 * g, col, sh)
+            _hp_cap(cv, 19, 15, 25, 31, 3.6 + 2 * g, col, sh)
+            for cx_ in (11.5, 16.5):
+                _hp_ell(cv, cx_, 14.5, 2.7 + g, 2.5 + g, col, sh)            # ring + little finger folded down
+            _hp_cap(cv, 8, 10, 15, 13, 4.0 + 2 * g, col, sh)
+    parts(1.0, ol, 0.0)
+    # sleeve / cuff (outlined)
+    for x in range(8, 25):
+        for y in range(0, 7):
+            cv.plot(x, y, ol)
+    for x in range(9, 24):
+        for y in range(1, 6):
+            cv.plot(x, y, shade(sleeve, 0.7 + 0.3 * (y / 5)))
+    for x in range(9, 24):
+        cv.plot(x, 6, mix(sleeve, (255, 255, 255), 0.45))
+    parts(0.0, skin, 0.45)
+    # knuckle / finger lines for a hand-drawn feel
+    if kind == 0:
+        for i in range(3):
+            for y in range(16, 19):
+                cv.plot(int(11.9 + i * 4.3), y, shade(skin, 0.62))
+    elif kind == 1:
+        for i in range(3):
+            cv.plot(int(13.6 + i * 3.3), 18, shade(skin, 0.6))
+    if mirror:
+        cv.rows = [row[::-1] for row in cv.rows]
+    return cv
+
+
+def blit_sprite(dst: "PixelCanvas", src: "PixelCanvas", x: int, y: int, flip_y: bool = False) -> None:
+    """Copies every non-black pixel of src onto dst at (x, y) (both y-up)."""
+    for sy in range(src.h):
+        for sx in range(src.w):
+            c = src.rows[src.h - 1 - sy][sx]
+            if c != (0, 0, 0):
+                dst.plot(x + sx, y + sy, c)
+
 
 
 class RPSScene(BackdropScene):
@@ -9669,8 +12742,12 @@ class RPSScene(BackdropScene):
         self.s, self.seat, self.net = session, seat, session.config.net
         self.picks: list = [None, None]
         self.stage, self.turn, self.sel, self.t, self.winner, self.note = "pick", 0, 0, 0.0, None, ""
-        pl = [p for p in session.config.players if not p.is_ai][:2]
-        self.names = [(p.name or f"PLAYER {i + 1}")[:14] for i, p in enumerate(pl)] + ["PLAYER 1", "PLAYER 2"][len(pl):]
+        self.cpu = session.config.mode == "single"      # vs the computer: seat 1 is the CPU and picks at random
+        if self.cpu:
+            self.names = ["YOU", "CPU"]
+        else:
+            pl = [p for p in session.config.players if not p.is_ai][:2]
+            self.names = [(p.name or f"PLAYER {i + 1}")[:14] for i, p in enumerate(pl)] + ["PLAYER 1", "PLAYER 2"][len(pl):]
         self.choice = 0                                 # FIRST (0) / SECOND (1)
 
     @staticmethod
@@ -9683,7 +12760,7 @@ class RPSScene(BackdropScene):
 
     def _both(self) -> None:
         a, b = self.picks
-        self.stage, self.t = "reveal", 0.0
+        self.stage, self.t = "count", 0.0                 # both hands shake: ROCK... PAPER... SCISSORS... SHOOT!
         self.winner = None if a == b else (0 if self.beats(a, b) else 1)
 
     def update(self, dt: float) -> None:
@@ -9707,9 +12784,23 @@ class RPSScene(BackdropScene):
                 self.net.drop(f)
                 self._finish(int(f.get("p", 0)))
                 return
-        if self.stage == "reveal" and self.t > 1.8:
+        if self.stage == "cpufirst" and self.t > 1.6:
+            self._finish(1)
+            return
+        if self.stage == "count":
+            beat = min(3, int(self.t / 0.6))
+            if beat != getattr(self, "_beat", -1):
+                self._beat = beat
+                self.app.sfx("rps_shake" if beat < 3 else "rps_reveal", 0.9)
+        else:
+            self._beat = -1
+        if self.stage == "count" and self.t > 2.3:
+            self.stage, self.t = "reveal", 0.0
+        elif self.stage == "reveal" and self.t > 2.0:
             if self.winner is None:
                 self.picks, self.stage, self.turn, self.note = [None, None], "pick", 0, "TIE! PICK AGAIN"
+            elif self.cpu and self.winner == 1:
+                self.stage, self.t = "cpufirst", 0.0                  # the computer won: it shoots first
             elif self.net is None:
                 self.stage = "choose"
             else:
@@ -9735,6 +12826,9 @@ class RPSScene(BackdropScene):
                         self.net.send({"t": "rps", "c": self.sel})
                         if self.picks[1 - self.seat] is not None:
                             self._both()
+                elif self.cpu:
+                    self.picks = [self.sel, self.app.rng.randrange(3)]
+                    self._both()
                 else:
                     self.picks[self.turn] = self.sel
                     if self.turn == 0:
@@ -9749,49 +12843,108 @@ class RPSScene(BackdropScene):
                     self.net.send({"t": "rpsfirst", "p": first_seat})
                 self._finish(first_seat)
 
+    SKINS = ((244, 204, 170), (176, 118, 84))
+
+    def _hands(self, screen: Screen, x: int, y: int, kinds: tuple, bobs: tuple, glow: Optional[int] = None) -> None:
+        """Two pixel-art hands facing each other, half-block rendered into the panel."""
+        W_PX, H_PX = 84, 38
+        cv = PixelCanvas(W_PX, H_PX, (0, 0, 0))
+        cols = [live_color(p.tank_color, self.app.time) for p in self.s.config.players if not p.is_ai][:2]
+        cols += [(90, 200, 255), (255, 150, 90)][len(cols):]
+        for k in range(2):
+            sp = hand_sprite(kinds[k], self.SKINS[k], cols[k], mirror=bool(k))
+            hx = 6 if k == 0 else W_PX - 6 - sp.w
+            blit_sprite(cv, sp, hx, int(bobs[k]))
+        top = y
+        for r in range(H_PX // 2):
+            for c in range(W_PX):
+                a_, b_ = cv.rows[2 * r][c], cv.rows[2 * r + 1][c]
+                if a_ == (0, 0, 0) and b_ == (0, 0, 0):
+                    continue
+                bgc = Palette.PANEL
+                screen.put(x + c, top + r, "▀", bgc if a_ == (0, 0, 0) else a_, bgc if b_ == (0, 0, 0) else b_)
+
     def draw(self, screen: Screen) -> None:
         super().draw(screen)
-        W = 70
-        x, y = panel(screen, W, 20, "WHO SHOOTS FIRST?")
+        W, H = 92, 26
+        x, y = panel(screen, W, H, "WHO SHOOTS FIRST?")
         me = self.seat
+        gx = x + (W - 84) // 2                                        # the hands' stage, centred
         if self.stage == "pick":
-            who = (f"{self.names[me]}: PICK" if me is not None else f"{self.names[self.turn]}: PICK  (the other player look away!)")
-            screen.center(y + 2, who, GOLD, Palette.PANEL, x, W)
-            if self.net is not None and self.picks[me] is not None:
-                screen.center(y + 4, "LOCKED IN - WAITING FOR THE OTHER PLAYER...", Palette.MUTED, Palette.PANEL, x, W)
+            who = (f"{self.names[me]}: CHOOSE YOUR HAND" if me is not None else "CHOOSE YOUR HAND  (the CPU picks at random)" if self.cpu
+                   else f"{self.names[self.turn]}: CHOOSE  (the other player look away!)")
+            screen.center(y + 1, who, GOLD, Palette.PANEL, x, W)
+            locked = self.net is not None and self.picks[me] is not None
             for i in range(3):
-                bx = x + 6 + i * 20
-                sel = i == self.sel and not (self.net is not None and self.picks[me] is not None)
-                for k, ln in enumerate(RPS_ART[i]):
-                    screen.text(bx + 5, y + 6 + k, ln, GOLD if sel else Palette.TEXT, Palette.PANEL)
-                screen.text(bx + 6, y + 10, ("▶ " if sel else "  ") + RPS_NAMES[i], Palette.WHITE if sel else Palette.MUTED, Palette.PANEL)
-            if self.note:
-                screen.center(y + 13, self.note, Palette.AMBER, Palette.PANEL, x, W)
-            screen.center(y + 17, "◄ ►  CHOOSE     ENTER  LOCK IN     (or 1 2 3)", Palette.PRIMARY_DIM, Palette.PANEL, x, W)
+                bx = x + 10 + i * 27
+                sel = i == self.sel and not locked
+                sp = hand_sprite(i, self.SKINS[(me if me is not None else self.turn) % 2], (90, 200, 255) if (me or self.turn) == 0 else (255, 150, 90))
+                cv = PixelCanvas(32, 36, (0, 0, 0))
+                blit_sprite(cv, sp, 0, 3 if sel and int(self.app.time * 4) % 2 else 0)
+                for r in range(18):
+                    for c in range(32):
+                        a_, b_ = cv.rows[2 * r][c], cv.rows[2 * r + 1][c]
+                        if a_ == (0, 0, 0) and b_ == (0, 0, 0):
+                            continue
+                        dim = 1.0 if (sel or locked is False) else 0.55
+                        screen.put(bx + c - 2, y + 4 + r, "▀", shade(Palette.PANEL, 1) if a_ == (0, 0, 0) else shade(a_, dim if sel else 0.6),
+                                   Palette.PANEL if b_ == (0, 0, 0) else shade(b_, dim if sel else 0.6))
+                screen.center(y + 22, "", Palette.PANEL, Palette.PANEL, x, W) if False else None
+                screen.text(bx + 8 - len(RPS_NAMES[i]) // 2 + 3, y + 21, ("▶ " if sel else "  ") + RPS_NAMES[i], Palette.WHITE if sel else Palette.MUTED, Palette.PANEL)
+            if locked:
+                screen.center(y + 23, "LOCKED IN - WAITING FOR THE OTHER PLAYER...", Palette.MUTED, Palette.PANEL, x, W)
+            elif self.note:
+                screen.center(y + 23, self.note, Palette.AMBER, Palette.PANEL, x, W)
+            draw_keycaps(screen, x + 22, y + H - 2, (("◄ ►", "CHOOSE"), ("ENTER", "LOCK IN"), ("1 2 3", "QUICK PICK")), Palette.PANEL)
+        elif self.stage == "count":
+            beat = int(self.t / 0.5)
+            word = ("ROCK...", "PAPER...", "SCISSORS...", "SHOOT!", "SHOOT!")[min(4, beat)]
+            bobs = tuple(max(0, 14 * abs(math.sin(self.t * math.pi / 0.5)) - 2) if beat < 3 else 0 for _ in range(2))
+            self._hands(screen, gx, y + 4, (0, 0), bobs)
+            screen.center(y + 22, word, GOLD if beat >= 3 else Palette.WHITE, Palette.PANEL, x, W)
+            names = f"{self.names[0]}     vs     {self.names[1]}"
+            screen.center(y + 1, names, Palette.AMBER, Palette.PANEL, x, W)
         elif self.stage == "reveal":
             a, b = self.picks
-            screen.center(y + 2, "REVEAL!", GOLD, Palette.PANEL, x, W)
-            for k, (n, pk) in enumerate(zip(self.names, (a, b))):
-                bx = x + 8 + k * 32
-                screen.text(bx, y + 4, n, Palette.AMBER, Palette.PANEL)
-                for j, ln in enumerate(RPS_ART[pk]):
-                    screen.text(bx + 2, y + 6 + j, ln, Palette.WHITE, Palette.PANEL)
-                screen.text(bx + 2, y + 10, RPS_NAMES[pk], GOLD if self.winner == k else Palette.MUTED, Palette.PANEL)
-            screen.center(y + 13, "TIE!" if self.winner is None else f"{self.names[self.winner]} WINS", Palette.OK if self.winner is not None else Palette.AMBER, Palette.PANEL, x, W)
+            self._hands(screen, gx, y + 4, (a, b), (4 * ease_out(clamp(self.t / 0.2, 0, 1)),) * 2, self.winner)
+            screen.center(y + 1, f"{self.names[0]}     vs     {self.names[1]}", Palette.AMBER, Palette.PANEL, x, W)
+            if self.t < 0.12:
+                screen.tint(x, y, W, H, (255, 255, 255), 0.5 * (1 - self.t / 0.12))
+            screen.center(y + 21, f"{RPS_NAMES[a]}   vs   {RPS_NAMES[b]}", Palette.WHITE, Palette.PANEL, x, W)
+            screen.center(y + 23, "IT'S A TIE!" if self.winner is None else f"{self.names[self.winner]} WINS!", Palette.OK if self.winner is not None else Palette.AMBER, Palette.PANEL, x, W)
         elif self.stage == "choose":
-            screen.center(y + 2, f"{self.names[self.winner]} WON - CHOOSE", GOLD, Palette.PANEL, x, W)
+            screen.center(y + 3, f"{self.names[self.winner]} WON", GOLD, Palette.PANEL, x, W)
+            screen.center(y + 5, "CHOOSE WHO SHOOTS FIRST", Palette.WHITE, Palette.PANEL, x, W)
             for i, lab in enumerate(("GO FIRST", "GO SECOND")):
                 sel = i == self.choice
-                screen.center(y + 6 + i * 2, ("▶ " if sel else "  ") + lab, GOLD if sel else Palette.TEXT, Palette.PANEL, x, W)
-            screen.center(y + 14, "◄ ►  CHOOSE     ENTER  CONFIRM", Palette.PRIMARY_DIM, Palette.PANEL, x, W)
+                screen.fill(x + 30, y + 9 + i * 4, 32, 3, Palette.PANEL_HI if sel else Palette.PANEL)
+                screen.center(y + 10 + i * 4, ("▶ " if sel else "  ") + lab + (" ◀" if sel else "  "), GOLD if sel else Palette.TEXT, Palette.PANEL_HI if sel else Palette.PANEL, x + 30, 32)
+            draw_keycaps(screen, x + 28, y + H - 2, (("◄ ►", "CHOOSE"), ("ENTER", "CONFIRM")), Palette.PANEL)
+        elif self.stage == "cpufirst":
+            screen.center(y + 10, "THE CPU WINS - IT SHOOTS FIRST", Palette.AMBER, Palette.PANEL, x, W)
         else:
-            screen.center(y + 4, f"{self.names[self.winner]} WON - CHOOSING WHO GOES FIRST...", Palette.AMBER, Palette.PANEL, x, W)
+            screen.center(y + 10, f"{self.names[self.winner]} WON - CHOOSING WHO GOES FIRST...", Palette.AMBER, Palette.PANEL, x, W)
 
 
 # ===========================================================================
 # PROFILES: up to three named saves in one game instance (profile 1 is the original save file: nothing to migrate)
 # ===========================================================================
 PROFILE_MAX = 3
+
+
+def fmt_playtime(sec: float) -> str:
+    """12345678 s -> '142D 21H 21M'; shows years and months once they exist (365-day years, 30-day months)."""
+    m = max(0, int(sec)) // 60
+    y, m = divmod(m, 525600)
+    mo, m = divmod(m, 43200)
+    d, m = divmod(m, 1440)
+    h, mi = divmod(m, 60)
+    parts = []
+    for val, lab in ((y, "Y"), (mo, "MO"), (d, "D"), (h, "H")):
+        if parts or val:
+            parts.append(f"{val}{lab}")
+    parts.append(f"{mi:02d}M" if parts else f"{mi}M")
+    return " ".join(parts)
 
 
 class ProfileBook:
@@ -9874,10 +13027,8 @@ class ProfilesScene(BackdropScene):
     def _rows(self) -> list:
         return list(self.app.profiles.profiles) + ([None] if len(self.app.profiles.profiles) < PROFILE_MAX else [])
 
-    def _summary(self, p: dict) -> str:
-        sv = self.app.save if p["id"] == self.app.profiles.active else SaveData.load(self.app.profiles.path_of(p["id"]))
-        pt = int(sv.playtime)
-        return f"{pt // 3600}H {pt // 60 % 60:02d}M   LEVEL {max(sv.completed | {0})}/20   {sv.coins:,} COINS"
+    def _save_of(self, p: dict) -> "SaveData":
+        return self.app.save if p["id"] == self.app.profiles.active else SaveData.load(self.app.profiles.path_of(p["id"]))
 
     def handle(self, ev: InputEvent) -> None:
         book, rows = self.app.profiles, self._rows()
@@ -9926,30 +13077,61 @@ class ProfilesScene(BackdropScene):
                 self.app.profiles_delete(rows[self.sel]["id"])
                 self.confirm, self.msg, self.sel = False, "PROFILE DELETED", 0
 
+    TIER_NAMES = ("NEW GAME", "TOURNAMENT CLEARED", "MISSIONS CLEARED", "VAULT CLEARED", "LEGEND")
+
+    @staticmethod
+    def outline_color(tier: int, i: int, t: float) -> RGB:
+        """Border colour of the i-th perimeter cell: gold / pulsing green / void / astral+gold, so progress reads at a glance."""
+        if tier == 1:
+            return mix((190, 140, 40), (255, 222, 120), 0.5 + 0.5 * math.sin(t * 1.2 + i * 0.1))
+        if tier == 2:
+            return mix((14, 80, 36), (110, 255, 150), 0.5 + 0.5 * math.sin(t * 3.0 + i * 0.05))
+        if tier == 3:
+            return mix(void_tint(t), (10, 4, 28), 0.5 + 0.5 * math.sin(t * 1.4 + i * 0.12))
+        if tier == 4:
+            return (255, 214, 90) if (i + int(t * 6)) % 6 < 3 else astral(t + i * 0.03)
+        return Palette.LINE
+
     def draw(self, screen: Screen) -> None:
         super().draw(screen)
-        W = 76
-        x, y = panel(screen, W, 20, "PROFILES")
-        book, rows = self.app.profiles, self._rows()
+        W, H = 84, 26
+        x, y = panel(screen, W, H, "PROFILES")
+        book, rows, t = self.app.profiles, self._rows(), self.app.time
         screen.center(y + 1, "Separate saves in one game. Switching saves your current profile first.", Palette.MUTED, Palette.PANEL, x, W)
         for i, p in enumerate(rows):
-            sel, ry = i == self.sel, y + 3 + i * 3
+            sel, ry = i == self.sel, y + 3 + i * 5
+            bw, bx = W - 6, x + 3
+            screen.fill(bx, ry, bw, 5, Palette.PANEL_HI if sel else Palette.PANEL)
             bg = Palette.PANEL_HI if sel else Palette.PANEL
-            screen.fill(x + 2, ry, W - 4, 2, bg)
             if p is None:
-                screen.text(x + 4, ry, "+ NEW PROFILE", GOLD if sel else Palette.MUTED, bg)
+                screen.text(bx + 3, ry + 2, "+ NEW PROFILE", GOLD if sel else Palette.MUTED, bg)
                 continue
+            sv = self._save_of(p)
+            tier, cnt = sv.progress_tier(), sv.progress_counts()
+            per = [(bx + k, ry) for k in range(bw)] + [(bx + bw - 1, ry + k) for k in range(1, 5)] + [(bx + bw - 1 - k, ry + 4) for k in range(1, bw)] + [(bx, ry + 4 - k) for k in range(1, 4)]
+            for n, (px, py) in enumerate(per):
+                ch = "═" if py in (ry, ry + 4) else "║"
+                if (px, py) == (bx, ry): ch = "╔"
+                elif (px, py) == (bx + bw - 1, ry): ch = "╗"
+                elif (px, py) == (bx, ry + 4): ch = "╚"
+                elif (px, py) == (bx + bw - 1, ry + 4): ch = "╝"
+                screen.put(px, py, ch, self.outline_color(tier, n, t), bg)
             act = p["id"] == book.active
-            screen.text(x + 4, ry, ("▶ " if sel else "  ") + p["name"] + ("   ★ ACTIVE" if act else ""), GOLD if act else Palette.WHITE if sel else Palette.TEXT, bg)
-            screen.text(x + 6, ry + 1, self._summary(p), Palette.MUTED, bg)
+            screen.text(bx + 3, ry + 1, ("▶ " if sel else "  ") + p["name"] + ("   ★ ACTIVE" if act else ""), GOLD if act else Palette.WHITE if sel else Palette.TEXT, bg)
+            tn = self.TIER_NAMES[tier]
+            screen.text(bx + bw - 3 - len(tn), ry + 1, tn, self.outline_color(tier, int(t * 10), t), bg)
+            line = f"PLAYTIME {fmt_playtime(sv.playtime)}    ◉ {sv.coins:,}    ◈ {sv.credits:,}"
+            screen.text(bx + 5, ry + 2, line[:bw - 8], Palette.AMBER, bg)
+            c = cnt
+            screen.text(bx + 5, ry + 3, f"TANKS {c['tanks'][0]}/{c['tanks'][1]}   AMMO {c['ammo'][0]}/{c['ammo'][1]}   MAPS {c['maps'][0]}/{c['maps'][1]}   SCREENS {c['screens'][0]}/{c['screens'][1]}"[:bw - 8], Palette.MUTED, bg)
         if self.mode:
-            screen.fill(x + 6, y + 13, W - 12, 3, Palette.PANEL_HI)
-            screen.text(x + 8, y + 13, "NAME THE NEW PROFILE:" if self.mode == "new" else "RENAME PROFILE:", Palette.AMBER, Palette.PANEL_HI)
-            screen.text(x + 8, y + 14, self.buf + ("█" if int(self.app.time * 2) % 2 == 0 else " "), Palette.WHITE, Palette.PANEL_HI)
-            screen.text(x + 8, y + 15, "ENTER OK   ESC CANCEL", Palette.MUTED, Palette.PANEL_HI)
+            screen.fill(x + 6, y + 18, W - 12, 4, Palette.PANEL_HI)
+            screen.text(x + 8, y + 18, "NAME THE NEW PROFILE:" if self.mode == "new" else "RENAME PROFILE:", Palette.AMBER, Palette.PANEL_HI)
+            screen.text(x + 8, y + 19, self.buf + ("█" if int(self.app.time * 2) % 2 == 0 else " "), Palette.WHITE, Palette.PANEL_HI)
+            screen.text(x + 8, y + 20, "ENTER OK   ESC CANCEL", Palette.MUTED, Palette.PANEL_HI)
         elif self.msg:
-            wrap_center(screen, y + 13, self.msg, W - 8, Palette.AMBER, Palette.PANEL, x, W, 2)
-        draw_keycaps(screen, x + 6, y + 18, (("▲▼", "CHOOSE"), ("ENTER", "SWITCH/NEW"), ("R", "RENAME"), ("X", "DELETE"), ("ESC", "BACK")), Palette.PANEL)
+            wrap_center(screen, y + 21, self.msg, W - 8, Palette.AMBER, Palette.PANEL, x, W, 2)
+        draw_keycaps(screen, x + 8, y + H - 2, (("▲▼", "CHOOSE"), ("ENTER", "SWITCH/NEW"), ("R", "RENAME"), ("X", "DELETE"), ("ESC", "BACK")), Palette.PANEL)
 
 
 class RoundMapScene(BackdropScene):
@@ -10051,10 +13233,20 @@ class RoundMapWaitScene(BackdropScene):
 class RoundResultScene(Scene):
     overlay = True
 
+    def music(self):
+        return (self.app.last_battle_song, "result") if self.app.last_battle_song else None
+
     def __init__(self, app, battle: BattleScene) -> None:
         super().__init__(app)
         self.battle = battle
         self.session = battle.session
+        try:
+            won = 1 - battle.doomed.team
+            mine = {t.team for t in battle.world.tanks if battle._control(t) == "local"}
+            good = len(mine) != 1 or won in mine
+            app.sfx(("match_" if self.session.over else "round_") + ("win" if good else "lose"), 1.0)
+        except Exception:
+            pass
 
         self.net = battle.session.config.net
         self.ready_me = self.ready_peer = self.moved = False
@@ -10128,6 +13320,10 @@ ROUND_PRESETS = (3, 5, 7, 10, 0)          # 0 = custom
 HP_PRESETS = (1, 3, 5, 7, 10, 0)
 
 
+WIND_MODES = (("OFF", (0.0, 0.0)), ("REGULAR", (0.0, 6.0)), ("LOW", (0.0, 2.0)), ("MEDIUM", (2.0, 4.0)),
+              ("HIGH", (4.0, 6.0)), ("CRAZY", (6.0, 12.0)))       # per-match WIND bands: (min, max) strength
+
+
 @dataclass
 class Rules:
     """Two Player / LAN match rules: BEST OF or FIRST TO n rounds, hearts, the battlefield, wind and the special attack."""
@@ -10137,7 +13333,7 @@ class Rules:
     hp_idx: int = 1
     hp_custom: int = 4
     map_key: str = ""                     # "" = random battlefield
-    wind: bool = True
+    wind: int = 1                         # index into WIND_MODES (0 OFF, 1 REGULAR, 2 LOW, 3 MEDIUM, 4 HIGH, 5 CRAZY)
     special: bool = False
     ammo_fx: bool = True                  # special ammo effects ON/OFF
     pick_maps: bool = True                # choose the battlefield every round (loser picks) instead of a random one
@@ -10164,13 +13360,13 @@ class Rules:
     def mapdef(self) -> Optional[MapDefinition]:
         return all_maps().get(self.map_key)
 
-    def wind_value(self, settings: "Settings") -> float:
-        """Wind strength for this match: your Settings strength when ON (a medium default if that is OFF), 0 when OFF."""
-        return 0.0 if not self.wind else (settings.wind if settings.wind > 0 else 5.0)
+    def wind_value(self, settings: "Settings") -> tuple:
+        """(min, max) wind strength for this match, from its WIND band."""
+        return WIND_MODES[int(clamp(self.wind, 0, len(WIND_MODES) - 1))][1]
 
     def summary(self) -> str:
         m = self.mapdef.name if self.mapdef else "RANDOM MAP"
-        return f"{self.label} · {self.hp} HP · {m} · WIND {'ON' if self.wind else 'OFF'}" + (" · SPECIAL" if self.special else "") + ("" if self.ammo_fx else " · AMMO FX OFF") + (" · BLESSING" if self.blessing else "")
+        return f"{self.label} · {self.hp} HP · {m} · WIND {WIND_MODES[self.wind][0]}" + (" · SPECIAL" if self.special else "") + ("" if self.ammo_fx else " · AMMO FX OFF") + (" · BLESSING" if self.blessing else "")
 
     def dump(self) -> str:
         return f"{self.fmt},{self.n_idx},{self.n_custom},{self.hp_idx},{self.hp_custom},{self.map_key},{int(self.wind)},{int(self.special)},{int(self.ammo_fx)},{int(self.pick_maps)},{int(self.blessing)}"
@@ -10182,7 +13378,8 @@ class Rules:
             f, a, b, c, d = parts[:5]                         # older saves only had the first five fields
             r = cls(f if f in ("best", "first") else "best", int(a), int(b), int(c), int(d))
             if len(parts) >= 8:
-                r.map_key, r.wind, r.special = parts[5], parts[6] == "1", parts[7] == "1"
+                r.map_key, r.special = parts[5], parts[7] == "1"
+                r.wind = int(parts[6]) if parts[6].isdigit() and int(parts[6]) < len(WIND_MODES) else 1    # old saves: "1" = REGULAR, "0" = OFF
             if len(parts) >= 9:
                 r.ammo_fx = parts[8] == "1"
             if len(parts) >= 10:
@@ -10257,7 +13454,7 @@ class RulesScene(BackdropScene):
             elif k == "next":
                 r.pick_maps = not r.pick_maps
             elif k == "wind":
-                r.wind = not r.wind
+                r.wind = (r.wind + d) % len(WIND_MODES)
             elif k == "ammo":
                 r.ammo_fx = not r.ammo_fx
             elif k == "blessing":
@@ -10290,14 +13487,14 @@ class RulesScene(BackdropScene):
             val = {"fmt": "BEST OF" if r.fmt == "best" else "FIRST TO", "n": str(r.n) if ROUND_PRESETS[r.n_idx] else "CUSTOM",
                    "n_custom": str(r.n_custom), "hp": str(r.hp) if HP_PRESETS[r.hp_idx] else "CUSTOM",
                    "hp_custom": str(r.hp_custom), "map": (f"{self._map_index():03d}/{len(self.maps) - 1} {mp.name}" if mp else "RANDOM"),
-                   "next": ("PICK EACH ROUND" if r.pick_maps else "RANDOM"), "wind": "ON" if r.wind else "OFF",
+                   "next": ("PICK EACH ROUND" if r.pick_maps else "RANDOM"), "wind": WIND_MODES[r.wind][0],
                    "ammo": "ON" if r.ammo_fx else "OFF", "special": "ON" if r.special else "OFF", "go": "▶",
                    "blessing": ("LOCKED" if not self.app.save.blessing_unlocked() else "ON" if r.blessing else "OFF")}[k]
             val = f"◄ {val[:25]} ►" if sel and k != "go" else val[:29]
             screen.text(x + PW - 4 - len(val), ry, val, GOLD if sel else Palette.TEXT, bg)
-        screen.center(y + H - 6, f"{r.label}  ·  {r.hp} {'HEART' if r.hp == 1 else 'HEARTS'} EACH  ·  WIND {'ON' if r.wind else 'OFF'}",
+        screen.center(y + H - 6, f"{r.label}  ·  {r.hp} {'HEART' if r.hp == 1 else 'HEARTS'} EACH  ·  WIND {WIND_MODES[r.wind][0]}",
                       Palette.AMBER, Palette.PANEL, x, PW)
-        extra = ("SPECIAL: press X to forfeit a turn; after two, next shot deals 3" if r.special
+        extra = ("SPECIAL: X banks a turn. Two banked = 3 damage" if r.special
                  else f"A side wins the match with {r.target} round wins")
         screen.center(y + H - 5, extra[:PW - 2], Palette.MUTED, Palette.PANEL, x, PW)
         if keys[self.row] == "ammo":
@@ -10307,7 +13504,7 @@ class RulesScene(BackdropScene):
                 screen.center(y + H - 4 + k, ln, Palette.PRIMARY, Palette.PANEL, x, PW)
         elif keys[self.row] == "blessing":
             tip = ("Defeat the Martyr to inherit this ultimate ammo." if not self.app.save.blessing_unlocked()
-                   else "ON: MARTYR'S BLESSING may be loaded - one direct hit erases every foe. Separate from SPECIAL AMMO." if r.blessing
+                   else "ON: the BLESSING may be loaded - one direct hit erases every foe." if r.blessing
                    else "OFF: MARTYR'S BLESSING cannot be selected or fired in this mode.")
             for k, ln in enumerate(textwrap.wrap(tip, PW - 6)[:2]):
                 screen.center(y + H - 4 + k, ln, GOLD, Palette.PANEL, x, PW)
@@ -10832,7 +14029,7 @@ class LanJoinScene(BackdropScene):
             mission = MISSIONS[int(m["n"]) - 1]
             sess = build_mission_session(app, mission, [], net=link, my_owner=1, world=tuple(m["world"]), seed=int(m["seed"]),
                                          humans=players, go=False)
-            sess.wind_override = float(m["wind"])
+            sess.wind_override = tuple(m["wind"]) if isinstance(m["wind"], list) else float(m["wind"])
             app.goto(BattleScene(app, sess))
             return
         world = tuple(m["world"])
@@ -10840,7 +14037,7 @@ class LanJoinScene(BackdropScene):
                           my_owner=1, world_size=world, special=bool(m.get("special", False)), ammo_fx=bool(m.get("ammo_fx", True)), pick_maps=bool(m.get("pick", False)),
                           blessing=bool(m.get("blessing", False)))
         session = MatchSession(cfg, all_maps().get(str(m.get("map", ""))), int(m["seed"]))
-        session.wind_override = float(m["wind"])
+        session.wind_override = tuple(m["wind"]) if isinstance(m["wind"], list) else float(m["wind"])
         app.goto(RPSScene(app, session, 1))
 
     def draw(self, screen: Screen) -> None:
@@ -11011,7 +14208,7 @@ class TournamentScene(BackdropScene):
                 screen.box(x, y, w, h, "single", edge, Palette.PANEL)
                 screen.center(y + 1, f"LV {lv.number}", Palette.TEXT if not locked else Palette.MUTED, Palette.PANEL, x, w)
                 dc = self._diff_color(lv)
-                screen.center(y + 2, lv.difficulty.value[:4], shade(dc, 0.45) if locked else dc, Palette.PANEL, x, w)
+                screen.center(y + 2, lv.difficulty.value, shade(dc, 0.45) if locked else dc, Palette.PANEL, x, w)
                 screen.center(y + 3, {"cleared": "✓", "open": "▶", "locked": "░"}[st], edge, Palette.PANEL, x, w)
         mid = cy + 5
         for gx in (cx - 16, cx - 1, cx + 36, cx + 51):
@@ -11050,7 +14247,7 @@ class TournamentScene(BackdropScene):
         for k, (lab, val, col) in enumerate(rows):
             screen.text(ax, py + 1 + k, f"{lab:<5}", Palette.MUTED, Palette.PANEL)
             screen.text(ax + 6, py + 1 + k, val, col, Palette.PANEL)
-        screen.text(ax, py + 5, lv.rule_text[:32], GOLD if lv.rule else Palette.MUTED, Palette.PANEL)
+        screen.text(ax, py + 5, lv.rule_text, GOLD if lv.rule else Palette.MUTED, Palette.PANEL)
         status = {"cleared": ("✓ CLEARED - REPLAY ANY TIME", Palette.OK), "open": ("▶ READY TO FIGHT", Palette.PRIMARY),
                   "locked": (f"░ LOCKED - CLEAR LEVEL {lv.number - 1} FIRST", Palette.MUTED)}[st]
         screen.text(ax, py + 7, status[0], status[1], Palette.PANEL)
@@ -11116,6 +14313,9 @@ def theme_preview(th: HomeTheme, t: float, hull: RGB, w: int = 34, h: int = 20) 
 class ShopScene(BackdropScene):
     """Spend coins (and credits on master-tier gear). Five pages; tier rows; live preview; ENTER twice to buy."""
     CW, GAP, W = 10, 1, 94
+
+    def music(self):
+        return ("shop_jingle", "menu")
 
     def __init__(self, app, page: int = 0) -> None:
         super().__init__(app)
@@ -11310,7 +14510,39 @@ class ShopScene(BackdropScene):
 
     # -- drawing -------------------------------------------------------------
     def _price(self, it: ShopItem) -> str:
-        return f"{it.coins}◉" + (f" {it.credits}◈" if it.credits else "")
+        c = f"{it.coins // 1000}K" if it.coins >= 10000 and it.coins % 1000 == 0 else f"{it.coins}"
+        return f"{c}◉" + (f" {it.credits}◈" if it.credits else "")
+
+    _BREAKS = {"GRAVEDIGGER": ("GRAVE-", "DIGGER"), "DOOMBRINGER": ("DOOM-", "BRINGER"), "EVISCERATOR": ("EVISCER-", "ATOR"),
+               "SINGULARITY": ("SINGU-", "LARITY"), "STORMBRINGER": ("STORM-", "BRINGER"), "CONSTELLATION": ("CONSTEL-", "LATION"),
+               "THUNDERHEAD": ("THUNDER-", "HEAD"), "SHATTERLINE": ("SHATTER-", "LINE"), "MARTYR'S TIME MACHINE": ("TIME", "MACHINE")}
+
+    @staticmethod
+    def _tile_lines(name: str, w: int) -> list:
+        """A tile name on at most two lines: whole words where they fit, a syllable break only for a word longer than the tile."""
+        if name in ShopScene._BREAKS:
+            return list(ShopScene._BREAKS[name])
+        words, lines = name.split(), [""]
+        for wd in words:
+            while len(wd) > w:                                    # one very long word: hyphenate it
+                room = w - len(lines[-1]) - (1 if lines[-1] else 0)
+                if room >= 4:
+                    cut = room - 1
+                    lines[-1] = (lines[-1] + " " if lines[-1] else "") + wd[:cut] + "-"
+                    wd = wd[cut:]
+                lines.append("")
+            if not lines[-1]:
+                lines[-1] = wd
+            elif len(lines[-1]) + 1 + len(wd) <= w:
+                lines[-1] += " " + wd
+            else:
+                lines.append(wd)
+        lines = [ln for ln in lines if ln]
+        if len(lines) > 2:
+            lines = [lines[0], " ".join(lines[1:])]
+            if len(lines[1]) > w:
+                lines[1] = lines[1][:w - 1] + "…"
+        return lines
 
     KIND = {"tank": "TANK", "ammo": "AMMO", "map": "MAP", "theme": "MAIN SCREEN", "rgb": "EXTRA", "paint": "EXTRA", "ticket": "TICKET", "timemachine": "ARTIFACT"}
 
@@ -11340,7 +14572,7 @@ class ShopScene(BackdropScene):
                 break
             row, gy = grid[r], y0 + 4 + k * 4
             col = TIER_COLORS[row[0].tier]
-            for dy in (0, 1):
+            for dy in (0, 1, 2):
                 bar = rainbow(t + r * 0.1 + dy * 0.05) if row[0].tier >= 4 else col      # the premium rows shimmer
                 screen.put(x0 + 1, gy + dy, "▌", bar, Palette.PANEL)
             for c, it in enumerate(row):
@@ -11348,9 +14580,9 @@ class ShopScene(BackdropScene):
                 sel = (r, c) == (sel_r, sel_c)
                 owned = save.is_unlocked(it.uid)
                 bg = Palette.PANEL_HI if sel else Palette.PANEL
-                screen.fill(x, gy, self.CW, 2, bg)
-                name = it.name if len(it.name) <= self.CW else it.name[:self.CW - 1] + "…"
-                screen.text(x, gy, name, Palette.WHITE if sel else (Palette.OK if owned else col), bg)
+                screen.fill(x, gy, self.CW, 3, bg)
+                for li, ln in enumerate(self._tile_lines(it.name, self.CW)):
+                    screen.text(x, gy + li, ln, Palette.WHITE if sel else (Palette.OK if owned else col), bg)
                 if it.uid == "ticket":
                     price, pc = (("SOLD OUT", Palette.MUTED) if owned else ("SEALED", Palette.MUTED) if not save.tickets_open()
                                  else (("RESUME" if save.ticket_active else self._price(it)), Palette.AMBER))
@@ -11362,7 +14594,7 @@ class ShopScene(BackdropScene):
                 else:
                     price = self._price(it)
                     pc = Palette.AMBER if not save.shortfall(it) else (200, 90, 90)
-                screen.text(x, gy + 1, price, pc, bg)
+                screen.text(x, gy + 2, price, pc, bg)
                 if sel:
                     screen.put(x - 1, gy, "▸", GOLD, Palette.PANEL)
         if len(grid) > vis:                                   # scroll bar
@@ -11599,7 +14831,8 @@ class MissionsScene(BackdropScene):
                 screen.center(y + 2, M_TYPE_SHORT[m.kind], shade(col, 0.45) if locked else col, Palette.PANEL, x, w)
                 screen.center(y + 3, {"cleared": "✓", "open": "▶", "locked": "░"}[st], edge, Palette.PANEL, x, w)
                 if abs(d) == 1:
-                    screen.center(y + 5, m.name[:12], (80, 92, 104) if locked else Palette.TEXT, Palette.PANEL, x, w)
+                    for k, ln in enumerate(textwrap.wrap(m.name, w - 2)[:2]):
+                        screen.center(y + 4 + k, ln, (80, 92, 104) if locked else Palette.TEXT, Palette.PANEL, x, w)
                     if m.rewards:
                         screen.center(y + 6, "★ REWARD", GOLD if not locked else (96, 86, 50), Palette.PANEL, x, w)
         if self.sel > 2:
@@ -11646,7 +14879,8 @@ class MissionsScene(BackdropScene):
         for k, line in enumerate(textwrap.wrap(m.blurb, 28)[:5]):
             screen.text(mx, py + 1 + k, line, Palette.TEXT, Palette.PANEL)
         first_left = m.number not in save.mission_paid
-        screen.text(mx, py + 7, f"{'FIRST CLEAR' if first_left else 'REPLAY'}  {m.first_coins if first_left else m.repeat_coins} ◉",
+        screen.text(mx, py + 7, f"{'FIRST CLEAR' if first_left else 'REPLAY'}  {m.first_coins if first_left else m.repeat_coins} ◉"
+                    + (f"  +{m.first_credits} ◈" if first_left else ""),
                     GOLD if first_left else Palette.MUTED, Palette.PANEL)
         if m.is_coop:
             screen.text(mx, py + 9, "LOCAL · LAN · AI WINGMAN", (130, 190, 255), Palette.PANEL)
@@ -11655,7 +14889,8 @@ class MissionsScene(BackdropScene):
         earned = m.number in save.mission_completed
         for k, uid in enumerate(m.rewards[:5]):
             lab, name = reward_label(uid)
-            screen.text(rx, py + 2 + k, ("✓ " if earned else "· ") + f"{lab:<7}" + name[:11], Palette.OK if earned else Palette.TEXT, Palette.PANEL)
+            lab = {"SCREEN": "HOME"}.get(lab, lab)
+            screen.text(rx, py + 2 + k, ("✓ " if earned else "· ") + f"{lab:<5}" + name, Palette.OK if earned else Palette.TEXT, Palette.PANEL)
         if not m.rewards:
             screen.text(rx, py + 2, "· COINS ONLY", Palette.MUTED, Palette.PANEL)
         if self.msg_t > 0:
@@ -11717,6 +14952,9 @@ class CoopChoiceScene(BackdropScene):
 
 
 class MissionResultScene(BackdropScene):
+    def music(self):
+        return (self.app.last_battle_song, "result") if self.app.last_battle_song else None
+
     def __init__(self, app, session: MissionSession) -> None:
         super().__init__(app)
         self.session, self.m, self.t = session, session.mission, 0.0
@@ -11790,6 +15028,7 @@ class LinksScene(BackdropScene):
     LINKS = (("SOURCE CODE", "github.com/ethanlabs101/TerminalTanks", True),
              ("WEBSITE REPO", "github.com/ethanlabs101/terminaltanks-web", True),
              ("WEBSITE", "ethanlabs101.github.io/terminaltanks-web", True),
+             ("DS PORT", "github.com/ethanlabs101/TerminalTanks-DS", True),
              ("ALL PROJECTS", "github.com/ethanlabs101", True),
              ("ITCH.IO", "COMING SOON", False),
              ("STEAM", "COMING SOON", False))
@@ -11828,7 +15067,7 @@ class LinksScene(BackdropScene):
 
     def draw(self, screen: Screen) -> None:
         super().draw(screen)
-        w, h = 70, 21
+        w, h = 72, 23
         x, y = panel(screen, w, h, "TERMINAL TANKS  ·  FIND US")
         screen.center(y + 2, "Free, open source and built by one developer.", Palette.TEXT, Palette.PANEL, x, w)
         screen.center(y + 3, "Play it, read it, fork it, share it.", Palette.MUTED, Palette.PANEL, x, w)
@@ -11838,132 +15077,21 @@ class LinksScene(BackdropScene):
             screen.fill(x + 2, ry, w - 4, 1, bg)
             screen.text(x + 4, ry, lab, Palette.WHITE if sel else Palette.MUTED, bg)
             screen.text(x + 20, ry, url, (GOLD if sel else Palette.PRIMARY) if live else Palette.AMBER, bg)
-        screen.center(y + 18, self.msg if self.msg_t > 0 else "More games from ethanlabs101 are on the way.",
+        screen.center(y + 20, self.msg if self.msg_t > 0 else "More games from ethanlabs101 are on the way.",
                       Palette.OK if self.msg_t > 0 and "OPENED" in self.msg else (Palette.AMBER if self.msg_t > 0 else Palette.MUTED), Palette.PANEL, x, w)
-        draw_keycaps(screen, x + 14, y + 19, (("W/S", "SELECT"), ("ENTER", "OPEN"), ("ESC", "BACK")), Palette.PANEL)
+        draw_keycaps(screen, x + 14, y + 21, (("W/S", "SELECT"), ("ENTER", "OPEN"), ("ESC", "BACK")), Palette.PANEL)
 
 
 # ===========================================================================
-# TANK STUDIO: pick a background + ammo for the workshop tank, watch it fire in game, and record a short GIF
-# (pure-Python GIF89a writer: no dependencies). If ffmpeg happens to be installed an MP4 is made from it too.
+# TANK STUDIO: a preview-only booth. Any tank, any battlefield, paint, ammo and shell colour, firing on loop. Nothing is saved or exported.
 # ===========================================================================
-def _gif_lzw(data: bytes) -> bytes:
-    clear, eoi = 256, 257
-    out, acc, nbits, size, nxt, table = bytearray(), 0, 0, 9, 258, {}
-
-    def put(code: int) -> None:
-        nonlocal acc, nbits
-        acc |= code << nbits
-        nbits += size
-        while nbits >= 8:
-            out.append(acc & 255)
-            acc >>= 8
-            nbits -= 8
-    put(clear)
-    prefix = data[0]
-    for b in data[1:]:
-        key = (prefix << 8) | b
-        c = table.get(key)
-        if c is not None:
-            prefix = c
-            continue
-        put(prefix)
-        table[key] = nxt
-        nxt += 1
-        if nxt > (1 << size) and size < 12:
-            size += 1
-        if nxt >= 4096:
-            put(clear)
-            table, size, nxt = {}, 9, 258
-        prefix = b
-    put(prefix)
-    put(eoi)
-    if nbits:
-        out.append(acc & 255)
-    return bytes(out)
-
-
-_BAYER = (0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5)
-
-
-def gif_bytes(frames: list, scale: int = 5, delay_cs: int = 8) -> bytes:
-    """frames: PixelCanvas list (all the same size). Palette = 6x6x6 colour cube + ordered dithering."""
-    w, h = frames[0].w, frames[0].h
-    W, H = w * scale, h * scale
-    pal = bytearray()
-    for r in range(6):
-        for g in range(6):
-            for b in range(6):
-                pal += bytes((r * 51, g * 51, b * 51))
-    pal += bytes(3 * (256 - 216))
-    buf = bytearray(b"GIF89a" + W.to_bytes(2, "little") + H.to_bytes(2, "little") + bytes((0xF7, 0, 0)) + bytes(pal))
-    buf += b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00"                       # loop forever
-    for cv in frames:
-        idx = bytearray()
-        for y, row in enumerate(cv.rows):
-            line = bytearray()
-            for x, (r, g, b) in enumerate(row):
-                d = (_BAYER[(y & 3) * 4 + (x & 3)] - 7.5) * 3.2
-                ri = min(5, max(0, int((r + d) / 51 + 0.5)))
-                gi = min(5, max(0, int((g + d) / 51 + 0.5)))
-                bi = min(5, max(0, int((b + d) / 51 + 0.5)))
-                line += bytes((36 * ri + 6 * gi + bi,)) * scale
-            idx += bytes(line) * scale
-        buf += b"\x21\xf9\x04\x00" + delay_cs.to_bytes(2, "little") + b"\x00\x00"
-        buf += b"\x2c\x00\x00\x00\x00" + W.to_bytes(2, "little") + H.to_bytes(2, "little") + b"\x00\x08"
-        lz = _gif_lzw(bytes(idx))
-        for i in range(0, len(lz), 255):
-            chunk = lz[i:i + 255]
-            buf += bytes((len(chunk),)) + chunk
-        buf += b"\x00"
-    buf += b"\x3b"
-    return bytes(buf)
-
-
-def write_gif(path: Path, frames: list, scale: int = 5, delay_cs: int = 8) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(gif_bytes(frames, scale, delay_cs))
-
-
-def deliver_file(app, name: str, data: bytes, mime: str = "image/gif") -> str:
-    """Hands a finished file to the player on every platform: a browser download on the web build, otherwise a file in
-    <save folder>/exports (falling back to the home folder, then the temp folder if that is read-only). Returns a message."""
-    if IS_WEB:
-        import js                                                  # Pyodide
-        from pyodide.ffi import to_js
-        arr = js.Uint8Array.new(len(data))
-        arr.assign(data)
-        blob = js.Blob.new([arr], to_js({"type": mime}, dict_converter=js.Object.fromEntries))
-        a = js.document.createElement("a")
-        a.href, a.download = js.URL.createObjectURL(blob), name
-        js.document.body.appendChild(a)
-        a.click()
-        a.remove()
-        return f"DOWNLOADING {name}"
-    import tempfile
-    sp = getattr(app.save, "path", None)
-    for base in ([sp.parent] if sp else []) + [Path.home() / "TerminalTanks", Path(tempfile.gettempdir()) / "TerminalTanks"]:
-        try:
-            out = base / "exports" / name
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(data)
-            return f"SAVED {out}"
-        except OSError:
-            continue
-    raise OSError("no writable folder found")
-
-
-STUDIO_BGS = (          # name, top colour, horizon colour
-    ("DUSK", (14, 22, 60), (200, 120, 110)), ("NIGHT", (3, 3, 16), (44, 30, 84)), ("DAWN", (40, 50, 110), (255, 190, 120)),
-    ("VOID", (0, 0, 0), (34, 10, 56)), ("TOXIC", (6, 24, 18), (90, 200, 120)), ("STUDIO", (28, 28, 34), (96, 96, 108)),
-)
-
-
 class StudioScene(BackdropScene):
-    """TANK STUDIO: pick a real battlefield, a paint, an ammo and a shell colour, watch the tank fire in the live preview, then
-    record a looping GIF (a browser download on the web build; also an MP4 on desktop when ffmpeg is installed)."""
-    ROWS = ("map", "paint", "ammo", "shot", "record", "back")
+    """TANK STUDIO (preview only): pick a real battlefield, a paint, an ammo and a shell colour and watch the tank fire on a loop."""
+    ROWS = ("map", "paint", "ammo", "shot", "back")
     SW, SH = 46, 44                                        # preview pixels: 46 x 22 terminal rows
+
+    def music(self):
+        return ("workshop", "menu")
 
     def __init__(self, app, design: "TankDesign", body_name: str, back: Callable) -> None:
         super().__init__(app)
@@ -12003,33 +15131,8 @@ class StudioScene(BackdropScene):
                 self.ai = (self.ai + d) % len(self.ammos)
             elif key == "shot":
                 self.si = (self.si + d) % len(PAINTS)
-        elif ev.confirm:
-            if key == "record":
-                self._record()
-            elif key == "back":
-                self.app.goto(self.back())
-
-    def _record(self) -> None:
-        try:
-            st = PreviewStage(self.app.settings, self.SW, self.SH, 2)
-            self._apply(st)
-            frames = []
-            for _ in range(int(PreviewStage.PERIOD / 0.08) + 1):
-                st.update(0.08)
-                frames.append(st.render().copy())
-            name = re.sub(r"[^A-Za-z0-9]+", "_", self.design.name).strip("_").lower() or "tank"
-            fname = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}.gif"
-            data = gif_bytes(frames)
-            note = deliver_file(self.app, fname, data)
-            if not IS_WEB and note.startswith("SAVED ") and shutil.which("ffmpeg"):
-                gif = Path(note[6:])
-                mp4 = gif.with_suffix(".mp4")
-                r = subprocess.run([shutil.which("ffmpeg"), "-y", "-loglevel", "error", "-i", str(gif), "-movflags", "faststart", "-pix_fmt", "yuv420p",
-                                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", str(mp4)], capture_output=True, timeout=60)
-                note += "  + MP4" if r.returncode == 0 and mp4.exists() else "  (MP4 failed)"
-            self.msg, self.msg_ok = note, True
-        except Exception as e:                                       # never let an export problem crash the game
-            self.msg, self.msg_ok = f"EXPORT FAILED: {e}"[:110], False
+        elif ev.confirm and key == "back":
+            self.app.goto(self.back())
 
     def update(self, dt: float) -> None:
         super().update(dt)
@@ -12044,8 +15147,8 @@ class StudioScene(BackdropScene):
         pn, sn = PAINTS[self.pi][0], PAINTS[self.si][0]
         lock = lambda n: "" if sv.paint_ok(n, True) else "  (LOCKED)"
         vals = {"map": self.maps[self.mi].name, "paint": pn + lock(pn), "ammo": self.ammos[self.ai].name, "shot": sn + lock(sn),
-                "record": "▶  RECORD A GIF" + (" + MP4" if (not IS_WEB and shutil.which("ffmpeg")) else ""), "back": "◄  BACK"}
-        labels = {"map": "BATTLEFIELD", "paint": "TANK PAINT", "ammo": "AMMO", "shot": "SHELL COLOR", "record": "", "back": ""}
+                "back": "◄  BACK"}
+        labels = {"map": "BATTLEFIELD", "paint": "TANK PAINT", "ammo": "AMMO", "shot": "SHELL COLOR", "back": ""}
         for i, key in enumerate(self.ROWS):
             ry, sel = y + 2 + i * 2, i == self.row
             bg = Palette.PANEL_HI if sel else Palette.PANEL
@@ -12057,12 +15160,9 @@ class StudioScene(BackdropScene):
                 col = live_color(PAINTS[self.pi if key == "paint" else self.si][1], t)
                 screen.text(x + 3, ry + 1, "█" * 8, col, Palette.PANEL)
         pr = y + 15
-        if self.msg:
-            wrap_center(screen, pr, self.msg, 40, Palette.OK if self.msg_ok else Palette.DANGER, Palette.PANEL, x, 44, 5)
-        else:
-            tip = ("Paints marked LOCKED are preview-only until you own them." if (not sv.paint_ok(pn, True) or not sv.paint_ok(sn, False))
-                   else "Pick a battlefield, paint and ammo, then record a looping clip of your tank firing.")
-            wrap_center(screen, pr, tip, 40, Palette.MUTED, Palette.PANEL, x, 44, 4)
+        tip = ("Paints marked LOCKED are preview-only until you own them." if (not sv.paint_ok(pn, True) or not sv.paint_ok(sn, False))
+               else "Preview your tank on any battlefield with any paint, ammo and shell colour. Nothing is saved.")
+        wrap_center(screen, pr, tip, 40, Palette.MUTED, Palette.PANEL, x, 44, 4)
         draw_keycaps(screen, x + 3, y + H - 2, (("▲▼", "ROW"), ("◄►", "CHANGE"), ("ENTER", "DO"), ("ESC", "BACK")), Palette.PANEL)
         px = x + 45
         screen.box(px, y, 50, H, "double", Palette.LINE, Palette.PANEL, "LIVE PREVIEW")
@@ -12078,6 +15178,9 @@ class WorkshopScene(BackdropScene):
     LABEL = {"load": "TANK", "turret": "TURRET", "hull": "HULL", "track": "TRACKS", "barrel": "BARREL", "glow": "GLOW", "ambient": "AMBIENT",
              "accent": "ACCENT", "color": "COLOR", "hover": "HOVER", "name": "NAME", "lore": "LORE", "build": "BUILD", "equip": "EQUIP", "delete": "DELETE"}
 
+    def music(self):
+        return ("workshop", "menu")
+
     def __init__(self, app) -> None:
         super().__init__(app)
         self.row, self.msg, self.msg_ok, self.msg_t = 0, "", True, 0.0
@@ -12087,6 +15190,12 @@ class WorkshopScene(BackdropScene):
         self.draft = {"parts": dict(CUSTOM_FALLBACK), "name": "MY TANK", "lore": "Built in the workshop.", "hover": False}
         self.opts = workshop_components(app.save)
         self.pcolor = paint_index(app.save.loadout(0).tank_color)        # preview body colour (applied to Player 1 on EQUIP)
+
+    def _toggle_hover(self) -> None:
+        if self.app.save.hover_open() or self.draft["hover"]:
+            self.draft["hover"] = not self.draft["hover"]
+        else:
+            self.msg_ok, self.msg, self.msg_t = False, "HOVER OPENS AFTER YOU DEFEAT THE MOTHERSHIP", 2.5
 
     def _saved(self) -> list:
         return self.app.save.custom_tanks
@@ -12108,7 +15217,7 @@ class WorkshopScene(BackdropScene):
 
     def handle(self, ev: InputEvent) -> None:
         key, raw, save = self.ROWS[self.row], ev.raw, self.app.save
-        if raw in ("g", "G") and key not in ("name", "lore"):                         # TANK STUDIO: backgrounds, ammo, GIF export
+        if raw in ("g", "G") and key not in ("name", "lore"):                         # TANK STUDIO: preview booth
             self.app.goto(StudioScene(self.app, self._design(), PAINTS[self.pcolor][0], lambda: WorkshopScene(self.app)))
             return
         if ev.action is Action.BACK:
@@ -12142,14 +15251,14 @@ class WorkshopScene(BackdropScene):
             elif key in self.opts:
                 self._cycle(key, d * (5 if ev.coarse else 1))
             elif key == "hover":
-                self.draft["hover"] = not self.draft["hover"]
+                self._toggle_hover()
         elif ev.confirm:
             if key == "hover":
-                self.draft["hover"] = not self.draft["hover"]
+                self._toggle_hover()
             elif key == "build":
                 hv = self.draft["hover"]
                 why = save.create_custom(self.draft["parts"], self.draft["name"].strip() or "CUSTOM", self.draft["lore"].strip(), hv)
-                paid = f"-{CUSTOM_TANK_FEE + (HOVER_COINS if hv else 0):,} COINS" + (f", -{HOVER_CREDITS} CREDITS" if hv else "")
+                paid = f"-{CUSTOM_TANK_FEE + (HOVER_COINS if hv else 0):,} COINS" + (f", -{HOVER_CREDITS} CREDITS" if hv and HOVER_CREDITS else "")
                 self.msg_ok, self.msg, self.msg_t = (not why), why or f"BUILT: {(self.draft['name'].strip() or 'CUSTOM')}  ({paid})", 3.0
                 if not why:
                     self.load = len(save.custom_tanks)
@@ -12179,7 +15288,7 @@ class WorkshopScene(BackdropScene):
         self.msg_t = max(0.0, self.msg_t - dt)
 
     HELP = ("HOW IT WORKS: you only get parts from tanks you own - every tank you unlock adds its parts. Mix parts, name it, "
-            "add lore, BUILD for {fee:,} coins. HOVER (a floating tank): +{hc:,} coins and +{hr} credits.")
+            "add lore, BUILD for {fee:,} coins. HOVER (a floating tank, after the Mothership): +{hc:,} coins{hr}.")
 
     def draw(self, screen: Screen) -> None:
         super().draw(screen)
@@ -12197,7 +15306,7 @@ class WorkshopScene(BackdropScene):
             elif key in self.opts:
                 val = self.draft["parts"].get(key, "-").upper().replace("_", " ")
             elif key == "hover":
-                val = "ON" if self.draft["hover"] else "OFF"
+                val = ("ON" if self.draft["hover"] else "OFF") if self.app.save.hover_open() else "LOCKED - BEAT THE MOTHERSHIP"
             elif key == "color":
                 nm, cc = PAINTS[self.pcolor]
                 val = nm + ("" if self.app.save.paint_ok(nm, True) else " (LOCKED)")
@@ -12219,19 +15328,24 @@ class WorkshopScene(BackdropScene):
             wrap_center(screen, my, self.msg, 40, Palette.OK if self.msg_ok else Palette.DANGER, Palette.PANEL, x, 44, 2)
         else:
             screen.center(my, f"{len(save.custom_tanks)}/{CUSTOM_TANK_MAX} SAVED", Palette.MUTED, Palette.PANEL, x, 44)
-        for k, ln in enumerate(textwrap.wrap(self.HELP.format(fee=CUSTOM_TANK_FEE, hc=HOVER_COINS, hr=HOVER_CREDITS), 40)[:4]):
+        for k, ln in enumerate(textwrap.wrap(self.HELP.format(fee=CUSTOM_TANK_FEE, hc=HOVER_COINS, hr=f" and +{HOVER_CREDITS} credits" if HOVER_CREDITS else ""), 40)[:4]):
             screen.text(x + 2, my + 1 + k, ln, Palette.MUTED, Palette.PANEL)
         draw_keycaps(screen, x + 3, y + H - 2, (("▲▼", "ROW"), ("◄►", "PART"), ("ENTER", "DO"), ("ESC", "BACK")), Palette.PANEL)
         # preview
         px = x + 45
-        screen.box(px, y, 48, H, "double", Palette.LINE, Palette.PANEL, "PREVIEW  ·  [G] STUDIO / GIF")
+        screen.box(px, y, 48, H, "double", Palette.LINE, Palette.PANEL, "PREVIEW  ·  [G] STUDIO")
         d = self._design()
         lo = save.loadout(0)
         self.stage.set_kit(d, PAINTS[self.pcolor][1], AMMO_BY_KEY[lo.ammo], COLOR_BY_NAME[lo.shot_color], 0.0)
         screen.blit(self.stage.render(), px + 1, y + 1)
         screen.center(y + 14, d.name, Palette.WHITE, Palette.PANEL, px, 48)
         wrap_center(screen, y + 15, d.blurb, 44, Palette.TEXT, Palette.PANEL, px, 48, 2)
-        screen.center(y + 17, f"{d.barrel.upper()}  ·  {d.glow.upper()}  ·  {d.ambient.upper()}"[:44], Palette.MUTED, Palette.PANEL, px, 48)
+        amb = d.ambient.upper().split("+")
+        line = f"{d.barrel.upper()}  ·  {d.glow.upper()}  ·  {'+'.join(amb)}"
+        while len(line) > 44 and len(amb) > 1:                     # list as many aura parts as fit, then count the rest
+            amb = amb[:-1]
+            line = f"{d.barrel.upper()}  ·  {d.glow.upper()}  ·  {'+'.join(amb)} +{len(d.ambient.split('+')) - len(amb)}"
+        screen.center(y + 17, line, Palette.MUTED, Palette.PANEL, px, 48)
         screen.center(y + 18, f"YOU HAVE {save.coins:,} ◉  {save.credits} CR", GOLD if save.coins >= CUSTOM_TANK_FEE else Palette.DANGER, Palette.PANEL, px, 48)
         # browsable list of every custom tank
         saved = self._saved()
@@ -12490,8 +15604,13 @@ class MartyrSession(MatchSession):
             return
         el = scene.srng.choice(_PHASE_ELEMS[min(self.phase_i, 2)])
         a = MAGE_AMMO[(el, min(self.phase_i, 2))]
+        name = _ELEM[el][0]
+        if scene.srng.random() < 0.7:                               # most turns he draws from EVERY special ammo there is
+            pool = [x for x in AMMOS[BASE_KITS:] + TICKET_AMMOS + ANCIENT_AMMOS if x.key != BLESSING_KEY]
+            a = scene.srng.choice(pool)
+            name = a.name
         tank.ammo, tank.shot_color = a, _ELEM[el][4]
-        scene.floaters.append(FloatText(tank.x, tank.y + tank.height + 14, _ELEM[el][0] + "!", _ELEM[el][4]))
+        scene.floaters.append(FloatText(tank.x, tank.y + tank.height + 14, name + "!", _ELEM[el][4]))
 
     def dmg_mult(self, tank) -> int:
         return MARTYR_PLAYER_MULT if tank.index == 0 else MARTYR_MAGE_MULT[min(self.phase_i, 2)]
@@ -12598,12 +15717,31 @@ MARTYR_OUTRO = [
     (_M, "Ten thousand years I waited. I thought I was waiting to be saved. I was waiting for you.", "win", False),
     (_M, "Take the relics of all six elements. Take the sanctuaries where we fought. They were always meant for the one who got this far.", "win", True),
     (_M, "Carry them well, little one. And do not let the sand run out.", "win", False),
+    (_M, "One last thing. What is left of my power cannot follow me into rest... so I give it to you.", "win", False),
+    (_N, "The last of the Martyr's power folds into a single shell of gold and starlight: MARTYR'S BLESSING.", "win", True),
+    (_M, "Load it, and nothing that stands in your path will stand for long. Use it well, descendant.", "win", False),
     (_N, "The hourglass turns one last time. The Martyr rests.", "win", True),
 ]
 
 
+def cinematic_song(pages) -> tuple:
+    who = {p[0] for p in pages}
+    stages = {p[2] for p in pages}
+    if "win" in stages:
+        return ("the_blessing", "story")
+    for st in stages:
+        if st.startswith("map") and st[3:4].isdigit():                    # the Martyr speaks before a fight: that phase's theme, held back
+            return (MARTYR_SONGS[min(2, int(st[3]))], "story")
+    if _M in who:
+        return ("time_machine", "story")
+    return ("whisper", "story")
+
+
 class CinematicScene(Scene):
     """Full-screen cutscene: animated art above, typed dialogue below. ENTER advances, ESC skips."""
+
+    def music(self):
+        return cinematic_song(self.pages)
 
     def __init__(self, app, pages: list, on_done: Callable) -> None:
         super().__init__(app)
@@ -12630,6 +15768,17 @@ class CinematicScene(Scene):
 
     def update(self, dt: float) -> None:
         self.age += dt
+        if getattr(self, "_snd_page", -1) != self.i and self.i < len(self.pages):
+            self._snd_page = self.i
+            who, text, stage, flash = self.pages[self.i]
+            if self.i:
+                self.app.sfx("ui_page", 0.6)
+            if stage == "voice":
+                self.app.sfx("whisper", 0.8)
+            elif stage == "awake":
+                self.app.sfx("time_machine", 1.0)
+            if flash:
+                self.app.sfx("cine_hit", 0.9)
 
     def draw(self, screen: Screen) -> None:
         cols, rows = screen.cols, screen.rows
@@ -12696,13 +15845,16 @@ class CinematicScene(Scene):
 class MartyrRewardsScene(BackdropScene):
     """Everything the Martyr leaves behind."""
 
+    def music(self):
+        return ("the_blessing", "story")
+
     def __init__(self, app) -> None:
         super().__init__(app)
         self.stage = PreviewStage(app.settings, 46, 26, 2)
 
     def handle(self, ev: InputEvent) -> None:
         if ev.confirm or ev.action in (Action.CONFIRM, Action.BACK):
-            self.app.goto(MartyrFinaleScene(self.app))
+            self.app.goto(BlessingGiftScene(self.app))
 
     def update(self, dt: float) -> None:
         super().update(dt)
@@ -12720,7 +15872,7 @@ class MartyrRewardsScene(BackdropScene):
                 + [("COLOR", GOLD), ("  ✦ ASTRAL PAINT & AMMO COLOR", astral(t))])
         for k, (txt, c) in enumerate(rows[:20]):
             screen.text(x + 3, y + 2 + k, txt, c, Palette.PANEL)
-        screen.text(x + 3, y + 2 + len(rows[:20]), "6 HOME SCREENS: ONE FOR EVERY ANCIENT TANK", Palette.AMBER, Palette.PANEL)
+        screen.text(x + 3, y + 2 + len(rows[:20]), "6 HOME SCREENS - ONE PER ANCIENT TANK", Palette.AMBER, Palette.PANEL)
         screen.text(x + 3, y + 3 + len(rows[:20]), "★ ULTIMATE AMMO: MARTYR'S BLESSING", astral(t), Palette.PANEL)
         screen.center(y + H - 2, "[ ENTER ]", Palette.PRIMARY if int(t * 2) % 2 == 0 else Palette.MUTED, Palette.PANEL, x, 44)
         px = x + 45
@@ -12737,6 +15889,9 @@ class MartyrRewardsScene(BackdropScene):
 
 class MartyrFinaleScene(Scene):
     """The 'you did it' screen: the ETERNAL home screen, shown in full."""
+
+    def music(self):
+        return ("the_blessing", "story")
 
     def __init__(self, app) -> None:
         super().__init__(app)
@@ -12765,6 +15920,9 @@ class MartyrFinaleScene(Scene):
 
 
 class TicketResultScene(BackdropScene):
+    def music(self):
+        return (self.app.last_battle_song, "result") if self.app.last_battle_song else None
+
     def __init__(self, app, session: "TicketSession") -> None:
         super().__init__(app)
         self.session, self.boss, self.t = session, session.boss, 0.0
@@ -12825,6 +15983,9 @@ class TicketResultScene(BackdropScene):
 
 class TournamentResultScene(BackdropScene):
     """Level complete / failed screen with a staged reveal of every unlock."""
+
+    def music(self):
+        return (self.app.last_battle_song, "result") if self.app.last_battle_song else None
 
     def __init__(self, app, session: TournamentSession) -> None:
         super().__init__(app)
@@ -12959,6 +16120,9 @@ class CheatScene(BackdropScene):
 
 
 class MatchResultScene(BackdropScene):
+    def music(self):
+        return (self.app.last_battle_song, "result") if self.app.last_battle_song else None
+
     def __init__(self, app, session: MatchSession) -> None:
         super().__init__(app)
         self.session = session
@@ -13034,6 +16198,3297 @@ class Transition:
         return clamp(self.t / (self.OUT if self.phase == "out" else self.IN), 0, 1)
 
 
+# ===========================================================================
+# AUDIO ENGINE - part 1: synthesis core (oscillators, instruments, drum kits, DSP helpers)
+# Everything is generated from code at runtime: no sample files, no third-party packages.
+# ===========================================================================
+AU_SR = 22050                    # sample rate of every synthesized buffer
+AU_TAU = math.tau
+
+
+def mtof(m: float) -> float:
+    return 440.0 * 2.0 ** ((m - 69) / 12.0)
+
+
+# ---- generic DSP (plain lists of floats) ------------------------------------------------------------------------------
+def au_tone(freq, dur, wv="sine", amp=1.0, decay=4.0, attack=0.003, f1=None, vib=0.0, duty=0.5, det=0.0, lp=None, curve=1.0) -> list:
+    """One oscillator with an exponential (or swept) pitch, attack + exponential decay, optional detune/lowpass."""
+    n = max(1, int(dur * AU_SR))
+    out = [0.0] * n
+    ph = ph2 = y = 0.0
+    sin, exp = math.sin, math.exp
+    for i in range(n):
+        t = i / AU_SR
+        f = freq if f1 is None else freq * (f1 / freq) ** ((i / n) ** curve)
+        if vib:
+            f *= 1 + vib * sin(AU_TAU * 6 * t)
+        ph += f / AU_SR
+        p = ph % 1.0
+        if wv == "sine":
+            v = sin(AU_TAU * ph)
+        elif wv == "saw":
+            v = 2 * p - 1
+        elif wv == "square":
+            v = 1.0 if p < duty else -1.0
+        elif wv == "tri":
+            v = 4 * abs(p - 0.5) - 1
+        else:                                                            # "fm": a bright two-operator tone
+            v = sin(AU_TAU * ph + 2.2 * sin(AU_TAU * ph * 2.0))
+        if det:
+            ph2 += f * (1 + det) / AU_SR
+            v = (v + (2 * (ph2 % 1.0) - 1 if wv == "saw" else sin(AU_TAU * ph2))) * 0.5
+        if lp:
+            y += lp * (v - y)
+            v = y
+        out[i] = v * min(1.0, t / attack) * exp(-decay * t) * amp
+    return out
+
+
+def au_noise(dur, lp=1.0, hp=0.0, decay=0.0, attack=0.002, amp=1.0, seed=7, lp1=None) -> list:
+    r = random.Random(seed)
+    n = max(1, int(dur * AU_SR))
+    out = [0.0] * n
+    y = z = 0.0
+    exp = math.exp
+    for i in range(n):
+        x = r.random() * 2 - 1
+        a = lp if lp1 is None else lp + (lp1 - lp) * (i / n)
+        y += a * (x - y)
+        v = y
+        if hp:
+            z += hp * (v - z)
+            v -= z
+        t = i / AU_SR
+        out[i] = v * min(1.0, t / attack) * exp(-decay * t) * amp
+    return out
+
+
+def au_mix(parts) -> list:
+    """parts: (buffer, start_seconds, gain)."""
+    out: list = []
+    for buf, at, g in parts:
+        o = int(at * AU_SR)
+        if o + len(buf) > len(out):
+            out.extend([0.0] * (o + len(buf) - len(out)))
+        out[o:o + len(buf)] = [a + b * g for a, b in zip(out[o:o + len(buf)], buf)]
+    return out
+
+
+def au_peak(buf, level=0.8) -> list:
+    m = max((abs(v) for v in buf), default=0.0) or 1.0
+    k = level / m
+    return [v * k for v in buf]
+
+
+def au_drive(buf, k=3.0) -> list:
+    tk = math.tanh(k)
+    return [math.tanh(v * k) / tk for v in buf]
+
+
+def au_lowpass(buf, a) -> list:
+    y = 0.0
+    out = [0.0] * len(buf)
+    for i, v in enumerate(buf):
+        y += a * (v - y)
+        out[i] = y
+    return out
+
+
+def au_highpass(buf, a) -> list:
+    y = 0.0
+    out = [0.0] * len(buf)
+    for i, v in enumerate(buf):
+        y += a * (v - y)
+        out[i] = v - y
+    return out
+
+
+def au_crush(buf, bits=5, hold=3) -> list:
+    """Bit-crush + sample-and-hold: the gritty digital edge of the glitch/technical sounds."""
+    q = 2 ** (bits - 1)
+    out, last = [0.0] * len(buf), 0.0
+    for i, v in enumerate(buf):
+        if i % hold == 0:
+            last = round(v * q) / q
+        out[i] = last
+    return out
+
+
+def au_echo(buf, d_secs, taps=((1, .38), (2, .17)), lp=0.0) -> list:
+    """Baked multi-tap echo (optionally darker on each repeat)."""
+    d = int(d_secs * AU_SR)
+    out = buf + [0.0] * (d * max(k for k, _ in taps))
+    src = buf
+    for k, g in taps:
+        if lp:
+            src = au_lowpass(src, lp)
+        o = k * d
+        out[o:o + len(src)] = [a + b * g for a, b in zip(out[o:o + len(src)], src)]
+    return out
+
+
+def au_space(buf, size=0.6, wet=0.35) -> list:
+    """A small, cheap 'room': four decaying comb echoes at prime-ish spacings (baked into a note or effect)."""
+    out = buf + [0.0] * int(size * AU_SR * 1.2)
+    for ms, g in ((29.7, .5), (37.1, .44), (41.1, .4), (43.7, .36)):
+        d = int(ms * size * 0.001 * AU_SR * 9)
+        for k in range(1, 4):
+            o = d * k
+            gk = wet * g ** k
+            seg = buf
+            out[o:o + len(seg)] = [a + b * gk for a, b in zip(out[o:o + len(seg)], seg)]
+    return out
+
+
+def au_finish(buf) -> list:
+    """Remove DC and de-click both ends so no effect can pop."""
+    n = len(buf)
+    if n == 0:
+        return buf
+    m = sum(buf) / n
+    buf = [v - m for v in buf]
+    f, a = min(n // 4, int(0.012 * AU_SR)), min(n // 4, int(0.0008 * AU_SR))
+    for i in range(f):
+        buf[n - 1 - i] *= i / max(1, f)
+    for i in range(a):
+        buf[i] *= i / max(1, a)
+    return buf
+
+
+def au_tail(buf, secs=0.006) -> list:
+    n = min(len(buf) // 3, int(secs * AU_SR))
+    for i in range(n):
+        buf[len(buf) - 1 - i] *= i / max(1, n)
+    return buf
+
+
+def au_bell(freq, dur=0.6, amp=1.0, decay=6.0) -> list:
+    return au_mix([(au_tone(freq, dur, "sine", amp, decay), 0, 1), (au_tone(freq * 2.76, dur, "sine", amp, decay * 1.7), 0, 0.33),
+                   (au_tone(freq * 5.4, dur * 0.6, "sine", amp, decay * 2.6), 0, 0.14)])
+
+
+# ---- wavetable instrument engine ---------------------------------------------------------------------------------------
+_AU_TBL = 512
+_au_tables: dict = {}
+
+
+def au_table(key: tuple) -> list:
+    """A single-cycle wavetable from harmonic weights (cached). key = tuple of amplitudes for harmonics 1..n."""
+    t = _au_tables.get(key)
+    if t is None:
+        t = [0.0] * _AU_TBL
+        sin = math.sin
+        for k, w in enumerate(key):
+            if w:
+                for i in range(_AU_TBL):
+                    t[i] += w * sin(AU_TAU * (k + 1) * i / _AU_TBL)
+        m = max(abs(v) for v in t) or 1.0
+        t = [v / m for v in t]
+        _au_tables[key] = t
+    return t
+
+
+def _formant_weights(f: float, formants, n_max: int = 40) -> tuple:
+    """Harmonic amplitudes of a voiced sound at pitch f shaped by vowel formants (centre Hz, width Hz, gain)."""
+    out = []
+    for k in range(1, n_max + 1):
+        fk = f * k
+        if fk > AU_SR * 0.45:
+            break
+        w = 0.08 / k
+        for c, bw, g in formants:
+            w += g * math.exp(-((fk - c) / bw) ** 2)
+        out.append(round(w, 3))
+    return tuple(out)
+
+
+def au_wave(f, dur, vel, table, env=(0.01, 0.0, 1.0, 0.08), voices=(1.0,), vib=(0.0, 5.5, 0.15), table2=None, morph=0.0,
+            div=1, trem=0.0, glide=0.0) -> list:
+    """Wavetable voice. env=(attack, decay, sustain, release) seconds/level; voices = detune ratios (supersaw-style unison);
+    vib=(depth, rate, delay); table2+morph crossfades bright->dark over `morph` seconds; div renders at SR/div (cheap pads)."""
+    sr = AU_SR // div
+    n = max(1, int(dur * sr))
+    out = [0.0] * n
+    a, d, s, r = env
+    nv = len(voices)
+    phs = [k * 0.137 for k in range(nv)]
+    sin = math.sin
+    T = _AU_TBL
+    vd, vr, vdel = vib
+    for i in range(n):
+        t = i / sr
+        if t < a:
+            e = t / a
+        elif t < a + d:
+            e = 1.0 - (1.0 - s) * (t - a) / d
+        else:
+            e = s
+        if t > dur - r:
+            e *= max(0.0, (dur - t) / r)
+        fm = f
+        if glide and t < glide:
+            fm = f * (0.5 + 0.5 * t / glide) if glide > 0 else f
+        if vd and t > vdel:
+            fm *= 1 + vd * sin(AU_TAU * vr * t) * min(1.0, (t - vdel) * 3)
+        v = 0.0
+        for k in range(nv):
+            phs[k] += fm * voices[k] / sr
+            idx = int((phs[k] % 1.0) * T)
+            if table2 is not None:
+                m = min(1.0, t / morph) if morph else 1.0
+                v += table[idx] * (1 - m) + table2[idx] * m
+            else:
+                v += table[idx]
+        v /= nv
+        if trem:
+            v *= 1 - trem * (0.5 + 0.5 * sin(AU_TAU * 5.2 * t))
+        out[i] = v * e * vel
+    if div > 1:
+        up = [0.0] * (n * div)
+        prev = 0.0
+        for i, v in enumerate(out):
+            dv = (v - prev) / div
+            for j in range(div):
+                up[i * div + j] = prev + dv * (j + 1)
+            prev = v
+        return up
+    return out
+
+
+def au_pluck(f, dur, vel, bright=0.5, damp=0.996, buzz=0.0, seed=3) -> list:
+    """Karplus-Strong plucked string (harp, koto, guitar, sitar with `buzz`)."""
+    n = max(1, int(dur * AU_SR))
+    p = max(2, int(AU_SR / max(f, 20)))
+    rng = random.Random(seed + int(f))
+    line = [rng.random() * 2 - 1 for _ in range(p)]
+    if bright < 1.0:
+        line = au_lowpass(line, 0.2 + 0.8 * bright)
+    out = [0.0] * n
+    tanh = math.tanh
+    for i in range(n):
+        j = i % p
+        v = line[j]
+        nxt = line[(j + 1) % p]
+        line[j] = damp * 0.5 * (v + nxt)
+        if buzz:
+            v = tanh(v * (1 + buzz * 4)) * 0.8 + v * 0.2
+        out[i] = v * vel
+    return au_tail(out, 0.02)
+
+
+def _au_inst_table():
+    """Named instruments: (render(f, dur, vel) -> buffer, mix gain)."""
+    saw = au_table(tuple(1.0 / k for k in range(1, 30)))
+    dsaw = au_table(tuple(1.0 / k ** 1.6 for k in range(1, 16)))
+    sq = au_table(tuple((1.0 / k if k % 2 else 0.0) for k in range(1, 26)))
+    dsq = au_table(tuple((1.0 / k ** 1.5 if k % 2 else 0.0) for k in range(1, 12)))
+    sine = au_table((1.0,))
+    organ = au_table((1.0, 0.8, 0.0, 0.6, 0.0, 0.45, 0.0, 0.35, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.12))
+    reed = au_table((0.6, 0.1, 1.0, 0.1, 0.7, 0.08, 0.5, 0.05, 0.35, 0.0, 0.2))
+    flute = au_table((1.0, 0.25, 0.08, 0.04))
+    brass_b = au_table(tuple(1.0 / k ** 0.9 for k in range(1, 22)))
+    brass_d = au_table(tuple(1.0 / k ** 2.2 for k in range(1, 10)))
+    glass = au_table((1.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.25))
+    hollow = au_table((1.0, 0.0, 0.33, 0.0, 0.2, 0.0, 0.14))
+    vox_a = ((700, 130, 1.0), (1220, 140, 0.55), (2600, 220, 0.25))
+    vox_o = ((450, 110, 1.0), (800, 120, 0.6), (2830, 240, 0.12))
+    I = {}
+
+    def W(name, gain, **kw):
+        I[name] = (lambda f, d, v, kw=kw: au_wave(f, d, v, **kw), gain)
+    # --- synths
+    W("supersaw", .42, table=saw, env=(0.01, 0.3, 0.7, 0.08), voices=(0.988, 0.994, 1.0, 1.006, 1.012))
+    W("saw", .5, table=saw, env=(0.005, 0.2, 0.6, 0.05), voices=(1.0, 1.004))
+    W("square", .45, table=sq, env=(0.004, 0.15, 0.7, 0.04))
+    W("hollow", .5, table=hollow, env=(0.01, 0.2, 0.8, 0.06), vib=(0.004, 5.5, 0.2))
+    W("pad", .38, table=dsaw, env=(0.45, 0.0, 1.0, 0.6), voices=(0.996, 1.0, 1.004), div=4)
+    W("warmpad", .4, table=dsq, env=(0.6, 0.0, 1.0, 0.8), voices=(0.997, 1.003), div=4, vib=(0.003, 4.0, 0.5))
+    W("glasspad", .34, table=glass, env=(0.3, 0.0, 1.0, 0.7), voices=(0.995, 1.0, 1.005), div=2, trem=0.2)
+    W("strings", .36, table=dsaw, env=(0.18, 0.0, 1.0, 0.25), voices=(0.994, 1.0, 1.006), vib=(0.004, 5.2, 0.15), div=2)
+    W("stacc", .5, table=dsaw, env=(0.004, 0.09, 0.15, 0.05), voices=(0.996, 1.004))
+    W("pizz", .55, table=hollow, env=(0.002, 0.12, 0.0, 0.03))
+    W("brass", .45, table=brass_b, table2=brass_d, morph=0.5, env=(0.03, 0.2, 0.75, 0.07), voices=(0.997, 1.003), vib=(0.004, 5.0, 0.3))
+    W("horn", .45, table=brass_d, env=(0.06, 0.2, 0.8, 0.12), voices=(1.0,), vib=(0.003, 4.8, 0.35))
+    W("organ", .36, table=organ, env=(0.012, 0.0, 1.0, 0.05), voices=(1.0, 2.0 * 1.001), trem=0.15)
+    W("reed", .45, table=reed, env=(0.03, 0.1, 0.85, 0.06), vib=(0.006, 5.8, 0.18))
+    W("flute", .5, table=flute, env=(0.06, 0.1, 0.85, 0.07), vib=(0.006, 5.0, 0.2))
+    W("erhu", .45, table=dsaw, env=(0.08, 0.1, 0.9, 0.1), vib=(0.014, 6.0, 0.12))
+    W("theremin", .5, table=sine, env=(0.12, 0.0, 1.0, 0.2), vib=(0.012, 5.5, 0.05))
+    W("sub", .8, table=sine, env=(0.006, 0.0, 1.0, 0.04))
+    W("chip", .32, table=sq, env=(0.001, 0.15, 0.55, 0.02))
+    W("chiptri", .5, table=au_table((1.0, 0.0, 0.11, 0.0, 0.04)), env=(0.001, 0.0, 1.0, 0.02))
+    W("music_box", .5, table=au_table((1.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.12)), env=(0.001, 0.6, 0.0, 0.05))
+    I["choir"] = (lambda f, d, v: au_wave(f, d, v, au_table(_formant_weights(f, vox_a)), env=(0.35, 0.0, 1.0, 0.5),
+                                          voices=(0.994, 1.0, 1.006), vib=(0.005, 5.0, 0.3), div=2), .42)
+    I["choir_o"] = (lambda f, d, v: au_wave(f, d, v, au_table(_formant_weights(f, vox_o)), env=(0.4, 0.0, 1.0, 0.6),
+                                            voices=(0.995, 1.005), vib=(0.004, 4.6, 0.3), div=2), .44)
+    # --- plucked / struck
+    I["harp"] = (lambda f, d, v: au_pluck(f, d, v, 0.55, 0.997), .7)
+    I["koto"] = (lambda f, d, v: au_pluck(f, d, v, 0.9, 0.993), .65)
+    I["guitar"] = (lambda f, d, v: au_pluck(f, d, v, 0.75, 0.995), .65)
+    I["sitar"] = (lambda f, d, v: au_pluck(f, d, v, 0.95, 0.996, buzz=0.6), .55)
+    I["harpsi"] = (lambda f, d, v: au_mix([(au_pluck(f, d, v, 1.0, 0.990), 0, 1), (au_pluck(f * 2, d, v, 1.0, 0.985), 0, .35)]), .55)
+    I["piano"] = (lambda f, d, v: [s * v for s in au_mix([(au_tone(f, d, "sine", 1, 2.2), 0, 1), (au_tone(f * 2, d, "sine", 1, 3.5), 0, .35),
+                                                          (au_tone(f * 3, d, "sine", 1, 5), 0, .15), (au_tone(f, d * .25, "fm", 1, 14), 0, .2)])], .6)
+    I["ep"] = (lambda f, d, v: [math.sin(AU_TAU * f * (i / AU_SR) + 1.1 * math.exp(-4 * i / AU_SR) * math.sin(AU_TAU * f * (i / AU_SR)))
+                                * math.exp(-2.4 * i / AU_SR) * min(1.0, (i / AU_SR) / 0.002) * v for i in range(int(d * AU_SR))], .6)
+    I["bell"] = (lambda f, d, v: [math.sin(AU_TAU * f * (i / AU_SR) + 1.7 * math.exp(-5 * i / AU_SR) * math.sin(AU_TAU * f * 2.0 * (i / AU_SR)))
+                                  * math.exp(-3.0 * i / AU_SR) * min(1.0, (i / AU_SR) / 0.002) * v for i in range(int(d * AU_SR))], .55)
+    I["celesta"] = (lambda f, d, v: [s * v for s in au_bell(f, d, 1, 5)], .55)
+    I["marimba"] = (lambda f, d, v: [s * v for s in au_mix([(au_tone(f, d, "sine", 1, 9), 0, 1), (au_tone(f * 4, d, "sine", 1, 30), 0, .3)])], .7)
+    I["vibes"] = (lambda f, d, v: [s * v * (1 - 0.3 * (0.5 + 0.5 * math.sin(AU_TAU * 5 * i / AU_SR)))
+                                   for i, s in enumerate(au_mix([(au_tone(f, d, "sine", 1, 2.0), 0, 1), (au_tone(f * 4, d, "sine", 1, 6), 0, .18)]))], .6)
+    I["glock"] = (lambda f, d, v: [s * v for s in au_bell(f * 2, d, 1, 7)], .4)
+    # --- basses
+    I["bass"] = (lambda f, d, v: _i_bass(f, d, v), .75)
+    I["fingerbass"] = (lambda f, d, v: au_pluck(f, d, v, 0.35, 0.998), .9)
+    I["reese"] = (lambda f, d, v: au_lowpass(au_wave(f, d, v, saw, env=(0.01, 0.0, 1.0, 0.05), voices=(0.993, 1.007, 0.5)), 0.12), .9)
+    I["acid"] = (lambda f, d, v: _i_acid(f, d, v), .65)
+    I["808"] = (lambda f, d, v: _i_808(f, d, v), .9)
+    I["wob"] = (lambda f, d, v: _i_wob(f, d, v), .7)
+    I["chipbass"] = (lambda f, d, v: au_wave(f, d, v, sq, env=(0.001, 0.0, 1.0, 0.02)), .4)
+    I["power"] = (lambda f, d, v: _i_power(f, d, v), .5)
+    I["chug"] = (lambda f, d, v: _i_power(f, min(d, 0.14), v, mute=True), .55)
+    I["hoover"] = (lambda f, d, v: au_wave(f, d, v, saw, env=(0.01, 0.2, 0.8, 0.06), voices=(0.98, 0.99, 1.0, 1.01, 1.02, 0.5), glide=0.06), .4)
+    I["drone"] = (lambda f, d, v: au_wave(f, d, v, reed, env=(0.8, 0.0, 1.0, 0.8), voices=(0.999, 1.001, 0.5), div=4), .4)
+    return I
+
+
+def _i_bass(f, dur, vel=1.0):
+    n = int(dur * AU_SR)
+    out = [0.0] * n
+    ph = y = 0.0
+    sin, exp = math.sin, math.exp
+    for i in range(n):
+        t = i / AU_SR
+        ph += f / AU_SR
+        v = (2 * (ph % 1.0) - 1) * 0.65 + sin(AU_TAU * ph) * 0.55
+        y += (0.05 + 0.42 * exp(-t * 8)) * (v - y)
+        out[i] = y * min(1.0, t / 0.004) * vel
+    return out
+
+
+def _i_acid(f, dur, vel=1.0):
+    n = int(dur * AU_SR)
+    out = [0.0] * n
+    ph = y1 = y2 = 0.0
+    exp, tanh = math.exp, math.tanh
+    for i in range(n):
+        t = i / AU_SR
+        ph += f / AU_SR
+        v = 2 * (ph % 1.0) - 1
+        c = 0.06 + 0.34 * exp(-t * 14)
+        y1 += c * (v - y1 + 0.8 * (y1 - y2))
+        y2 += c * (y1 - y2)
+        out[i] = tanh(y2 * 1.8) * min(1.0, t / 0.003) * (1.0 if t < dur - 0.02 else max(0.0, (dur - t) / 0.02)) * vel
+    return out
+
+
+def _i_808(f, dur, vel=1.0):
+    n = int(max(dur, 0.25) * AU_SR)
+    sin, exp = math.sin, math.exp
+    out = [0.0] * n
+    ph = 0.0
+    for i in range(n):
+        t = i / AU_SR
+        ph += f * (1 + 1.4 * exp(-t * 40)) / AU_SR
+        out[i] = math.tanh(sin(AU_TAU * ph) * 1.6) * exp(-t * 1.4) * min(1.0, t / 0.002) * vel
+    return out
+
+
+def _i_wob(f, dur, vel=1.0, rate=2.0):
+    n = int(dur * AU_SR)
+    out = [0.0] * n
+    ph = y = 0.0
+    sin = math.sin
+    for i in range(n):
+        t = i / AU_SR
+        ph += f / AU_SR
+        v = (2 * (ph % 1.0) - 1) * 0.7 + sin(AU_TAU * ph * 0.5) * 0.5
+        y += (0.04 + 0.30 * (0.5 + 0.5 * sin(AU_TAU * rate * t))) * (v - y)
+        out[i] = y * min(1.0, t / 0.004) * vel
+    return out
+
+
+def _i_power(f, dur, vel=1.0, mute=False):
+    """A distorted power chord (root + fifth + octave), the 'guitar' of the metal and industrial themes."""
+    n = int(dur * AU_SR)
+    out = [0.0] * n
+    p1 = p2 = p3 = y = 0.0
+    tanh, exp = math.tanh, math.exp
+    for i in range(n):
+        t = i / AU_SR
+        p1 += f / AU_SR
+        p2 += f * 1.4983 / AU_SR
+        p3 += f * 2.003 / AU_SR
+        v = (p1 % 1.0) + (p2 % 1.0) * 0.8 + (p3 % 1.0) * 0.5 - 1.15
+        v = tanh(v * 4.0)
+        y += (0.18 if mute else 0.35) * (v - y)
+        env = exp(-t * (18 if mute else 1.2)) * min(1.0, t / 0.003)
+        out[i] = y * env * vel
+    return au_tail(out, 0.01)
+
+
+# ---- drum kits ------------------------------------------------------------------------------------------------------------
+def au_drum(name: str) -> list:
+    """Every drum sound in the game. Names are 'kind' or 'kind.variant'."""
+    T, N, M = au_tone, au_noise, au_mix
+    if name == "kick":
+        return M([(T(150, .42, "sine", 1, 10, .001, f1=45), 0, 1.2), (N(.012, 1, .3, 100), 0, .45)])
+    if name == "kick.808":
+        return M([(T(140, .9, "sine", 1, 3.0, .001, f1=34), 0, 1.3), (N(.01, 1, .3, 120), 0, .3)])
+    if name == "kick.hard":
+        return au_drive(M([(T(190, .32, "sine", 1, 9, .001, f1=48), 0, 1.3), (N(.02, 1, .2, 90), 0, .6)]), 2.5)
+    if name == "kick.soft":
+        return M([(T(110, .35, "sine", 1, 12, .004, f1=50), 0, 1.0)])
+    if name == "snare":
+        return M([(N(.24, 1, .12, 19), 0, .9), (T(210, .14, "sine", 1, 26, f1=150), 0, .8)])
+    if name == "snare.tight":
+        return M([(N(.16, 1, .2, 28), 0, 1.0), (T(260, .1, "sine", 1, 30, f1=180), 0, .7)])
+    if name == "snare.orch":
+        return M([(N(.32, .9, .15, 12), 0, 1.0), (T(190, .2, "sine", 1, 18, f1=170), 0, .5)])
+    if name == "snare.lofi":
+        return au_lowpass(M([(N(.2, 1, .1, 22), 0, .8), (T(180, .12, "sine", 1, 24, f1=140), 0, .8)]), 0.4)
+    if name == "rim":
+        return M([(T(1700, .03, "square", 1, 120, lp=.6), 0, .8), (N(.02, 1, .4, 150), 0, .4)])
+    if name == "clap":
+        return M([(N(.05, .9, .1, 60, seed=s), t, 1) for s, t in ((1, 0), (2, .011), (3, .023))] + [(N(.18, .8, .1, 22, seed=9), .03, .8)])
+    if name == "hat":
+        return N(.05, 1, .45, 80, .001, .6)
+    if name == "hat.tight":
+        return N(.025, 1, .55, 150, .001, .55)
+    if name == "ohat":
+        return N(.22, 1, .45, 14, .001, .6)
+    if name == "ride":
+        return M([(N(.6, 1, .5, 5, .001, .35), 0, 1), (T(3400, .6, "sine", 1, 6), 0, .08), (T(5100, .5, "sine", 1, 8), 0, .05)])
+    if name == "crash":
+        return M([(N(1.6, 1, .35, 2.2, .001, .7, seed=11), 0, 1), (N(.4, .6, .2, 6, seed=12), 0, .4)])
+    if name == "shaker":
+        return N(.07, 1, .6, 50, .02, .45, seed=5)
+    if name == "tom":
+        return M([(T(140, .35, "sine", 1, 9, .001, f1=95), 0, 1.0), (N(.03, .6, .1, 60), 0, .3)])
+    if name == "tom.hi":
+        return M([(T(220, .28, "sine", 1, 11, .001, f1=150), 0, 1.0), (N(.03, .6, .1, 60), 0, .3)])
+    if name == "taiko":
+        return M([(T(82, .9, "sine", 1, 4.2, .002, f1=55), 0, 1.4), (N(.08, .25, .05, 25), 0, .9), (T(160, .1, "sine", 1, 30), 0, .4)])
+    if name == "taiko.rim":
+        return M([(T(900, .05, "square", 1, 80, lp=.4), 0, .7), (N(.04, .8, .2, 90), 0, .5)])
+    if name == "timpani":
+        return M([(T(98, 1.6, "sine", 1, 2.0, .004, f1=92), 0, 1.2), (T(196, 1.0, "sine", 1, 3.5), 0, .35), (N(.06, .3, .05, 30), 0, .5)])
+    if name == "doum":
+        return M([(T(120, .5, "sine", 1, 7, .001, f1=80), 0, 1.2), (N(.02, .5, .1, 80), 0, .3)])
+    if name == "tek":
+        return M([(T(820, .07, "sine", 1, 55), 0, .7), (N(.04, 1, .4, 90), 0, .6)])
+    if name == "clave":
+        return T(2500, .06, "sine", 1, 60)
+    if name == "block":
+        return M([(T(1200, .07, "sine", 1, 55), 0, 1.0), (T(2650, .05, "sine", 1, 70), 0, .3)])
+    if name == "cowbell":
+        return au_lowpass(M([(T(540, .25, "square", 1, 14), 0, .6), (T(800, .25, "square", 1, 14), 0, .6)]), .5)
+    if name == "anvil":
+        return M([(T(f, .8, "sine", 1, 5), 0, g) for f, g in ((1350, .8), (2370, .5), (3610, .35), (4980, .2))] + [(N(.03, 1, .3, 90), 0, .8)])
+    if name == "gong":
+        return M([(T(f, 3.0, "sine", 1, 1.0, .02, vib=.003), 0, g) for f, g in ((110, 1.0), (163, .6), (247, .5), (391, .3), (523, .2))]
+                 + [(N(1.0, .2, .02, 2, .05), 0, .3)])
+    if name == "glitch":
+        return au_crush(M([(T(3100, .05, "square", 1, 50), 0, .7), (N(.04, 1, .3, 60, seed=21), .01, .7)]), 3, 4)
+    if name == "glitch.blip":
+        return M([(T(f, .03, "sine", 1, 90), k * .018, 1) for k, f in enumerate((1800, 2700, 1200))])
+    if name == "glitch.zap":
+        return au_crush(T(2400, .12, "saw", 1, 20, f1=200, lp=.6), 4, 3)
+    if name == "riser":
+        return au_noise(1.8, .02, .02, 0.0, 1.6, .7, seed=33, lp1=.8)
+    if name == "boom":
+        return M([(T(70, 2.0, "sine", 1, 2.2, .002, f1=30), 0, 1.5), (N(1.4, .08, .0, 2.5, .005), 0, .8)])
+    if name == "chip.k":
+        return au_crush(T(220, .12, "square", 1, 20, f1=60), 4, 2)
+    if name == "chip.s":
+        return au_crush(N(.1, 1, .3, 28, seed=4), 4, 3)
+    if name == "chip.h":
+        return au_crush(N(.03, 1, .5, 110, seed=6), 3, 3)
+    if name == "bodhran":
+        return M([(T(95, .35, "sine", 1, 10, .001, f1=70), 0, 1.0), (N(.05, .4, .1, 50), 0, .4)])
+    if name == "tabla":
+        return M([(T(330, .4, "sine", 1, 9, .001, f1=360), 0, .9), (N(.02, 1, .4, 90), 0, .3)])
+    return au_noise(.05, 1, .4, 80)
+
+
+DRUM_GAIN = {"kick": 1.0, "snare": .8, "hat": .45, "ohat": .45, "clap": .6, "ride": .35, "crash": .45, "shaker": .4, "rim": .6, "tom": .8,
+             "taiko": .95, "timpani": .8, "doum": .9, "tek": .6, "clave": .5, "block": .6, "cowbell": .4, "anvil": .45, "gong": .6,
+             "glitch": .5, "riser": .45, "boom": .9, "chip": .55, "bodhran": .85, "tabla": .7}
+
+
+def drum_gain(name: str) -> float:
+    return DRUM_GAIN.get(name.split(".")[0], 0.6)
+
+# ===========================================================================
+# AUDIO ENGINE - part 2: the composer. Every song is hand-specified (its own motif, answer phrase, chord progression,
+# metre, tempo, mode, form and arrangement style); the composer only performs it. Songs are *sequenced* at runtime from
+# a small bank of pre-rendered notes, so music costs almost no memory or CPU once a song is loaded.
+# ===========================================================================
+SCALES = {"maj": (0, 2, 4, 5, 7, 9, 11), "min": (0, 2, 3, 5, 7, 8, 10), "dor": (0, 2, 3, 5, 7, 9, 10), "phr": (0, 1, 3, 5, 7, 8, 10),
+          "lyd": (0, 2, 4, 6, 7, 9, 11), "mix": (0, 2, 4, 5, 7, 9, 10), "hmin": (0, 2, 3, 5, 7, 8, 11), "phd": (0, 1, 4, 5, 7, 8, 10),
+          "hung": (0, 2, 3, 6, 7, 8, 11), "pent": (0, 2, 4, 7, 9), "mpent": (0, 3, 5, 7, 10), "wt": (0, 2, 4, 6, 8, 10),
+          "loc": (0, 1, 3, 5, 6, 8, 10), "insen": (0, 1, 5, 7, 10)}
+METERS = {"44": (16, (4, 4, 4, 4)), "34": (12, (4, 4, 4)), "68": (12, (6, 6)), "78": (14, (4, 4, 6)), "54": (20, (6, 4, 6, 4)),
+          "58": (10, (4, 6)), "98": (18, (6, 6, 6)), "128": (24, (6, 6, 6, 6))}
+
+
+def deg_semi(sc: tuple, d: int) -> int:
+    """Scale degree (1-based, may exceed the octave or go below 1) -> semitones above the tonic."""
+    L = len(sc)
+    q, r = divmod(d - 1, L)
+    return sc[r] + 12 * q
+
+
+def parse_chord(tok: str, sc: tuple) -> tuple:
+    """'1', '6M', 'b7M', '4m7', '5s' (sus4), '1p' (power), '2d' (dim) -> (root semitone, (intervals...))."""
+    acc = 0
+    while tok and tok[0] in "b#":
+        acc += -1 if tok[0] == "b" else 1
+        tok = tok[1:]
+    i = 0
+    while i < len(tok) and tok[i].isdigit():
+        i += 1
+    d, q = int(tok[:i] or 1), tok[i:]
+    root = deg_semi(sc, d) + acc
+    if "M" in q:
+        iv = [0, 4, 7]
+    elif "m" in q:
+        iv = [0, 3, 7]
+    elif "d" in q:
+        iv = [0, 3, 6]
+    elif "+" in q:
+        iv = [0, 4, 8]
+    elif "s" in q:
+        iv = [0, 5, 7]
+    elif "p" in q:
+        iv = [0, 7, 12]
+    elif acc:
+        iv = [0, 4, 7]
+    else:                                                    # diatonic: stack scale thirds
+        iv = [0, deg_semi(sc, d + 2) - deg_semi(sc, d), deg_semi(sc, d + 4) - deg_semi(sc, d)]
+    if "7" in q:
+        iv.append(10 if ("M" not in q or "m" in q) else 11)
+    if "9" in q:
+        iv.append(14)
+    return root, tuple(iv)
+
+
+def parse_mel(text: str, sc: tuple, meter: int) -> list:
+    """'5:4 3:2 2 1:8 r:4 1#\\':2 ...' -> [(step, semitone, length)]; durations in 16th steps (carry over), r = rest, ~ = tie,
+    ' / , raise / lower an octave, # / b alter. A bar line '|' is decorative."""
+    out, step, dur = [], 0, 4
+    for tok in text.replace("|", " ").split():
+        if ":" in tok:
+            tok, ds = tok.split(":")
+            dur = int(ds)
+        if tok == "~":
+            if out:
+                s0, m0, l0 = out[-1]
+                out[-1] = (s0, m0, l0 + dur)
+            step += dur
+            continue
+        if tok != "r":
+            octv, acc = 0, 0
+            core = tok
+            while core and core[-1] in "',":
+                octv += 12 if core[-1] == "'" else -12
+                core = core[:-1]
+            while core and core[-1] in "#b":
+                acc += 1 if core[-1] == "#" else -1
+                core = core[:-1]
+            out.append((step, deg_semi(sc, int(core)) + acc + octv, dur))
+        step += dur
+    return out
+
+
+# ---- grooves: lane -> pattern per bar ('x' hit, 'o' ghost, '-' rest); every pattern must be the metre's step count ------
+GROOVES = {
+    "four":    {"K": "x---x---x---x---", "C": "----x-------x---", "H": "--x---x---x---x-", "h": "x-x-x-x-x-x-x-x-"},
+    "rock":    {"K": "x-----x-x-------", "S": "----x-------x---", "h": "x-x-x-x-x-x-x-x-"},
+    "rock2":   {"K": "x--x--x---x-x---", "S": "----x-------x--o", "R": "x-x-x-x-x-x-x-x-"},
+    "boom":    {"K": "x-----x---x-----", "S": "----x-------x-x-", "T": "x---------------", "P": "--x-----x-x---x-"},
+    "boom2":   {"K": "x--x----x-x-----", "S": "--------x-------", "T": "x-------x-------", "P": "x-x-x-x-x-x-x-x-"},
+    "march":   {"K": "x-------x-------", "S": "x-oxx-x-x-oxx-x-", "T": "x-------x-------"},
+    "dnb":     {"K": "x---------x-----", "S": "----x-------x---", "h": "x-x-x-x-x-x-x-x-", "s": "-------o-o----o-"},
+    "trap":    {"K": "x------x--x-----", "S": "--------x-------", "h": "xxxxxxxxxxxxxxxx", "O": "-----------x----"},
+    "metal":   {"K": "xxxxxxxxxxxxxxxx", "S": "----x-------x---", "R": "x-x-x-x-x-x-x-x-"},
+    "metal2":  {"K": "x-xxx-xxx-xxx-xx", "S": "----x-------x---", "h": "x-x-x-x-x-x-x-x-"},
+    "techno":  {"K": "x---x---x---x---", "h": "--x---x---x---x-", "C": "----x-------x---", "P": "--x--x--x-----x-"},
+    "chip":    {"K": "x-------x-x-----", "S": "----x-------x---", "h": "x-x-x-x-x-x-x-x-"},
+    "break":   {"K": "x-----x---x-----", "S": "----x-------x---", "h": "x-x-x-x-x-x-x-x-", "s": "--o---o---o-o---"},
+    "dub":     {"K": "x---------x-----", "S": "--------x-------", "h": "--x---x---x---x-"},
+    "half":    {"K": "x---------x--x--", "S": "--------x-------", "h": "x-x-x-x-x-x-x-x-"},
+    "glitch":  {"K": "x--x---x-x----x-", "S": "----x--x----x-x-", "h": "xx-x-xx-xx-x-xx-", "G": "---x------x---x-"},
+    "desert":  {"D": "x------x-x------", "E": "--x-x---x---x-x-", "h": "x-x-x-x-x-x-x-x-"},
+    "eastern": {"K": "x-------x---x---", "B": "--x---x---x---x-", "P": "----x-------x---"},
+    "house":   {"K": "x---x---x---x---", "C": "----x-------x---", "O": "--x---x---x---x-", "h": "x-xxx-xxx-xxx-xx"},
+    "soft":    {"K": "x-------x-------", "h": "----x-------x---"},
+    "ambient": {"K": "x---------------", "h": "--------x-------"},
+    "clock":   {"K": "x-------x-------", "P": "x---x---x---x---", "B": "--x---x---x---x-"},
+    "indus":   {"K": "x--x--x-x--x--x-", "S": "----x-------x---", "A": "-------x-------x", "h": "x-x-x-x-x-x-x-x-"},
+    "hyper":   {"K": "x---x---x---x---", "O": "--x---x---x---x-", "C": "----x-------x---", "h": "xxxxxxxxxxxxxxxx"},
+    "western": {"K": "x-----x-x-----x-", "S": "----x-------x---", "P": "x-xx-xx-x-xx-xx-"},
+    "funk":    {"K": "x--x--x---x--x--", "S": "----x--o-o--x---", "h": "x-x-x-x-x-x-x-x-", "P": "--x---x---x---x-"},
+    "waltz":   {"K": "x-----------", "S": "----o---o---", "h": "x-x-x-x-x-x-"},
+    "waltz2":  {"T": "x-----------", "P": "----x---x---", "R": "x---x---x---"},
+    "jig":     {"K": "x--x-xx--x-x", "P": "x-xx-xx-xx-x", "S": "------x-----"},
+    "jig2":    {"K": "x-----x-----", "S": "---x-x---x-x", "h": "x-xx-xx-xx-x"},
+    "march68": {"K": "x-----x-----", "S": "x-ox-ox-ox-o", "T": "x-----------"},
+    "balkan":  {"D": "x---x---x-----", "E": "--x---x---x-x-", "C": "----------x---"},
+    "balkan2": {"K": "x---x---x--x--", "S": "--x---x-----x-", "h": "x-x-x-x-x-x-x-"},
+    "five":    {"K": "x-----x---x-----x---", "S": "----x-------x-----x-", "h": "x-x-x-x-x-x-x-x-x-x-"},
+    "five2":   {"K": "x-----------x-------", "P": "x--x--x---x--x--x---", "B": "------x---------x---"},
+    "five8":   {"K": "x---x-----", "S": "------x---", "h": "x-x-x-x-x-"},
+    "nine":    {"K": "x-----x-----x-----", "S": "---x-----x-----x-x", "h": "x-xx-xx-xx-xx-xx-x"},
+    "twelve":  {"K": "x-----x-----x-----x-----", "S": "------x-----------x-----", "h": "x-xx-xx-xx-xx-xx-xx-xx-x"},
+    "none":    {},
+}
+FILLS = {"tom": {"T": "----x-x-xxxxxxxx"}, "snare": {"S": "x-x-x-x-xxxxxxxx"}, "taiko": {"K": "x---x---x-x-xxxx", "P": "--x---x---x-x-x-"},
+         "glitch": {"G": "xxxx-xx-xxxxxxxx", "S": "----x---x-x-xxxx"}, "chip": {"S": "x-x-x-x-xxxxxxxx"}, "none": {}}
+KITS = {   # lane -> drum sample
+    "pop":    {"K": "kick", "S": "snare", "C": "clap", "H": "ohat", "h": "hat", "O": "ohat", "R": "ride", "T": "tom", "P": "shaker", "s": "snare.tight"},
+    "808":    {"K": "kick.808", "S": "snare.tight", "C": "clap", "h": "hat.tight", "O": "ohat", "H": "ohat", "P": "rim", "T": "tom"},
+    "rock":   {"K": "kick.hard", "S": "snare", "h": "hat", "R": "ride", "O": "ohat", "T": "tom", "P": "tom.hi", "C": "clap"},
+    "orch":   {"K": "taiko", "S": "snare.orch", "T": "timpani", "P": "taiko.rim", "h": "shaker", "C": "clap", "R": "ride"},
+    "chip":   {"K": "chip.k", "S": "chip.s", "h": "chip.h", "C": "chip.s", "T": "chip.k", "O": "chip.h"},
+    "lofi":   {"K": "kick.soft", "S": "snare.lofi", "h": "hat", "O": "ohat", "P": "shaker", "R": "ride", "C": "rim"},
+    "dub":    {"K": "kick.soft", "S": "rim", "h": "hat", "O": "ohat", "P": "shaker", "C": "clap"},
+    "tribal": {"K": "taiko", "B": "block", "P": "taiko.rim", "D": "doum", "E": "tek", "S": "snare.orch", "T": "tom", "h": "shaker"},
+    "desert": {"D": "doum", "E": "tek", "h": "shaker", "K": "doum", "S": "tek", "C": "clap", "T": "tom", "P": "tabla"},
+    "metal":  {"K": "kick.hard", "S": "snare.tight", "R": "ride", "h": "hat", "T": "tom", "A": "anvil", "C": "clap", "O": "ohat"},
+    "indus":  {"K": "kick.hard", "S": "snare.tight", "A": "anvil", "h": "hat.tight", "C": "clap", "T": "tom", "O": "ohat"},
+    "glitch": {"K": "kick.hard", "S": "glitch", "G": "glitch.blip", "h": "hat.tight", "C": "glitch.zap", "T": "tom.hi", "O": "ohat"},
+    "clock":  {"K": "kick.soft", "P": "clave", "B": "block", "S": "rim", "h": "hat.tight", "T": "timpani"},
+    "celtic": {"K": "bodhran", "P": "shaker", "S": "rim", "h": "shaker", "T": "bodhran"},
+    "soft":   {"K": "kick.soft", "h": "shaker", "S": "rim", "P": "shaker", "T": "timpani", "R": "ride"},
+}
+
+# ---- bass, harmony and arpeggio figures ---------------------------------------------------------------------------------
+def bass_figure(name: str, meter: int, groups: tuple) -> list:
+    """[(step, semitone offset from chord root, length)] for one bar."""
+    beats, acc = [], 0
+    for g in groups:
+        beats.append(acc)
+        acc += g
+    if name == "root":
+        return [(0, 0, meter)]
+    if name == "pulse8":
+        return [(s, 0, 2) for s in range(0, meter, 2)]
+    if name == "pulse16":
+        return [(s, 0, 1) for s in range(meter)]
+    if name == "beats":
+        return [(b, 0, g) for b, g in zip(beats, groups)]
+    if name == "march":
+        return [(b, 0 if k % 2 == 0 else 7, g) for k, (b, g) in enumerate(zip(beats, groups))]
+    if name == "octave":
+        return [(s, 12 if (s // 2) % 2 else 0, 2) for s in range(0, meter, 2)]
+    if name == "gallop":
+        return [(s, 0, 1) for s in range(meter) if s % 4 in (0, 3)]
+    if name == "walk":
+        steps = [0, 4, 7, 9, 12, 10, 7, 5]
+        return [(b, steps[k % len(steps)], g) for k, (b, g) in enumerate(zip(beats, groups))]
+    if name == "synco":
+        return [(s, 0 if s < meter - 4 else 7, 2) for s in (0, 3, 6, 10, 12) if s < meter]
+    if name == "dub":
+        return [(0, 0, 3), (3, 0, 1), (6, 7, 2), (10, 0, 4)] if meter == 16 else [(0, 0, meter // 2), (meter // 2, 7, meter // 2)]
+    if name == "chug":
+        return [(s, 0, 1) for s in range(meter) if s % 4 != 2]
+    if name == "808":
+        return [(0, 0, 7), (7, 0, 3), (10, -2, 6)] if meter == 16 else [(0, 0, meter)]
+    if name == "waltz":
+        return [(0, 0, 4)]
+    if name == "jig":
+        return [(b, 0 if k % 2 == 0 else 7, g) for k, (b, g) in enumerate(zip(beats, groups))]
+    if name == "drone":
+        return [(0, 0, meter)]
+    if name == "acid":
+        pat = [(0, 0), (1, 12), (3, 0), (4, 0), (6, 12), (7, 0), (8, 0), (10, 0), (11, 12), (13, 0), (14, 7)]
+        return [(s, o, 1) for s, o in pat if s < meter]
+    if name == "boogie":
+        steps = [0, 4, 7, 9, 10, 9, 7, 4]
+        return [(s, steps[(s // 2) % 8], 2) for s in range(0, meter, 2)]
+    return [(0, 0, meter)]
+
+
+ARPS = {"up": [0, 1, 2, 3], "updown": [0, 1, 2, 3, 2, 1], "down": [3, 2, 1, 0], "broken": [0, 2, 1, 3], "alberti": [0, 2, 1, 2],
+        "octave": [0, 3], "trill": [0, 1], "pulse": [0, -1], "spread": [0, 2, 3, 4, 3, 2], "five": [0, 1, 2, 1, 3]}
+
+# ---- arrangement styles ----------------------------------------------------------------------------------------------------
+# kit/groove/fill: drums. bass/bass_i: bass figure + instrument. harm: "pad" | "arp:<shape>:<rate>" | "stab:<rhythm>" |
+# "oompah" | "power:<rhythm>" | "strum:<rhythm>"; harm_i its instrument. pad: optional sustained bed. lead/lead2/counter:
+# instruments. swing (0..0.3), pump (sidechain depth), echo (lead echo in beats), oct (lead octave shift).
+STYLES = {
+    "epic":     dict(kit="orch", groove="boom", fill="taiko", bass="beats", bass_i="strings", harm="arp:alberti:2", harm_i="stacc", pad="strings",
+                     lead="brass", lead2="choir", counter="horn", oct=0),
+    "march":    dict(kit="orch", groove="march", fill="snare", bass="march", bass_i="pizz", harm="stab:x---x---x---x---", harm_i="brass", pad="strings",
+                     lead="brass", lead2="flute", counter="horn"),
+    "synthwave": dict(kit="pop", groove="four", fill="tom", bass="pulse8", bass_i="bass", harm="arp:up:1", harm_i="pizz", pad="pad",
+                      lead="supersaw", lead2="hollow", counter="glasspad", pump=0.45, echo=0.75),
+    "chip":     dict(kit="chip", groove="chip", fill="chip", bass="octave", bass_i="chipbass", harm="arp:up:1", harm_i="chip", pad=None,
+                     lead="square", lead2="chiptri", counter="chip", oct=12),
+    "dnb":      dict(kit="pop", groove="dnb", fill="snare", bass="root", bass_i="reese", harm="arp:broken:2", harm_i="pizz", pad="pad",
+                     lead="hollow", lead2="glasspad", counter="strings", pump=0.25, echo=0.75),
+    "trap":     dict(kit="808", groove="trap", fill="snare", bass="808", bass_i="808", harm="arp:pulse:2", harm_i="bell", pad="warmpad",
+                     lead="bell", lead2="flute", counter="choir_o"),
+    "metal":    dict(kit="metal", groove="metal", fill="tom", bass="chug", bass_i="chug", harm="power:x-------x---x---", harm_i="power", pad=None,
+                     lead="saw", lead2="organ", counter="choir", oct=0),
+    "metal2":   dict(kit="metal", groove="metal2", fill="tom", bass="gallop", bass_i="chug", harm="power:x-----x-x-------", harm_i="power", pad="choir",
+                     lead="supersaw", lead2="brass", counter="organ"),
+    "techno":   dict(kit="808", groove="techno", fill="snare", bass="acid", bass_i="acid", harm="stab:--x---x---x-x---", harm_i="stacc", pad="pad",
+                     lead="square", lead2="glasspad", counter="hollow", pump=0.5, echo=0.75),
+    "ambient":  dict(kit="soft", groove="ambient", fill="none", bass="root", bass_i="sub", harm="pad", harm_i="warmpad", pad="glasspad",
+                     lead="celesta", lead2="flute", counter="glasspad", echo=1.0),
+    "waltz":    dict(kit="lofi", groove="waltz", fill="none", bass="waltz", bass_i="fingerbass", harm="oompah", harm_i="pizz", pad="strings",
+                     lead="flute", lead2="music_box", counter="strings"),
+    "jig":      dict(kit="celtic", groove="jig", fill="none", bass="jig", bass_i="fingerbass", harm="strum:x--x--", harm_i="guitar", pad=None,
+                     lead="flute", lead2="harp", counter="reed"),
+    "balkan":   dict(kit="desert", groove="balkan", fill="none", bass="beats", bass_i="fingerbass", harm="stab:x---x---x-----", harm_i="organ", pad=None,
+                     lead="reed", lead2="flute", counter="brass"),
+    "desert":   dict(kit="desert", groove="desert", fill="none", bass="drone", bass_i="drone", harm="arp:spread:2", harm_i="sitar", pad="warmpad",
+                     lead="erhu", lead2="sitar", counter="reed"),
+    "eastern":  dict(kit="tribal", groove="eastern", fill="taiko", bass="beats", bass_i="fingerbass", harm="arp:broken:2", harm_i="koto", pad="warmpad",
+                     lead="flute", lead2="koto", counter="erhu"),
+    "gothic":   dict(kit="orch", groove="boom2", fill="taiko", bass="beats", bass_i="organ", harm="pad", harm_i="organ", pad="choir",
+                     lead="organ", lead2="choir_o", counter="harpsi"),
+    "industrial": dict(kit="indus", groove="indus", fill="tom", bass="pulse16", bass_i="reese", harm="power:x--x--x---x-----", harm_i="power", pad="drone",
+                       lead="saw", lead2="theremin", counter="stacc", pump=0.35),
+    "dub":      dict(kit="dub", groove="dub", fill="none", bass="dub", bass_i="sub", harm="stab:----x-------x---", harm_i="organ", pad="warmpad",
+                     lead="theremin", lead2="ep", counter="vibes", echo=0.75),
+    "glitch":   dict(kit="glitch", groove="glitch", fill="glitch", bass="synco", bass_i="acid", harm="arp:spread:1", harm_i="bell", pad="glasspad",
+                     lead="square", lead2="music_box", counter="hollow", pump=0.4, echo=0.5),
+    "cosmic":   dict(kit="soft", groove="soft", fill="none", bass="root", bass_i="sub", harm="arp:spread:2", harm_i="celesta", pad="choir",
+                     lead="glasspad", lead2="theremin", counter="choir_o", echo=1.0),
+    "horror":   dict(kit="orch", groove="ambient", fill="none", bass="drone", bass_i="drone", harm="pad", harm_i="glasspad", pad="choir_o",
+                     lead="theremin", lead2="music_box", counter="strings"),
+    "hymn":     dict(kit="soft", groove="none", fill="none", bass="root", bass_i="organ", harm="pad", harm_i="organ", pad="choir",
+                     lead="choir_o", lead2="celesta", counter="strings"),
+    "hyper":    dict(kit="metal", groove="hyper", fill="snare", bass="octave", bass_i="hoover", harm="stab:x-x-x-x-x-x-x-x-", harm_i="supersaw", pad=None,
+                     lead="supersaw", lead2="square", counter="hoover", pump=0.6),
+    "clock":    dict(kit="clock", groove="clock", fill="none", bass="march", bass_i="pizz", harm="arp:alberti:2", harm_i="harpsi", pad="strings",
+                     lead="harpsi", lead2="music_box", counter="reed"),
+    "western":  dict(kit="rock", groove="western", fill="tom", bass="gallop", bass_i="fingerbass", harm="strum:x--x--x---x--x--", harm_i="guitar", pad=None,
+                     lead="guitar", lead2="theremin", counter="brass"),
+    "folk":     dict(kit="lofi", groove="soft", fill="none", bass="beats", bass_i="fingerbass", harm="strum:x---x-x-x---x-x-", harm_i="guitar", pad="warmpad",
+                     lead="flute", lead2="harp", counter="strings"),
+    "house":    dict(kit="pop", groove="house", fill="snare", bass="octave", bass_i="bass", harm="stab:--x---x---x---x-", harm_i="ep", pad="warmpad",
+                     lead="ep", lead2="vibes", counter="strings", pump=0.4),
+    "funk":     dict(kit="pop", groove="funk", fill="tom", bass="boogie", bass_i="fingerbass", harm="stab:--x--x----x--x--", harm_i="brass", pad=None,
+                     lead="brass", lead2="organ", counter="ep"),
+    "lullaby":  dict(kit="soft", groove="none", fill="none", bass="root", bass_i="sub", harm="arp:alberti:2", harm_i="music_box", pad="warmpad",
+                     lead="celesta", lead2="music_box", counter="glasspad", echo=1.0),
+    "fanfare":  dict(kit="orch", groove="march", fill="snare", bass="march", bass_i="horn", harm="stab:x---x-x-x---x---", harm_i="brass", pad="strings",
+                     lead="brass", lead2="horn", counter="choir"),
+}
+STEMS = ("drums", "bass", "harm", "pad", "lead", "counter")
+STEM_PAN = {"drums": 0.0, "bass": 0.0, "harm": -0.35, "pad": 0.15, "lead": 0.2, "counter": -0.25}
+STEM_GAIN = {"drums": 0.85, "bass": 0.9, "harm": 0.6, "pad": 0.5, "lead": 0.9, "counter": 0.5}
+SECTION_BARS = {"I": 4, "A": 8, "A2": 8, "B": 8, "B2": 8, "C": 8, "D": 4, "X": 8, "O": 4}
+
+
+class SongSpec:
+    """One hand-specified piece of music."""
+
+    def __init__(self, key, name, cat, bpm, root, scale, meter, style, prog, mel, form="I A B A2 C X O", desc="", **kw):
+        self.key, self.name, self.cat, self.bpm, self.root, self.scale = key, name, cat, bpm, root, scale
+        self.meter, self.style, self.prog, self.mel, self.form, self.desc = meter, style, prog, mel, form, desc
+        self.kw = kw
+
+    def get(self, k, default=None):
+        return self.kw.get(k, STYLES[self.style].get(k, default))
+
+
+class Song:
+    """A composed song: time-sorted events (sample, stem, note key, velocity, pan) plus section markers."""
+
+    def __init__(self, sid, events, total, secs, spb) -> None:
+        self.sid, self.events, self.total, self.secs, self.spb = sid, events, total, secs, spb
+        self.times = [e[0] for e in events]
+        self.keys = {e[2] for e in events}
+
+
+def compose(spec: SongSpec) -> Song:
+    sc = SCALES[spec.scale]
+    meter, groups = METERS[spec.meter]
+    spb = 60.0 / spec.bpm / 4                                   # seconds per 16th step
+    rng = random.Random(sum(map(ord, spec.key)) * 7919)
+    st = STYLES[spec.style]
+    kit = KITS[spec.get("kit")]
+    root = spec.root
+    swing = spec.get("swing", 0.0)
+    oct_ = spec.get("oct", 0)
+    ev, secs = [], {}
+    step0 = 0
+
+    def add(step, stem, key, vel, pan=None):
+        sw = swing * spb if (step % 2 == 1) else 0.0
+        ev.append((int((step * spb + sw) * AU_SR), stem, key, max(0.05, min(1.2, vel)), STEM_PAN[stem] if pan is None else pan))
+
+    progs = {k: [parse_chord(t, sc) for t in v.split()] for k, v in spec.prog.items()}
+    mels = {k: parse_mel(v, sc, meter) for k, v in spec.mel.items()}
+    mel_len = {k: max(1, -(-max((s + l for s, _, l in v), default=meter) // meter)) for k, v in mels.items()}
+    lead_i, lead2_i, counter_i = spec.get("lead"), spec.get("lead2"), spec.get("counter")
+    harm, harm_i, pad_i = spec.get("harm"), spec.get("harm_i"), spec.get("pad")
+    bass_name, bass_i = spec.get("bass"), spec.get("bass_i")
+    groove, groove_b = GROOVES[spec.get("groove")], GROOVES[spec.get("groove_b", spec.get("groove"))]
+    fill = FILLS[spec.get("fill")]
+    lead_base = root + 24 + oct_
+    seq = spec.get("seq", 2)                                    # how far (in scale steps) the varied restatement moves
+    for sec in spec.form.split():
+        bars = SECTION_BARS.get(sec, 8)
+        secs.setdefault(sec, int(step0 * spb * AU_SR))
+        letter = sec[0]
+        prog = progs.get("B" if letter == "B" else "C" if (letter == "C" and "C" in progs) else "A")
+        melk = "B" if letter == "B" else "C" if (letter == "C" and "C" in mels) else "A"
+        mel = mels.get(melk, mels["A"])
+        mlen = mel_len.get(melk, 2)
+        loud = {"I": 0.55, "A": 0.85, "A2": 0.95, "B": 0.85, "B2": 0.95, "C": 0.6, "D": 0.8, "X": 1.0, "O": 0.5}.get(sec, 0.85)
+        drums_on = sec in ("A", "A2", "B", "B2", "X", "D") or (sec == "C" and spec.get("c_drums", False))
+        for bar in range(bars):
+            b0 = step0 + bar * meter
+            ch_root, iv = prog[bar % len(prog)]
+            croot = root + ch_root
+            tones = [croot + i for i in iv[:3]] + [croot + 12]
+            last_bar = bar == bars - 1
+            # --- drums
+            if drums_on and st.get("groove") != "none":
+                g = fill if (last_bar and bars >= 8 and fill and meter == 16) else (groove_b if letter == "B" else groove)
+                if sec == "D":
+                    g = {"S": "x-x-x-x-x-x-x-x-" if bar < bars - 1 else "xxxxxxxxxxxxxxxx", "K": "x---x---x---x---"} if meter == 16 else groove
+                for lane, pat in g.items():
+                    name = kit.get(lane)
+                    if not name:
+                        continue
+                    for s, c in enumerate(pat[:meter]):
+                        if c in "xo":
+                            v = (1.0 if c == "x" else 0.45) * (1.08 if s == 0 else 1.0) * rng.uniform(0.9, 1.0) * loud
+                            if sec == "D" and lane == "S":
+                                v *= 0.4 + 0.6 * (bar * meter + s) / (bars * meter)
+                            add(b0 + s, "drums", ("drum", name), v * drum_gain(name))
+                if bar == 0 and sec in ("A", "A2", "X", "B2"):
+                    add(b0, "drums", ("drum", "gong" if spec.style in ("eastern", "gothic", "hymn") else "crash"), 0.5 * loud)
+            elif sec in ("I", "C") and st.get("kit") in ("orch", "tribal") and bar % 2 == 0:
+                add(b0, "drums", ("drum", "timpani" if st.get("kit") == "orch" else "taiko"), 0.45 * loud)
+            if sec == "D" and bar == 0:
+                add(b0, "drums", ("drum", "riser"), 0.55)
+            # --- outro: one held cadence chord, low root and a closing hit, for the whole outro
+            if sec == "O":
+                if bar == 0:
+                    L_ = bars * meter
+                    for t_ in tones[:3]:
+                        add(b0, "harm", (pad_i or harm_i, t_ + 12, L_), 0.45)
+                    add(b0, "bass", (bass_i if bass_i not in ("chug", "acid", "808", "wob") else "sub", croot - 12 if croot - 12 >= root - 12 else croot, L_), 0.7)
+                    add(b0, "drums", ("drum", "gong" if spec.style in ("eastern", "gothic", "hymn", "horror") else "timpani" if st.get("kit") == "orch" else "crash"), 0.5)
+                    add(b0 + meter, "lead", (lead2_i, _nearest_tone(lead_base, tones), (bars - 1) * meter), 0.4)
+                continue
+            # --- bass
+            if sec != "O" or bar == 0:
+                fig = bass_figure("root" if sec in ("I", "C", "O") else bass_name, meter, groups)
+                for s, off, ln in fig:
+                    m = croot - 12 + off
+                    while m < root - 12:
+                        m += 12
+                    add(b0 + s, "bass", (bass_i, m, ln), 0.9 * loud * rng.uniform(0.92, 1.0))
+            # --- harmony figure
+            hseq = harm.split(":")
+            if sec in ("O",) and bar > 0:
+                pass
+            elif hseq[0] == "pad" or sec in ("I", "C", "O"):
+                if bar % 2 == 0 or meter < 16:
+                    ln = meter * (2 if meter >= 16 else 1)
+                    for k, t_ in enumerate(tones[:3]):
+                        add(b0, "harm", (harm_i if hseq[0] == "pad" else (pad_i or "pad"), t_ + 12, ln), 0.5 * loud)
+            elif hseq[0] == "arp":
+                shape, rate = ARPS[hseq[1]], int(hseq[2])
+                for k, s in enumerate(range(0, meter, rate)):
+                    idx = shape[k % len(shape)]
+                    if idx < 0:
+                        continue
+                    n = tones[idx % 4] + (12 if idx >= 4 else 0) + 12
+                    add(b0 + s, "harm", (harm_i, n, rate if rate > 1 else 2), 0.62 * loud * (1.05 if s % 4 == 0 else 0.9))
+            elif hseq[0] in ("stab", "power", "strum"):
+                rhythm = (hseq[1] * 4)[:meter]
+                for s, c in enumerate(rhythm):
+                    if c != "x":
+                        continue
+                    if hseq[0] == "power":
+                        add(b0 + s, "harm", (harm_i, croot - 12 if croot - 12 >= root - 12 else croot, 3), 0.7 * loud)
+                    elif hseq[0] == "strum":
+                        for k, t_ in enumerate(tones[:4]):
+                            add(b0 + s, "harm", (harm_i, t_ + 12, 6), 0.45 * loud, -0.35 + 0.2 * k)
+                    else:
+                        for t_ in tones[:3]:
+                            add(b0 + s, "harm", (harm_i, t_ + 12, 2), 0.42 * loud)
+            elif hseq[0] == "oompah":
+                for b in range(1, len(groups)):
+                    s = sum(groups[:b])
+                    for t_ in tones[:3]:
+                        add(b0 + s, "harm", (harm_i, t_ + 12, 2), 0.4 * loud)
+            # --- sustained bed
+            if pad_i and hseq[0] != "pad" and sec not in ("I", "C", "O") and bar % 2 == 0 and spec.get("bed", True):
+                for t_ in tones[:3]:
+                    add(b0, "pad", (pad_i, t_ + 12, meter * 2), 0.38 * loud)
+            # --- melody
+            mbar = bar % mlen
+            phrase = bar // mlen
+            for s, semi, ln in mel:
+                if not (mbar * meter <= s < (mbar + 1) * meter):
+                    continue
+                ss = s - mbar * meter
+                if sec in ("I", "O"):
+                    if bar >= 2 or sec == "O":
+                        continue
+                    inst, vel, octs = lead2_i, 0.55, 0
+                elif sec == "C":
+                    inst, vel, octs = lead2_i, 0.6, 0
+                elif sec == "D":
+                    continue
+                else:
+                    inst, vel, octs = lead_i, 0.8, (12 if sec in ("X",) and spec.get("x_up", True) else 0)
+                m = lead_base + semi + octs
+                if sec in ("A2", "B2", "X") and phrase % 2 == 1 and spec.get("vary", True):
+                    m = lead_base + deg_shift(sc, semi, seq) + octs              # the restatement climbs
+                if last_bar and ss + ln >= meter - 1 and sec not in ("C",):
+                    m = _nearest_tone(m, tones)                                 # cadence onto a chord tone
+                L = ln if sec != "C" else ln * 2
+                add(b0 + ss, "lead", (inst, m, L), vel * loud * (1.06 if ss % groups[0] == 0 else 0.94))
+                if sec in ("A2", "B2", "X") and counter_i:
+                    add(b0 + ss, "counter", (counter_i, _below_tone(m, tones), max(ln, 4)), 0.42 * loud)
+        step0 += bars * meter
+    ev.sort(key=lambda e: e[0])
+    return Song(spec.key, ev, int(step0 * spb * AU_SR), secs, spb)
+
+
+def deg_shift(sc: tuple, semi: int, k: int) -> int:
+    """Move a melody note k scale steps (keeps it in the mode)."""
+    octv, rem = divmod(semi, 12)
+    L = len(sc)
+    best = min(range(L), key=lambda i: abs(sc[i] - rem))
+    return deg_semi(sc, best + 1 + k) + 12 * octv + (rem - sc[best])
+
+
+def _nearest_tone(m: int, tones: list) -> int:
+    cands = [t + 12 * o for t in tones[:3] for o in range(-2, 5)]
+    return min(cands, key=lambda c: (abs(c - m), c))
+
+
+def _below_tone(m: int, tones: list) -> int:
+    cands = [t + 12 * o for t in tones[:3] for o in range(-2, 5) if t + 12 * o <= m - 3]
+    return max(cands) if cands else m - 12
+
+# ===========================================================================
+# AUDIO ENGINE - part 3: the soundtrack. Every entry is its own piece: motif (A), answer (B), progression, mode, metre,
+# tempo, form and arrangement. Durations are 16th notes; degrees are scale steps (' = octave up, , = down, # b = altered).
+# ===========================================================================
+SONGS: dict = {}
+
+
+def _S(key, name, cat, bpm, root, scale, meter, style, prog, mel, form="I A B A2 C X O", desc="", **kw) -> None:
+    SONGS[key] = SongSpec(key, name, cat, bpm, root, scale, meter, style, prog, mel, form, desc, **kw)
+
+
+# ---------------------------------------------------------------- home screens / menus
+_S("main_theme", "TERMINAL TANKS (MAIN THEME)", "menu", 112, 50, "dor", "44", "synthwave",
+   {"A": "1m 7M 4M 1m", "B": "3M 4M 1m 5m"},
+   {"A": "1:4 5:4 4:2 5:2 6:4 | 5:6 4:2 3:4 2:4 | 1:4 5:4 4:2 5:2 1':4 | 7:6 6:2 5:8",
+    "B": "3:4 4:4 5:8 | 6:4 5:2 4:2 3:8 | 2:4 3:4 4:4 5:4 | 2:12 r:4"}, desc="The anthem of the artillery. It plays wherever you start.")
+_S("green_hills", "GREEN HILLS, LONG SHADOWS", "menu", 104, 50, "maj", "68", "jig",
+   {"A": "1 4 1 5", "B": "6m 4 1 5"},
+   {"A": "5:2 3:2 1:2 3:4 5:2 | 6:2 5:2 3:2 2:6 | 3:2 5:2 1':2 7:4 5:2 | 6:2 4:2 2:2 1:6",
+    "B": "3':4 2':2 1':4 6:2 | 5:4 3:2 5:6 | 4:2 6:2 1':2 7:2 6:2 5:2 | 3:6 2:6"}, desc="Flute and harp over open fields.")
+_S("embers_and_ale", "EMBERS AND ALE", "menu", 92, 43, "dor", "34", "waltz",
+   {"A": "1m 4M 1m 5m", "B": "7M 3M 4M 5m"},
+   {"A": "5:4 4:2 3:2 2:4 | 3:8 1:4 | 2:4 3:2 4:2 5:4 | 4:12",
+    "B": "1':6 7:2 6:4 | 5:8 3:4 | 4:4 5:2 6:2 4:4 | 5:12"}, lead="reed", lead2="guitar", desc="A tavern waltz for the hour after battle.")
+_S("mirage_road", "MIRAGE ROAD", "menu", 88, 45, "phd", "44", "desert",
+   {"A": "1 2M 1 7m", "B": "4m 2M 1 1"},
+   {"A": "1:2 2:2 3:4 2:2 1:2 7,:4 | 1:8 r:2 5:2 4:2 3:2 | 2:4 3:2 4:2 5:6 4:2 | 3:2 2:2 1:12",
+    "B": "5:4 6:4 5:2 4:2 3:4 | 4:8 3:4 2:4 | 3:2 2:2 1:4 2:4 7,:4 | 1:16"}, desc="Heat haze, distant drums, a road with no end.")
+_S("frost_lullaby", "FROST LULLABY", "menu", 84, 52, "lyd", "34", "lullaby",
+   {"A": "1 2 1 5", "B": "6m 2 4# 5"},
+   {"A": "3:4 5:4 4:4 | 3:6 2:2 1:4 | 2:4 3:4 5:4 | 6:12",
+    "B": "1':4 7:4 6:4 | 5:8 4:4 | 3:4 4:4 5:2 3:2 | 2:12"}, desc="A music box left out in the snow.")
+_S("neon_arcade", "NEON ARCADE", "menu", 118, 47, "min", "44", "synthwave",
+   {"A": "1m 6M 3M 7M", "B": "4m 6M 7M 7M"},
+   {"A": "1:2 3:2 5:2 1':4 7:2 5:4 | 6:4 5:2 3:2 5:8 | 1:2 3:2 5:2 1':4 3':2 2':4 | 7:8 5:8",
+    "B": "4:4 6:4 1':8 | 7:4 6:2 5:2 6:8 | 4:4 6:4 7:4 2':4 | 1':16"}, lead="hollow", desc="Rain on chrome. Every sign is still on.")
+_S("undertow_dub", "UNDERTOW DUB", "menu", 76, 41, "min", "44", "dub",
+   {"A": "1m 4m 1m 7M", "B": "6M 7M 1m 1m"},
+   {"A": "r:4 5:2 4:2 3:8 | r:4 3:2 4:2 5:4 7:4 | 1':8 7:4 5:4 | 4:8 r:8",
+    "B": "3:4 4:4 5:4 3:4 | 1:16 | 7,:4 1:4 2:4 4:4 | 3:16"}, desc="The sea floor keeps its own slow time.")
+_S("ash_kingdom", "ASH KINGDOM", "menu", 80, 40, "hmin", "34", "gothic",
+   {"A": "1m 6M 4m 5M", "B": "6M 2d 5M 1m"},
+   {"A": "1:4 2:4 3:4 | 5:8 4:4 | 3:4 2:4 7,:4 | 1:12",
+    "B": "6:6 5:2 4:4 | 3:8 2:4 | 7,:4 1:4 2:4 | 5,:12"}, form="I A B C A O", desc="Cinders falling over a throne nobody sits on.")
+_S("canopy", "UNDER THE CANOPY", "menu", 98, 50, "pent", "44", "eastern",
+   {"A": "1 3 4 1", "B": "2 4 3 1"},
+   {"A": "1:2 2:2 3:4 5:2 3:2 2:4 | 1:6 5,:2 1:8 | 3:2 4:2 5:4 1':2 5:2 4:4 | 3:16",
+    "B": "5:4 4:4 3:2 2:2 1:4 | 2:8 3:8 | 5:2 1':2 5:4 4:4 3:4 | 2:8 1:8"}, harm_i="marimba", lead="flute", desc="Marimba rain under green leaves.")
+_S("starlight_drift", "STARLIGHT DRIFT", "menu", 72, 45, "lyd", "54", "cosmic",
+   {"A": "1 2 6m 5", "B": "4# 2 1 1"},
+   {"A": "5:6 4:4 3:6 2:4 | 1:10 5,:4 1:6",
+    "B": "3:4 4:4 5:6 6:6 | 5:20"}, desc="Nothing but light-years, and you in the middle of them.")
+_S("ghost_waltz", "GHOST WALTZ", "menu", 96, 42, "hung", "34", "horror",
+   {"A": "1m 4# 1m 5M", "B": "6M 4# 5M 1m"},
+   {"A": "5:4 4:2 3:2 2:4 | 1:8 7,:4 | 1:4 3:4 5:4 | 4:12",
+    "B": "6:4 5:4 4:4 | 3:8 2:4 | 7,:4 1:4 2:4 | 1:12"}, lead="music_box", desc="The dancers left. The music did not.")
+_S("first_contact", "FIRST CONTACT", "menu", 90, 46, "lyd", "44", "ambient",
+   {"A": "1 2 1 2", "B": "6m 5 4# 2"},
+   {"A": "1':6 7:2 4:8 | 5:4 3:4 2:8 | 1':6 2':2 4':8 | 3':16",
+    "B": "6:4 5:4 4:4 3:4 | 2:16 | 4:4 5:4 6:4 1':4 | 7:16"}, lead="theremin", desc="Radar dishes turn toward something that answered.")
+_S("masters_throne", "THE MASTER'S THRONE", "menu", 70, 41, "min", "44", "fanfare",
+   {"A": "1m 6M 7M 1m", "B": "4m 5M 6M 5M"},
+   {"A": "1:8 5:4 6:4 | 5:8 4:4 3:4 | 1:4 3:4 5:4 1':4 | 7:16",
+    "B": "6:4 7:4 1':8 | 2':8 1':4 7:4 | 6:4 5:4 4:4 3:4 | 5:16"}, form="I A B A2 O", desc="The crown is yours. The room is very quiet.")
+_S("kernel_panic", "KERNEL PANIC", "menu", 152, 42, "phr", "78", "glitch",
+   {"A": "1m 2M 1m 7m", "B": "6M 2M 4m 5d"},
+   {"A": "1:1 1:1 2:2 1:2 5:2 4:2 3:4 | 1:2 2:2 3:2 5:2 7:2 1':4 | 7:1 5:1 3:2 1:2 2:2 3:2 2:4 | 1:14",
+    "B": "5:2 6:2 5:2 3:2 2:2 1:4 | 2:1 3:1 5:2 2:2 3:2 6:2 5:4 | 4:2 3:2 2:2 1:2 7,:2 6,:4 | 7,:14"},
+   form="I A A2 B D X C X O", desc="SECRET EDITION. A kernel, a fault, and a very fast fix.", groove_b="glitch")
+_S("protector", "PROTECTOR OF THE UNIVERSE", "menu", 66, 45, "lyd", "34", "hymn",
+   {"A": "1 2 6m 5", "B": "4# 2 3m 1"},
+   {"A": "5:8 6:4 | 5:4 4:4 3:4 | 2:8 3:4 | 1:12",
+    "B": "1':8 7:4 | 6:4 5:4 4:4 | 5:8 6:4 | 5:12"}, form="I A B A2 C X O", desc="ETERNAL EDITION. The hymn the stars kept for you.")
+_S("solaris_hymn", "SOLARIS", "menu", 84, 48, "mix", "44", "fanfare",
+   {"A": "1 7M 4 1", "B": "6m 7M 1 1"},
+   {"A": "1:4 3:4 5:8 | 6:4 5:4 7b:8 | 1':4 7b:2 6:2 5:4 3:4 | 4:16",
+    "B": "5:4 6:4 7b:4 1':4 | 2':8 1':8 | 6:4 4:4 7b:4 6:4 | 5:16"}, lead="horn", desc="The ancient sun rises one more time.")
+_S("chronos_clockwork", "CHRONOS", "menu", 108, 46, "wt", "44", "clock",
+   {"A": "1 2 3 1", "B": "4 5 4 1"},
+   {"A": "1:2 2:2 3:2 4:2 5:4 4:4 | 3:4 2:4 1:8 | 6:2 5:2 4:2 3:2 2:4 3:4 | 1:16",
+    "B": "1':4 6:4 5:4 4:4 | 3:8 4:8 | 5:2 4:2 3:2 2:2 1:4 6,:4 | 1:16"}, desc="Every gear in the universe, ticking in step.")
+_S("glass_desert", "GLASS DESERT", "menu", 96, 47, "phd", "54", "desert",
+   {"A": "1 2M 1 1", "B": "6M 7m 1 1"},
+   {"A": "5:2 4:2 3:2 2:4 1:4 2:6 | 3:4 4:2 3:2 2:2 1:10",
+    "B": "1':6 7:2 6:2 5:6 4:4 | 3:4 2:4 1:12"}, harm_i="harp", lead="flute", desc="Twin suns on dunes of fused glass.")
+_S("lantern_festival", "LANTERN FESTIVAL", "menu", 100, 48, "pent", "44", "eastern",
+   {"A": "1 4 3 1", "B": "2 3 4 1"},
+   {"A": "3:2 5:2 1':4 5:4 3:4 | 2:2 3:2 5:4 3:8 | 3:2 5:2 1':4 2':4 1':4 | 5:16",
+    "B": "1':4 2':2 1':2 5:8 | 3:4 5:4 2:8 | 3:4 2:4 1:4 5,:4 | 1:16"}, lead="erhu", desc="A thousand paper lanterns rising.")
+_S("worldtree", "WORLDTREE", "menu", 78, 43, "dor", "68", "folk",
+   {"A": "1m 4M 7M 1m", "B": "3M 4M 5m 1m"},
+   {"A": "1:6 3:4 4:2 | 5:6 4:6 | 3:2 4:2 5:2 7:4 6:2 | 5:12",
+    "B": "1':6 7:4 6:2 | 5:12 | 4:2 5:2 6:2 4:4 3:2 | 1:12"}, lead="flute", lead2="choir", desc="Starlight climbing through ancient roots.")
+_S("sky_whale", "SONG OF THE SKY WHALE", "menu", 64, 41, "maj", "34", "ambient",
+   {"A": "1 4 6m 5", "B": "4 5 3m 6m"},
+   {"A": "5:8 6:4 | 1':12 | 7:4 6:4 5:4 | 3:12",
+    "B": "4:8 5:4 | 6:12 | 5:4 4:4 3:4 | 2:12"}, lead="choir_o", lead2="theremin", desc="Something as big as a moon is singing.")
+_S("shatterline", "SHATTERLINE", "menu", 124, 49, "lyd", "44", "glitch",
+   {"A": "1 2 7m 1", "B": "6m 2 4# 5"},
+   {"A": "5:2 1':2 7:2 5:2 4:4 5:4 | 3:4 2:4 1:8 | 5:2 1':2 2':2 3':2 2':4 1':4 | 7:16",
+    "B": "4:4 5:4 6:4 7:4 | 1':16 | 6:2 5:2 4:2 3:2 2:4 3:4 | 5:16"}, lead="music_box", lead2="glasspad", desc="Floating plates of prismatic glass.")
+# ---------------------------------------------------------------- story / interface
+_S("whisper", "A VOICE", "story", 60, 45, "loc", "44", "horror",
+   {"A": "1d 2M 1d 7m"}, {"A": "5:8 4:8 | 3:8 2:8 | 1:16 | r:16"}, form="I A C O", desc="Someone has been watching you fight.")
+_S("time_machine", "THE ARCANE TIME MACHINE", "story", 63, 40, "wt", "34", "hymn",
+   {"A": "1 2 3 1", "B": "4 5 4 2"},
+   {"A": "1:4 2:4 3:4 | 5:8 4:4 | 3:4 2:4 1:4 | 2:12",
+    "B": "5:4 6:4 7:4 | 1':12 | 7:4 6:4 5:4 | 4:12"}, form="I A B C A O", lead2="celesta", desc="The machine that kept a man alive past time.")
+_S("the_blessing", "THE MARTYR'S BLESSING", "story", 72, 45, "maj", "34", "hymn",
+   {"A": "1 4 5 1", "B": "6m 4 2m 5"},
+   {"A": "3:4 5:4 1':4 | 7:8 5:4 | 6:4 5:4 4:4 | 3:12",
+    "B": "1':6 2':2 1':4 | 6:12 | 5:4 6:4 7:4 | 1':12"}, form="I A B A2 X O", desc="The last of his power, sealed and handed down to you.")
+_S("shop_jingle", "THE ARMORY", "menu", 112, 48, "mix", "44", "house",
+   {"A": "1 7M 4 1", "B": "4 5 7M 1"},
+   {"A": "1:2 3:2 5:2 3:2 7b:4 6:4 | 5:8 3:8 | 1:2 3:2 5:2 1':4 7b:2 6:4 | 5:16",
+    "B": "4:4 6:4 1':4 6:4 | 5:16 | 4:4 6:4 7b:4 2':4 | 1':16"}, form="I A B A2 O", desc="Browse. Buy. Blow things up.")
+_S("workshop", "THE WORKSHOP", "menu", 96, 45, "dor", "44", "funk",
+   {"A": "1m7 4M 1m7 4M", "B": "7M 6m 5m 4M"},
+   {"A": "1:2 r:2 3:2 4:2 5:4 r:4 | 7:2 5:2 4:2 3:2 1:8 | 1:2 r:2 3:2 4:2 5:4 7:4 | 1':8 r:8",
+    "B": "4:4 3:4 1:4 7,:4 | 1:16 | 5:4 4:4 3:4 2:4 | 1:16"}, form="I A B A2 O", desc="Spanners, sparks and a bass line.")
+_S("tutorial", "TRAINING GROUND", "battle", 104, 48, "maj", "44", "folk",
+   {"A": "1 5 6m 4", "B": "4 5 1 1"},
+   {"A": "1:4 3:4 5:4 3:4 | 4:4 6:4 5:8 | 3:4 5:4 1':4 6:4 | 5:16",
+    "B": "4:4 5:4 6:4 7:4 | 1':16 | 6:4 5:4 4:4 2:4 | 1:16"}, desc="Aim, power, wind. Again.")
+# ---------------------------------------------------------------- battlefields (map families)
+_S("steel_rain", "STEEL RAIN", "battle", 132, 40, "min", "44", "metal2",
+   {"A": "1m 6M 7M 1m", "B": "4m 6M 5m 7M"},
+   {"A": "1:2 1:2 5:4 4:2 3:2 2:4 | 1:4 3:4 5:8 | 6:2 5:2 4:4 3:2 2:2 1:4 | 7,:8 5,:8",
+    "B": "4:4 5:4 6:4 7:4 | 1':8 5:8 | 6:4 5:4 4:4 2:4 | 1:16"}, desc="Default battlefield theme: shells and guitars.")
+_S("iron_valley", "IRON VALLEY", "battle", 120, 43, "dor", "44", "march",
+   {"A": "1m 4M 1m 5m", "B": "7M 4M 7M 5m"},
+   {"A": "1:4 1:2 2:2 3:4 4:4 | 5:8 3:8 | 4:4 4:2 5:2 6:4 5:4 | 4:8 2:8",
+    "B": "7:4 6:4 5:8 | 4:4 3:4 2:8 | 3:4 4:4 5:4 6:4 | 5:16"}, desc="A valley full of tracks and drums.")
+_S("hedgerow_skirmish", "HEDGEROW SKIRMISH", "battle", 136, 50, "mix", "68", "jig",
+   {"A": "1 7M 1 5m", "B": "4 1 7M 1"},
+   {"A": "1:2 2:2 3:2 5:2 3:2 1:2 | 7b,:2 2:2 4:2 7b:2 4:2 2:2 | 1:2 3:2 5:2 1':2 7b:2 6:2 | 5:2 3:2 2:2 1:6",
+    "B": "4:2 6:2 1':2 6:2 4:2 6:2 | 5:2 3:2 1:2 3:4 5:2 | 7b:2 6:2 5:2 4:2 3:2 2:2 | 1:12"}, desc="Fiddle-fast fighting between farm walls.")
+_S("sandstorm_siege", "SANDSTORM SIEGE", "battle", 126, 45, "phd", "44", "desert",
+   {"A": "1 2M 1 7m", "B": "6M 7m 1 2M"},
+   {"A": "1:2 2:2 3:2 4:2 5:4 4:2 3:2 | 2:4 1:4 2:8 | 3:2 4:2 5:2 6:2 5:4 4:2 3:2 | 2:2 1:2 7,:4 1:8",
+    "B": "5:4 6:2 5:2 4:4 3:4 | 2:8 1:8 | 6:4 5:2 4:2 3:4 2:4 | 1:16"}, groove="desert", c_drums=True, desc="Dunes, darbukas and artillery.")
+_S("frostbite_front", "FROSTBITE FRONT", "battle", 112, 44, "min", "44", "epic",
+   {"A": "1m 6M 3M 7M", "B": "4m 5m 6M 7M"},
+   {"A": "5:4 5:2 6:2 5:4 4:4 | 3:8 2:8 | 1:4 1:2 2:2 3:4 5:4 | 4:16",
+    "B": "6:4 5:4 4:4 3:4 | 2:8 3:8 | 4:4 5:4 6:4 7:4 | 1':16"}, harm_i="celesta", desc="Ice fields, breath like smoke, guns like thunder.")
+_S("magma_pressure", "MAGMA PRESSURE", "battle", 148, 38, "phr", "44", "metal",
+   {"A": "1p 2p 1p 7p", "B": "6p 7p 1p 2p"},
+   {"A": "1:2 2:2 1:2 3:2 1:2 4:2 3:2 2:2 | 1:16 | 5:2 4:2 3:2 2:2 3:2 2:2 1:2 7,:2 | 1:16",
+    "B": "6:4 5:4 4:4 3:4 | 2:8 1:8 | 6:2 7:2 1':4 7:2 6:2 5:4 | 2:16"}, desc="The ground is melting under your treads.")
+_S("tidebreaker", "TIDEBREAKER", "battle", 172, 41, "dor", "44", "dnb",
+   {"A": "1m 4M 1m 3M", "B": "6d 7M 1m 1m"},
+   {"A": "5:6 4:2 3:4 1:4 | 2:8 r:8 | 5:6 6:2 7:4 1':4 | 6:16",
+    "B": "3':4 2':4 1':4 7:4 | 6:16 | 4:4 5:4 6:4 4:4 | 5:16"}, desc="Waves breaking on steel at 172 BPM.")
+_S("orbital_barrage", "ORBITAL BARRAGE", "battle", 128, 46, "lyd", "44", "synthwave",
+   {"A": "1 2 7m 5", "B": "4# 2 1 1"},
+   {"A": "1':4 7:2 5:2 4:4 5:4 | 3:4 2:4 1:8 | 1':4 2':2 3':2 4':4 3':4 | 2':16",
+    "B": "5:4 6:4 7:4 1':4 | 2':8 1':8 | 7:4 6:4 5:4 4:4 | 5:16"}, desc="Artillery above the atmosphere.")
+_S("scrapyard_riot", "SCRAPYARD RIOT", "battle", 118, 41, "min", "44", "industrial",
+   {"A": "1p 1p 6p 7p", "B": "4p 4p 6p 5p"},
+   {"A": "1:2 r:2 1:2 3:2 r:2 4:2 3:4 | r:16 | 1:2 r:2 1:2 3:2 5:2 4:2 3:2 1:2 | r:16",
+    "B": "6:4 5:4 4:4 3:4 | 1:16 | 6:4 7:4 1':4 7:4 | 5:16"}, desc="Rust, rivets and riot.")
+_S("eye_of_the_storm", "EYE OF THE STORM", "battle", 144, 43, "min", "78", "balkan",
+   {"A": "1m 7M 6M 5m", "B": "4m 7M 3M 5M"},
+   {"A": "1:2 2:2 3:2 4:2 5:6 | 4:2 3:2 2:2 1:2 7,:6 | 1:2 3:2 5:2 1':2 7:6 | 6:2 5:2 4:2 3:2 2:6",
+    "B": "5:4 6:4 7:6 | 1':4 7:4 6:6 | 5:2 4:2 3:2 2:2 1:6 | 7,:14"}, lead="saw", desc="Seven-eight thunder: lightning on the off-beat.")
+_S("jungle_drums", "JUNGLE DRUMS", "battle", 116, 45, "mpent", "44", "eastern",
+   {"A": "1 3 4 1", "B": "4 5 3 1"},
+   {"A": "1:2 1:2 3:2 4:2 5:4 4:4 | 3:4 1:4 2:8 | 1:2 3:2 4:2 5:2 1':4 5:4 | 4:8 3:8",
+    "B": "5:4 4:4 3:4 1:4 | 5,:16 | 1:4 3:4 4:4 5:4 | 1:16"}, harm_i="marimba", lead="reed", desc="Something is moving in the green.")
+_S("graveyard_shift", "GRAVEYARD SHIFT", "battle", 100, 40, "hung", "44", "gothic",
+   {"A": "1m 4# 5M 1m", "B": "6M 2d 5M 5M"},
+   {"A": "1:4 3:4 4:4 5:4 | 6:8 5:8 | 4:4 3:4 2:4 7,:4 | 1:16",
+    "B": "5:4 6:4 7:8 | 1':8 7:8 | 6:4 5:4 4:4 3:4 | 2:16"}, desc="Midnight, mausoleums and mortars.")
+_S("cartridge_war", "CARTRIDGE WAR", "battle", 150, 48, "maj", "44", "chip",
+   {"A": "1 6m 4 5", "B": "4 5 3m 6m"},
+   {"A": "5:2 5:2 6:2 5:2 3:4 1:4 | 2:2 3:2 4:2 5:2 3:8 | 5:2 5:2 6:2 5:2 1':4 7:4 | 6:4 5:4 4:8",
+    "B": "4:2 4:2 5:2 6:2 4:4 6:4 | 5:16 | 3:2 4:2 5:2 6:2 7:4 5:4 | 1':16"}, desc="Eight bits of pure artillery.")
+_S("lantern_terraces", "LANTERN TERRACES", "battle", 128, 48, "pent", "44", "eastern",
+   {"A": "1 4 3 1", "B": "4 3 2 1"},
+   {"A": "1':2 5:2 3:2 5:2 1':4 2':4 | 3':8 2':8 | 1':2 2':2 3':2 5':2 3':4 2':4 | 1':16",
+    "B": "5:4 3:4 2:4 1:4 | 2:8 3:8 | 5:4 1':4 5:4 3:4 | 2:16"}, groove="boom", kit="tribal", desc="Fighting up the temple steps.")
+_S("worldtree_roots", "WORLDTREE ROOTS", "battle", 120, 43, "dor", "68", "jig",
+   {"A": "1m 7M 4M 1m", "B": "3M 4M 5m 1m"},
+   {"A": "1:4 3:2 5:4 4:2 | 3:4 2:2 1:6 | 5:4 6:2 7:4 1':2 | 7:6 5:6",
+    "B": "1':6 7:2 6:2 5:2 | 4:6 3:6 | 2:2 3:2 4:2 5:2 6:2 7:2 | 1':12"}, lead="reed", desc="Roots older than any war.")
+_S("whalefall", "WHALEFALL", "battle", 92, 41, "min", "44", "cosmic",
+   {"A": "1m 6M 4m 5m", "B": "6M 7M 1m 1m"},
+   {"A": "5:8 6:4 5:4 | 3:8 2:8 | 1:8 3:4 5:4 | 4:16",
+    "B": "6:8 7:4 1':4 | 7:8 5:8 | 4:8 3:4 2:4 | 1:16"}, groove="half", kit="808", c_drums=True, desc="A battle among bleached bones.")
+_S("shatterline_battle", "PRISM BREAK", "battle", 140, 49, "lyd", "44", "glitch",
+   {"A": "1 2 7m 1", "B": "6m 2 4# 5"},
+   {"A": "1:1 3:1 5:2 1':2 5:2 4:4 3:4 | 2:2 3:2 5:2 2:2 1:8 | 1:1 3:1 5:2 1':2 2':2 3':4 2':4 | 1':16",
+    "B": "6:2 4:2 2:2 4:2 6:4 5:4 | 3:16 | 6:2 7:2 1':2 2':2 3':4 4':4 | 5':16"}, desc="Every shell refracts.")
+_S("glass_dunes_battle", "FUSED SAND", "battle", 132, 47, "phd", "44", "metal2",
+   {"A": "1p 2p 1p 7p", "B": "6p 7p 1p 2p"},
+   {"A": "1:2 2:2 3:4 2:2 1:2 7,:4 | 1:16 | 3:2 4:2 5:4 4:2 3:2 2:4 | 1:16",
+    "B": "5:4 6:4 5:4 4:4 | 3:8 2:8 | 1:4 2:4 3:4 2:4 | 1:16"}, lead="erhu", desc="Desert metal under twin suns.")
+# ---------------------------------------------------------------- tournament bosses (one theme each)
+_S("boss_stinger", "STINGER", "boss", 164, 47, "phr", "44", "chip",
+   {"A": "1m 2M 1m 2M", "B": "6M 7m 1m 1m"},
+   {"A": "1:1 2:1 1:1 2:1 1:4 5:2 4:2 3:2 2:2 | 1:1 2:1 1:1 2:1 1:4 7,:8 | 3:1 4:1 3:1 4:1 3:4 6:2 5:2 4:2 3:2 | 2:16",
+    "B": "6:2 5:2 4:2 3:2 2:4 1:4 | 2:16 | 6:2 7:2 1':2 2':2 1':4 7:4 | 1':16"}, desc="Level 1. A buzz you hear before you see it.")
+_S("boss_warden", "THE WARDEN", "boss", 108, 41, "min", "44", "march",
+   {"A": "1m 6M 7M 1m", "B": "4m 5M 1m 1m"},
+   {"A": "1:4 1:2 1:2 5:8 | 4:4 3:4 2:8 | 1:4 1:2 1:2 6:8 | 5:16",
+    "B": "4:4 5:4 6:8 | 5:4 4:4 3:8 | 2:4 3:4 4:4 7,:4 | 1:16"}, desc="Level 2. Locked gates and a heavy key.")
+_S("boss_specter", "SPECTER", "boss", 118, 44, "hmin", "34", "horror",
+   {"A": "1m 6M 4m 5M", "B": "2d 5M 1m 1m"},
+   {"A": "5:4 6:4 5:4 | 4:4 3:4 2:4 | 3:4 2:4 1:4 | 7,:12",
+    "B": "1':4 7:4 6:4 | 5:12 | 4:4 3:4 2:4 | 1:12"}, groove="waltz2", lead2="choir_o", desc="Level 3. You can only see it when it fires.")
+_S("boss_colossus", "COLOSSUS", "boss", 86, 36, "phr", "44", "metal",
+   {"A": "1p 1p 2p 1p", "B": "6p 6p 7p 1p"},
+   {"A": "1:8 2:4 1:4 | 7,:8 1:8 | 3:8 2:4 3:4 | 4:16",
+    "B": "6:8 5:4 4:4 | 3:16 | 2:8 1:4 2:4 | 1:16"}, groove="half", desc="Level 4. The ground shakes when it breathes.")
+_S("boss_sentinel", "SENTINEL", "boss", 128, 45, "dor", "44", "techno",
+   {"A": "1m 1m 7M 4M", "B": "6d 7M 1m 1m"},
+   {"A": "1:2 r:2 1:2 r:2 5:2 r:2 4:2 3:2 | 1:2 r:2 1:2 r:2 7,:4 1:4 | 3:2 r:2 3:2 r:2 6:2 r:2 5:2 4:2 | 3:16",
+    "B": "5:4 4:4 3:4 2:4 | 1:16 | 7:4 6:4 5:4 4:4 | 5:16"}, desc="Level 5. Precision. Glass. Zero error.")
+_S("boss_glacier", "GLACIER", "boss", 100, 44, "min", "34", "epic",
+   {"A": "1m 6M 7M 3M", "B": "4m 5m 6M 5M"},
+   {"A": "1:6 2:2 3:4 | 5:8 4:4 | 3:4 2:4 1:4 | 7,:12",
+    "B": "6:6 5:2 4:4 | 3:8 2:4 | 1:4 2:4 3:4 | 2:12"}, groove="waltz2", harm_i="celesta", lead2="choir", desc="Level 6. A moving wall of ice.")
+_S("boss_helios", "HELIOS", "boss", 132, 48, "lyd", "44", "synthwave",
+   {"A": "1 2 1 2", "B": "6m 5 4# 2"},
+   {"A": "1:4 3:4 5:4 4:4 | 5:8 2':8 | 1':4 7:4 5:4 3:4 | 2:16",
+    "B": "6:4 7:4 1':4 2':4 | 3':16 | 2':4 1':4 7:4 6:4 | 5:16"}, desc="Level 7. Staring into a nova.")
+_S("boss_rattler", "RATTLER", "boss", 138, 45, "phd", "44", "western",
+   {"A": "1 1 7m 1", "B": "4m 2M 1 1"},
+   {"A": "5:2 5:2 6:2 5:2 4:2 3:2 2:4 | 1:8 r:8 | 5:2 5:2 6:2 5:2 7b:4 6:4 | 5:16",
+    "B": "1':4 7b:4 6:4 5:4 | 4:8 3:8 | 2:4 3:2 2:2 1:4 7,:4 | 1:16"}, desc="Level 8. One shot. Make it count.")
+_S("boss_miasma", "MIASMA", "boss", 96, 40, "loc", "44", "industrial",
+   {"A": "1d 2M 1d 5M", "B": "6M 2M 5M 1d"},
+   {"A": "1:4 2:4 1:4 7,:4 | 1:8 r:8 | 3:4 4:4 3:4 2:4 | 5,:16",
+    "B": "5:8 4:4 3:4 | 2:16 | 3:4 2:4 1:4 7,:4 | 1:16"}, groove="half", lead="theremin", desc="Level 9. Don't breathe in.")
+_S("boss_bastion", "BASTION", "boss", 112, 43, "min", "44", "epic",
+   {"A": "1m 4m 6M 5M", "B": "6M 7M 1m 5M"},
+   {"A": "1:4 5:4 5:4 6:2 5:2 | 4:4 3:4 2:8 | 3:4 6:4 6:4 7:2 6:2 | 5:16",
+    "B": "1':4 7:4 6:4 5:4 | 4:4 5:4 6:8 | 5:4 4:4 3:4 2:4 | 1:16"}, desc="Level 10. Walls that answer fire with fire.")
+_S("boss_zephyr", "ZEPHYR", "boss", 160, 47, "dor", "78", "balkan",
+   {"A": "1m 4M 1m 7M", "B": "3M 4M 5m 1m"},
+   {"A": "5:2 6:2 5:2 4:2 3:6 | 4:2 5:2 4:2 3:2 2:6 | 3:2 4:2 5:2 7:2 1':6 | 7:2 6:2 5:2 4:2 5:6",
+    "B": "1':4 7:4 6:6 | 5:4 4:4 3:6 | 2:2 3:2 4:2 5:2 6:6 | 5:14"}, lead="flute", desc="Level 11. A gale in seven-eight.")
+_S("boss_geode", "GEODE", "boss", 120, 47, "lyd", "54", "glitch",
+   {"A": "1 2 6m 7m", "B": "4# 5 1 1"},
+   {"A": "1:2 5:2 1':2 2':2 3':4 2':2 1':2 5:4 | 4:4 5:4 3:6 2:6",
+    "B": "6:2 7:2 1':2 2':2 3':6 2':6 | 1':20"}, lead="celesta", desc="Level 12. Crystal faces, every one a mirror.")
+_S("boss_mirage", "MIRAGE", "boss", 92, 46, "phd", "44", "dub",
+   {"A": "1 2M 1 1", "B": "4m 2M 7m 1"},
+   {"A": "5:6 4:2 3:8 | r:16 | 3:6 2:2 1:8 | r:16",
+    "B": "1':6 7:2 6:8 | 5:16 | 4:6 3:2 2:8 | 1:16"}, desc="Level 13. Is that it, or its echo?")
+_S("boss_revenant", "REVENANT", "boss", 92, 40, "hmin", "34", "gothic",
+   {"A": "1m 4m 5M 1m", "B": "6M 4m 2d 5M"},
+   {"A": "1:4 3:4 5:4 | 1':8 7:4 | 6:4 5:4 4:4 | 3:12",
+    "B": "5:4 6:4 7:4 | 1':12 | 7:4 6:4 5:4 | 7,:12"}, desc="Level 14. One strike is all it needs.")
+_S("boss_corsair", "CORSAIR", "boss", 140, 45, "min", "68", "jig",
+   {"A": "1m 7M 1m 5m", "B": "6M 7M 1m 5M"},
+   {"A": "1:2 2:2 3:2 5:4 3:2 | 4:2 3:2 2:2 1:6 | 7,:2 1:2 2:2 4:4 2:2 | 3:2 2:2 7,:2 1:6",
+    "B": "5:4 6:2 7:4 5:2 | 1':6 7:6 | 6:2 5:2 4:2 3:2 2:2 3:2 | 1:12"}, lead="reed", groove="jig2", desc="Level 15. Cannons, rum and a long sea shanty.")
+_S("boss_tyrant", "TYRANT", "boss", 156, 38, "min", "44", "metal",
+   {"A": "1p 6p 4p 5p", "B": "6p 7p 1p 1p"},
+   {"A": "1:2 1:2 1:2 2:2 3:4 1:4 | 4:2 3:2 2:2 1:2 7,:8 | 1:2 1:2 1:2 2:2 3:4 5:4 | 6:4 5:4 4:8",
+    "B": "1':4 7:4 6:4 5:4 | 6:8 7:8 | 1':2 2':2 1':4 7:4 6:4 | 5:16"}, desc="Level 16. Wrath with a crown on.")
+_S("boss_archon", "ARCHON", "boss", 104, 46, "mix", "44", "epic",
+   {"A": "1 7M 4 1", "B": "6m 7M 1 1"},
+   {"A": "1:8 5:8 | 7b:4 6:4 5:8 | 1':8 7b:4 6:4 | 5:16",
+    "B": "4:4 5:4 6:4 7b:4 | 1':16 | 2':8 1':4 7b:4 | 1':16"}, lead="choir", lead2="brass", desc="Level 17. The zenith answers in a choir.")
+_S("boss_obsidian", "OBSIDIAN", "boss", 124, 38, "loc", "44", "industrial",
+   {"A": "1p 2p 1p 5p", "B": "6p 2p 5p 1p"},
+   {"A": "1:2 1:2 2:2 1:2 5:4 4:4 | 3:2 2:2 1:4 2:8 | 1:2 1:2 2:2 1:2 6:4 5:4 | 4:16",
+    "B": "5:4 6:4 5:4 3:4 | 2:16 | 1:4 2:4 3:4 5:4 | 1:16"}, groove="indus", lead2="choir", desc="Level 18. The forge, and the thing it made.")
+_S("boss_tempest", "TEMPEST", "boss", 174, 42, "min", "44", "dnb",
+   {"A": "1m 6M 3M 7M", "B": "4m 6M 5m 5m"},
+   {"A": "5:4 6:2 7:2 1':4 7:4 | 6:4 5:4 3:8 | 5:4 6:2 7:2 2':4 1':4 | 7:16",
+    "B": "3':4 2':4 1':4 7:4 | 6:16 | 5:4 4:4 3:4 2:4 | 1:16"}, lead="supersaw", desc="Level 19. The spire calls the lightning.")
+_S("boss_master", "THE MASTER", "boss", 116, 40, "hmin", "44", "metal2",
+   {"A": "1m 6M 4m 5M", "B": "6M 7d 1m 5M"},
+   {"A": "1:4 5:4 1':8 | 7:4 6:2 5:2 4:4 3:4 | 2:4 5:4 2':8 | 1':4 7:2 6:2 5:8",
+    "B": "6:4 7:4 1':4 2':4 | 3':8 2':4 1':4 | 7:4 6:4 5:4 4:4 | 5:4 7,:4 1:8"},
+   form="I A B A2 C D X X O", lead2="choir", counter="brass", desc="Level 20. Everything you learned, aimed back at you.")
+# ---------------------------------------------------------------- missions
+_S("saucer_attack", "SAUCER ATTACK", "boss", 130, 46, "wt", "44", "techno",
+   {"A": "1 2 3 2", "B": "4 5 4 1"},
+   {"A": "1':2 r:2 5:2 r:2 3:2 4:2 5:4 | 6:4 5:4 r:8 | 1':2 r:2 6:2 r:2 4:2 5:2 6:4 | 2':16",
+    "B": "3:4 4:4 5:4 6:4 | 1':16 | 6:4 5:4 4:4 3:4 | 2:16"}, lead="theremin", desc="They hop. They shield. They fire in threes.")
+_S("mothership", "THE MOTHERSHIP", "boss", 98, 38, "loc", "44", "epic",
+   {"A": "1d 2M 1d 7m", "B": "6M 7m 2M 1d"},
+   {"A": "1:8 2:4 1:4 | 5:8 4:8 | 1:8 2:4 3:4 | 2:16",
+    "B": "6:4 5:4 4:4 3:4 | 2:8 1:8 | 7,:8 1:4 2:4 | 1:16"}, lead="choir", lead2="theremin", counter="brass", groove="boom2",
+   form="I A B A2 C D X X O", desc="The flagship. Its shadow covers the whole map.")
+_S("boss_rush", "BOSS RUSH", "boss", 176, 45, "min", "44", "hyper",
+   {"A": "1m 6M 3M 7M", "B": "4m 5m 6M 7M"},
+   {"A": "1:2 3:2 5:2 1':2 7:2 5:2 3:2 5:2 | 6:4 5:4 3:8 | 1:2 3:2 5:2 1':2 2':4 3':4 | 2':16",
+    "B": "4:2 6:2 1':2 6:2 4:2 6:2 1':4 | 7:16 | 5:2 7:2 2':2 7:2 5:2 7:2 2':4 | 1':16"}, form="I A A2 B D X X O",
+   desc="Every boss. One round each. No healing.")
+_S("squad_up", "SQUAD UP", "battle", 122, 45, "dor", "44", "funk",
+   {"A": "1m7 4M 1m7 4M", "B": "7M 1m 4M 5m"},
+   {"A": "1:2 3:2 4:2 5:2 r:4 4:2 3:2 | 1:4 r:4 7,:4 1:4 | 1:2 3:2 4:2 5:2 r:4 7:2 6:2 | 5:16",
+    "B": "4:4 3:4 1:8 | 7,:4 1:4 3:4 4:4 | 5:4 4:4 3:4 1:4 | 1:16"}, desc="Co-op and 2 vs 1: back to back.")
+# ---------------------------------------------------------------- terminal tickets (the ten Ancient Hoarders)
+_S("t_volt", "VOLT SOVEREIGN", "boss", 136, 47, "dor", "44", "techno",
+   {"A": "1m 7M 4M 5m", "B": "3M 4M 1m 1m"},
+   {"A": "1:1 1:1 5:2 1:1 1:1 6:2 5:2 4:2 3:4 | 2:2 3:2 5:4 3:8 | 1:1 1:1 5:2 1:1 1:1 7:2 6:2 5:2 4:4 | 5:16",
+    "B": "3':4 2':4 1':4 7:4 | 1':16 | 6:4 5:4 4:4 3:4 | 1:16"}, lead="saw", desc="Ticket boss. A skyline that is one big capacitor.")
+_S("t_magistrate", "IRON MAGISTRATE", "boss", 118, 43, "hmin", "44", "clock",
+   {"A": "1m 4m 5M 1m", "B": "6M 2d 5M 1m"},
+   {"A": "1:2 3:2 5:2 3:2 1':4 7:4 | 6:2 5:2 4:2 3:2 2:4 1:4 | 7,:2 2:2 4:2 2:2 7:4 6:4 | 5:16",
+    "B": "1':4 1':2 7:2 6:4 5:4 | 4:4 3:4 2:8 | 3:2 4:2 5:2 6:2 7:4 2':4 | 1':16"}, desc="Ticket boss. ORDER. ORDER IN THE CLOCKWORK COURT.")
+_S("t_regent", "GLACIER REGENT", "boss", 88, 44, "min", "34", "gothic",
+   {"A": "1m 6M 3M 7M", "B": "4m 5m 1m 1m"},
+   {"A": "5:8 4:4 | 3:4 2:4 1:4 | 2:8 3:4 | 5,:12",
+    "B": "1':8 7:4 | 6:4 5:4 4:4 | 5:8 2:4 | 1:12"}, harm_i="celesta", lead="choir", desc="Ticket boss. A cathedral carved from one frozen breath.")
+_S("t_solar", "SOLAR ARCHON", "boss", 120, 48, "lyd", "44", "fanfare",
+   {"A": "1 2 1 5", "B": "6m 2 4# 5"},
+   {"A": "1:4 5:4 1':8 | 7:4 4:4 5:8 | 3:4 5:4 2':8 | 1':16",
+    "B": "6:4 7:4 1':4 2':4 | 3':8 2':8 | 1':4 7:4 6:4 4:4 | 5:16"}, desc="Ticket boss. The temple at the centre of the sun.")
+_S("t_abyssal", "ABYSS LEVIATHAN", "boss", 84, 36, "phr", "44", "dub",
+   {"A": "1m 2M 1m 7m", "B": "6M 7m 1m 2M"},
+   {"A": "1:8 r:4 2:4 | 1:16 | 5,:8 r:4 7,:4 | 1:16",
+    "B": "5:8 4:8 | 3:8 2:8 | 1:8 2:4 3:4 | 2:16"}, lead="choir_o", groove="half", desc="Ticket boss. The city sank. Something stayed.")
+_S("t_pharaoh", "SAND PHARAOH", "boss", 112, 45, "phd", "44", "desert",
+   {"A": "1 2M 1 7m", "B": "4m 3M 2M 1"},
+   {"A": "1:2 2:2 3:4 4:2 3:2 2:4 | 1:4 2:2 3:2 4:8 | 5:2 6:2 5:2 4:2 3:4 2:4 | 1:16",
+    "B": "1':4 7:4 6:4 5:4 | 4:2 5:2 4:2 3:2 2:8 | 3:2 2:2 1:4 7,:4 2:4 | 1:16"}, lead="reed", c_drums=True, desc="Ticket boss. A king who never stopped counting.")
+_S("t_baron", "TOXIC BARON", "boss", 130, 41, "loc", "44", "techno",
+   {"A": "1d 1d 2M 1d", "B": "5M 6M 2M 1d"},
+   {"A": "1:2 1:2 2:2 1:2 r:4 5,:4 | 1:2 1:2 2:2 3:2 2:8 | 1:2 1:2 2:2 1:2 r:4 7,:4 | 1:16",
+    "B": "5:4 4:4 3:4 2:4 | 1:16 | 6:4 5:4 4:4 3:4 | 2:16"}, lead="acid", desc="Ticket boss. Bubbling, glowing, profitable.")
+_S("t_shadow", "SHADOW EMPEROR", "boss", 104, 40, "hung", "44", "metal2",
+   {"A": "1m 4# 5M 1m", "B": "6M 4# 2d 5M"},
+   {"A": "1:4 2:4 3:4 4:4 | 5:8 4:8 | 3:4 2:4 1:4 7,:4 | 1:16",
+    "B": "6:4 5:4 4:4 3:4 | 2:8 3:8 | 4:4 5:4 6:4 7:4 | 1':16"}, lead="organ", lead2="choir", desc="Ticket boss. The keep has no windows.")
+_S("t_overseer", "COSMIC OVERSEER", "boss", 110, 46, "wt", "54", "cosmic",
+   {"A": "1 2 3 4", "B": "5 4 2 1"},
+   {"A": "1':4 6:2 5:4 4:2 3:4 2:4 | 1:6 2:4 3:6 4:4",
+    "B": "5:6 6:4 5:6 4:4 | 3:20"}, groove="five", kit="glitch", desc="Ticket boss. The eye on the throne never blinks.")
+_S("t_warlord", "DRAGON WARLORD", "boss", 126, 44, "insen", "44", "eastern",
+   {"A": "1 2 1 4", "B": "5 4 2 1"},
+   {"A": "1:2 2:2 4:4 5:4 4:2 2:2 | 1:4 5,:4 1:8 | 4:2 5:2 1':4 2':4 1':2 5:2 | 4:16",
+    "B": "1':4 5:4 4:4 2:4 | 1:16 | 2:4 4:4 5:4 1':4 | 1':16"}, lead="erhu", groove="boom", desc="Ticket boss. Fire on the pagoda peak.")
+# ---------------------------------------------------------------- the Martyr (each phase and the conversations)
+_S("martyr_ember", "THE MARTYR I: EMBER SANCTUM", "boss", 120, 40, "hmin", "44", "epic",
+   {"A": "1m 6M 4m 5M", "B": "6M 3M 4m 5M"},
+   {"A": "1:4 3:4 5:4 1':4 | 7:8 5:8 | 6:4 5:4 4:4 3:4 | 2:8 7,:8",
+    "B": "3':6 2':2 1':8 | 7:4 6:4 5:8 | 4:4 5:4 6:4 7:4 | 1':16"},
+   form="I A B A2 C D X X O", lead2="choir", counter="brass", groove="boom2", desc="Phase I. Fire and stone.")
+_S("martyr_tempest", "THE MARTYR II: TEMPEST SPIRES", "boss", 168, 42, "dor", "78", "balkan",
+   {"A": "1m 7M 4M 1m", "B": "3M 4M 5m 7M"},
+   {"A": "5:2 4:2 3:2 2:2 1:6 | 7,:2 1:2 2:2 3:2 5:6 | 4:2 5:2 6:2 7:2 1':6 | 7:2 6:2 5:2 4:2 5:6",
+    "B": "1':4 2':4 3':6 | 2':4 1':4 7:6 | 6:2 7:2 1':2 2':2 3':6 | 2':14"},
+   form="I A B A2 C D X X O", lead="supersaw", lead2="choir", counter="strings", desc="Phase II. Wind and water.")
+_S("martyr_astral", "THE MARTYR III: ASTRAL RIFT", "boss", 140, 45, "lyd", "44", "metal2",
+   {"A": "1 2 7m 5", "B": "6m 2 4# 5"},
+   {"A": "1':4 7:2 5:2 4:4 5:4 | 1':4 2':4 3':8 | 2':4 1':2 7:2 6:4 5:4 | 4:8 5:8",
+    "B": "3':4 4':4 5':8 | 4':4 3':4 2':8 | 1':4 2':4 3':4 4':4 | 5':16"},
+   form="I A B A2 C D X X O", lead2="choir", counter="choir_o", desc="Phase III. Beyond ordinary time.")
+
+# ---------------------------------------------------------------- premium II: ten home screens and ten battlefields
+_S("h_biolume", "BIOLUME TRENCH", "menu", 72, 45, "lyd", "44", "ambient",
+   {"A": "1 2 1 2", "B": "6 3 2 5"},
+   {"A": "3:4 5:4 7:6 6:2 | 5:8 2':8 | 1':4 7:4 6:4 7:4 | 5:16",
+    "B": "6:6 5:2 3:8 | 2:4 3:4 2:8 | 3:4 5:4 6:4 1':4 | 7:12 r:4",
+    "C": "1':8 2':8 | 3':16 | 2':8 7:8 | 5:16"},
+   form="I A B C A2 O", lead="vibes", lead2="celesta", counter="glasspad", pad="glasspad", bass_i="sub",
+   desc="Jellyfish lanterns drifting up through the dark.")
+_S("h_spiritshrine", "SPIRIT SHRINE", "menu", 104, 47, "insen", "44", "eastern",
+   {"A": "1m 2M 3m 1m", "B": "5M 3m 2M 1m"},
+   {"A": "1:2 2:2 3:4 4:4 5:4 | 4:6 3:2 2:8 | 3:2 4:2 5:4 1':4 5:4 | 4:4 3:4 1:8",
+    "B": "1':6 2':2 1':4 5:4 | 4:8 3:4 4:4 | 5:4 4:4 2:4 3:4 | 1:12 r:4"},
+   lead="koto", lead2="flute", counter="erhu", pad="warmpad", harm_i="koto", desc="Torii gates, moonlight and drifting foxfire.")
+_S("h_holocity", "HOLO CITY NIGHTS", "menu", 124, 42, "min", "44", "techno",
+   {"A": "1m 6M 3M 7M", "B": "4m 6M 7M 7M"},
+   {"A": "1:2 1:2 3:2 5:4 4:2 3:4 | 5:2 5:2 6:2 7:4 6:2 5:4 | 3':4 2':2 1':2 7:4 5:4 | 1':12 r:4",
+    "B": "4:4 6:4 1':4 4':4 | 3':6 2':2 1':8 | 7:4 1':4 2':4 5:4 | 7:16"},
+   lead="supersaw", lead2="square", counter="glasspad", desc="Rain, neon and a hundred holograms.")
+_S("h_tesseract", "THE TESSERACT", "menu", 92, 44, "lyd", "54", "cosmic",
+   {"A": "1 2 7 1", "B": "6 5 2 2"},
+   {"A": "1:6 5:4 2':6 1':4 | 7:6 5:4 3:6 2:4 | 3:6 6:4 2':6 3':4 | 2':20",
+    "B": "6:6 5:4 3:6 5:4 | 2':10 1':10 | 7:6 1':4 2':6 5:4 | 3:20"},
+   lead="theremin", lead2="glasspad", counter="celesta", pad="glasspad", desc="Five beats to the bar, four dimensions to the cube.")
+_S("h_kaijubay", "KAIJU BAY", "menu", 100, 40, "hmin", "44", "industrial",
+   {"A": "1 6 7 1", "B": "4 1 6 5"},
+   {"A": "1:8 r:2 1:2 2:2 3:2 | 5:8 4:4 3:4 | 6:6 5:2 4:4 3:4 | 2:4 7,:4 1:8",
+    "B": "3:4 4:4 5:4 6:4 | 1':12 7:4 | 6:4 5:4 4:4 3:4 | 2:8 5,:8"},
+   lead="brass", lead2="choir", counter="horn", pad="choir", desc="Searchlights, sirens and something enormous wading in.")
+_S("h_shroomgrove", "GLOWSHROOM GROVE", "menu", 76, 43, "dor", "44", "dub",
+   {"A": "1m 4M 1m 4M", "B": "7M 4M 3M 5m"},
+   {"A": "5:2 r:2 5:2 3:2 4:4 5:4 | 6:2 r:2 6:2 4:2 5:8 | 5:2 r:2 5:2 3:2 4:2 5:2 6:2 1':2 | 7:4 6:4 5:8",
+    "B": "1':4 7:2 6:2 5:4 4:4 | 3:8 4:8 | 5:4 6:2 7:2 1':4 2':4 | 1':16"},
+   lead="marimba", lead2="vibes", counter="flute", pad="warmpad", swing=0.12, desc="Spores rising like slow snow in reverse.")
+_S("h_wormsea", "THE DEEP DESERT", "menu", 96, 45, "phd", "44", "desert",
+   {"A": "1 2 1 2", "B": "4m 2M 6M 1M"},
+   {"A": "1:2 2:2 3:4 2:2 1:2 7,:4 | 1:12 r:4 | 3:2 4:2 5:4 6:2 5:2 4:4 | 3:4 2:4 1:8",
+    "B": "5:4 6:4 5:2 4:2 3:4 | 4:8 2:8 | 3:4 4:2 5:2 6:4 1':4 | 7:4 6:4 5:8"},
+   lead="erhu", lead2="sitar", counter="reed", pad="warmpad", desc="Three moons, and the sand breathing underneath.")
+_S("h_jadetemple", "JADE TEMPLE", "menu", 112, 48, "mix", "44", "eastern",
+   {"A": "1 7 4 1", "B": "6m 7 1 5m"},
+   {"A": "1:4 3:2 5:2 6:4 5:4 | 4:2 3:2 2:4 1:8 | 1:4 3:2 5:2 7:4 6:2 5:2 | 6:4 7:4 1':8",
+    "B": "3':4 2':4 1':2 7:2 6:4 | 5:8 3:8 | 4:4 5:4 6:2 5:2 4:4 | 5:16"},
+   lead="flute", lead2="marimba", counter="reed", harm_i="marimba", desc="A feathered serpent turning round the pyramid.")
+_S("h_orrery", "THE ORRERY", "menu", 108, 50, "maj", "44", "clock",
+   {"A": "1 6 2 5", "B": "4 5 3 6"},
+   {"A": "1:2 3:2 5:2 1':2 7:2 5:2 3:2 5:2 | 6:2 1':2 3':2 1':2 6:4 r:4 | 2:2 4:2 6:2 2':2 1':2 7:2 6:2 4:2 | 5:8 7,:4 r:4",
+    "B": "4':4 3':4 2':4 1':4 | 7:4 1':4 2':8 | 3':4 2':2 1':2 7:4 6:4 | 5:12 r:4"},
+   lead="harpsi", lead2="celesta", counter="music_box", pad="strings", desc="Brass rings turning the stars like clockwork.")
+_S("h_ghostarmada", "GHOST ARMADA", "menu", 96, 43, "dor", "68", "jig",
+   {"A": "1 7 1 5", "B": "3 7 4 1"},
+   {"A": "1:2 1:2 1:2 3:4 5:2 | 4:4 2:2 7,:4 5,:2 | 1:2 1:2 1:2 3:4 5:2 | 4:4 2:2 1:6",
+    "B": "5:4 6:2 7:4 1':2 | 7:4 5:2 4:6 | 3:2 4:2 5:2 6:4 4:2 | 5:12"},
+   lead="reed", lead2="choir_o", counter="erhu", pad="choir", desc="A shanty for a crew that is no longer alive.")
+_S("m_mariana", "MARIANA DEEP", "battle", 172, 43, "min", "44", "dnb",
+   {"A": "1 6 7 1", "B": "4 6 3 7"},
+   {"A": "5:6 4:2 3:4 1:4 | 2:6 3:2 4:8 | 5:4 6:4 7:4 1':4 | 7:8 5:8",
+    "B": "1':6 7:2 6:4 5:4 | 4:8 3:4 4:4 | 5:6 6:2 7:8 | 1':16"},
+   lead="hollow", lead2="vibes", counter="glasspad", desc="Battlefield theme. Pressure, dark and drifting light.")
+_S("m_torii", "TORII PATH", "battle", 128, 45, "hmin", "44", "eastern",
+   {"A": "1 6 4 5", "B": "6 b7M 1 5"},
+   {"A": "1:4 2:2 3:2 5:4 3:4 | 2:2 3:2 2:2 1:2 7,:8 | 1:4 3:2 4:2 5:4 6:4 | 5:12 r:4",
+    "B": "1':4 7:4 6:2 5:2 6:4 | 5:6 4:2 3:8 | 4:4 5:2 6:2 7:4 6:4 | 5:16"},
+   lead="erhu", lead2="koto", counter="flute", desc="Battlefield theme. Taiko on the temple stair.")
+_S("m_gridlock", "NEON GRIDLOCK", "battle", 140, 41, "min", "44", "trap",
+   {"A": "1 6 3 7", "B": "6 7 1 1"},
+   {"A": "1':2 r:2 1':2 7:2 5:4 3:4 | 4:2 r:2 4:2 3:2 1:8 | 1':2 r:2 1':2 2':2 3':4 2':4 | 7:16",
+    "B": "5:2 5:2 6:4 7:4 1':4 | 6:8 5:8 | 3:2 3:2 4:4 5:4 7:4 | 1':16"},
+   lead="bell", lead2="supersaw", counter="choir_o", desc="Battlefield theme. Rooftops, rain and 808s.")
+_S("m_paradox", "PARADOX ENGINE", "battle", 140, 44, "dor", "78", "glitch",
+   {"A": "1 7 6 7", "B": "4 5 1 1"},
+   {"A": "1:2 3:2 5:4 2':6 | 1':4 7:4 5:6 | 3:2 5:2 7:4 2':6 | 1':14",
+    "B": "6:4 5:4 4:2 3:4 | 2:4 4:4 7,:6 | 1:2 2:2 3:4 5:6 | 4:6 3:8"},
+   lead="square", lead2="hollow", counter="theremin", desc="Battlefield theme. Seven beats, folded in on themselves.")
+_S("m_kaiju", "KAIJU BAY: LANDFALL", "battle", 136, 40, "hmin", "44", "metal2",
+   {"A": "1 6 4 5", "B": "1 3 6 5"},
+   {"A": "1:2 1:2 1:2 5:2 4:4 3:4 | 2:2 2:2 2:2 6:2 5:4 4:4 | 3:4 5:4 1':4 7:4 | 1':8 5:8",
+    "B": "3':4 2':4 1':4 7:4 | 6:4 5:4 4:8 | 3:4 4:2 5:2 6:4 7:4 | 1':16"},
+   lead="supersaw", lead2="brass", counter="choir", desc="Battlefield theme. It has come ashore.")
+_S("m_mycelia", "MYCELIA", "battle", 104, 45, "dor", "44", "funk",
+   {"A": "1m7 4M7 1m7 5m7", "B": "3M7 4M7 2m7 5m7"},
+   {"A": "1:2 r:2 3:2 4:2 5:2 r:2 3:4 | 4:2 5:2 7:2 5:2 4:4 3:4 | 1:2 r:2 3:2 4:2 5:2 7:2 1':4 | 7:4 5:4 r:8",
+    "B": "5:4 7:4 1':2 2':2 3':4 | 2':6 1':2 7:8 | 6:4 1':4 2':4 4':4 | 3':12 r:4"},
+   lead="ep", lead2="marimba", counter="flute", swing=0.18, desc="Battlefield theme. The forest floor has a groove.")
+_S("m_wormsmaw", "WORM'S MAW", "battle", 126, 44, "phd", "54", "desert",
+   {"A": "1 2 1 7", "B": "4m 2M 6M 1M"},
+   {"A": "1:4 2:2 3:4 4:2 5:4 4:4 | 3:6 2:4 1:6 2:4 | 3:4 4:2 5:4 6:2 5:4 4:4 | 3:4 2:4 1:12",
+    "B": "5:6 6:4 5:6 4:4 | 3:10 2:10 | 1:4 2:2 3:4 4:2 5:8 | 1':20"},
+   lead="reed", lead2="erhu", counter="brass", desc="Battlefield theme. Five beats on the edge of the pit.")
+_S("m_serpent", "SERPENT STAIRS", "battle", 120, 46, "dor", "44", "epic",
+   {"A": "1 7 4 1", "B": "3 7 4 5"},
+   {"A": "1:4 5:4 4:2 3:2 4:4 | 5:6 6:2 5:8 | 1':4 7:2 6:2 5:4 4:4 | 3:4 2:4 1:8",
+    "B": "3:4 4:4 5:8 | 6:4 7:4 1':8 | 2':4 1':2 7:2 6:4 5:4 | 5:16"},
+   lead="brass", lead2="flute", counter="horn", harm_i="marimba", desc="Battlefield theme. Drums from the temple steps.")
+_S("m_astrolabe", "ASTROLABE", "battle", 132, 47, "lyd", "44", "techno",
+   {"A": "1 2 5 1", "B": "6 3 2 5"},
+   {"A": "1:2 5:2 2':2 3':2 5:4 3':4 | 2':2 6:2 1':2 2':2 6:4 2':4 | 3':2 5':2 4':2 3':2 2':4 7:4 | 1':16",
+    "B": "6:4 3':4 2':4 6:4 | 5:4 2':4 1':8 | 7:4 1':2 2':2 3':4 5':4 | 2':16"},
+   lead="celesta", lead2="supersaw", counter="glasspad", desc="Battlefield theme. Clockwork in four on the floor.")
+_S("m_ghostreef", "GHOST REEF", "battle", 100, 43, "hmin", "34", "gothic",
+   {"A": "1 4 5 1", "B": "6 4 5 5"},
+   {"A": "1:4 3:4 5:4 | 6:6 5:2 4:4 | 3:4 2:4 7,:4 | 1:12",
+    "B": "5:4 1':4 7:4 | 6:6 5:2 3:4 | 4:4 6:4 5:4 | 5:12"},
+   lead="organ", lead2="choir", counter="erhu", desc="Battlefield theme. A waltz for drowned sailors.")
+
+# ===========================================================================
+# AUDIO ENGINE - part 4: the note bank (pre-rendered notes per song, cached on disk)
+# ===========================================================================
+_AU_INST = None
+AU_A16 = 18000
+
+
+def au_instruments() -> dict:
+    global _AU_INST
+    if _AU_INST is None:
+        _AU_INST = _au_inst_table()
+    return _AU_INST
+
+
+class NoteBank:
+    """Pre-rendered notes for one song; the sequencer fires them on the beat grid."""
+
+    def __init__(self, spb: float, echo: float = 0.0) -> None:
+        self.spb, self.echo, self.notes = spb, echo, {}
+
+    def make(self, key) -> array:
+        if key[0] == "drum":
+            buf, sc = au_drum(key[1]), 1.0
+        else:
+            name, m, steps = key
+            base = name.split("+")[0]
+            fn, sc = au_instruments().get(base, au_instruments()["pad"])
+            buf = fn(mtof(m), max(0.05, steps * self.spb), 1.0)
+            if name.endswith("+e") and self.echo:
+                buf = au_echo(buf, self.echo * 4 * self.spb, ((1, .34), (2, .16), (3, .07)), lp=0.5)
+        buf = au_tail(buf)
+        return array("h", [int(max(-1.0, min(1.0, v * sc)) * AU_A16) for v in buf])
+
+    def prepare(self, keys) -> bool:
+        grew = False
+        for k in keys:
+            if k not in self.notes:
+                self.notes[k] = self.make(k)
+                grew = True
+        return grew
+
+    def dump(self) -> bytes:
+        return zlib.compress(pickle.dumps({k: v.tobytes() for k, v in self.notes.items()}), 3)
+
+    def load(self, blob: bytes) -> None:
+        for k, b in pickle.loads(zlib.decompress(blob)).items():
+            a = array("h")
+            a.frombytes(b)
+            self.notes[k] = a
+
+
+_au_songs: dict = {}
+
+
+def song_of(sid: str) -> "Song":
+    s = _au_songs.get(sid)
+    if s is None:
+        spec = SONGS[sid]
+        s = _au_songs[sid] = compose(spec)
+        if spec.get("echo"):                                        # lead gets the style's echo baked in
+            s.events = [(t, st, ((k[0] + "+e",) + k[1:]) if st == "lead" else k, v, p) for t, st, k, v, p in s.events]
+            s.keys = {e[2] for e in s.events}
+    return s
+
+
+def bank_for(sid: str) -> "NoteBank":
+    spec = SONGS[sid]
+    song = song_of(sid)
+    bank = NoteBank(song.spb, spec.get("echo", 0.0) or 0.0)
+    bank.prepare(sorted(song.keys, key=repr))
+    return bank
+
+# ===========================================================================
+# AUDIO ENGINE - part 5: sound effects. Named effects for the interface, battles, story and the Blessing, plus a unique
+# FIRE and IMPACT sound for every ammo, built from its launch family (proj) and blast family (boom) and varied by a seed
+# derived from the ammo's own key (pitch, colour, decay, extra layers) - so no two ammo sound alike.
+# ===========================================================================
+def _sfx_named() -> dict:
+    T, N, M, P, B = au_tone, au_noise, au_mix, au_peak, au_bell
+    R = {}
+    C5, E5, G5, C6, E6, G6 = 523.25, 659.25, 783.99, 1046.5, 1318.5, 1568.0
+    shimmer = lambda d, amp=0.4: N(d, 1.0, 0.25, 6.0 / max(d, 0.1), 0.01, amp, seed=3)
+    swell = lambda fs, d, amp=.5, lpa=.18: M([(T(f, d, "saw", amp, 1.2, .18, det=.006, lp=lpa), 0, 1) for f in fs])
+    # ---- interface
+    R["ui_move"] = lambda: P(M([(T(1500, .045, "sine", 1, 60), 0, 1), (T(3000, .03, "sine", 1, 90), 0, .3)]), .34)
+    R["ui_tab"] = lambda: P(M([(N(.02, 1, .3, 100), 0, .5), (T(980, .035, "sine", 1, 60), 0, 1)]), .36)
+    R["ui_select"] = lambda: P(M([(T(740, .07, "square", 1, 20, duty=.4, lp=.5), 0, 1), (T(1110, .11, "square", 1, 16, duty=.4, lp=.5), .055, 1)]), .46)
+    R["ui_back"] = lambda: P(M([(T(620, .06, "square", 1, 22, lp=.5), 0, 1), (T(410, .1, "square", 1, 18, lp=.5), .05, 1)]), .42)
+    R["ui_error"] = lambda: P(M([(au_drive(T(120, .12, "saw", 1, 8), 3), 0, 1), (au_drive(T(120, .14, "saw", 1, 8), 3), .15, 1)]), .5)
+    R["ui_toggle"] = lambda: P(M([(T(1320, .04, "square", 1, 50, lp=.5), 0, 1), (T(1760, .05, "square", 1, 40, lp=.5), .035, .8)]), .4)
+    R["ui_buy"] = lambda: P(M([(B(f, .55, 1, 7), i * .07, 1) for i, f in enumerate((1047, 1319, 1568, 2093, 2637))] + [(shimmer(.45), .25, .5)]), .66)
+    R["ui_equip"] = lambda: P(M([(N(.08, .25, 0, 40), 0, 1.0), (T(300, .16, "saw", 1, 14, f1=900, lp=.3), .03, .6), (T(1800, .05, "sine", 1, 60), .16, .5)]), .56)
+    R["ui_unlock"] = lambda: P(M([(swell([C5, E5, G5, C6], 1.1, .5), 0, 1)] + [(B(f, 1.0, 1, 4), .08 * i, .6) for i, f in enumerate((C6, E6, G6, 2093))]
+                                 + [(shimmer(.7), .3, .4)]), .72)
+    R["ui_open"] = lambda: P(N(.3, .03, 0.02, 4, .04, lp1=.6), .4)
+    R["ui_type"] = lambda: P(T(2300, .014, "square", 1, 120, lp=.6), .26)
+    R["ui_page"] = lambda: P(M([(N(.09, .5, .2, 25, .01, seed=8), 0, 1), (T(700, .06, "sine", 1, 40, f1=1100), 0, .4)]), .38)
+    R["ui_start"] = lambda: P(M([(N(.6, .02, .0, 2.5, .2, lp1=.7), 0, .7), (T(110, .7, "saw", 1, 2.4, .02, f1=440, lp=.2), 0, .6),
+                                 (B(880, .8, 1, 4), .5, .5), (B(1320, .8, 1, 4), .58, .4)]), .7)
+    R["coin"] = lambda: P(M([(B(1976, .25, 1, 10), 0, 1), (B(2637, .3, 1, 9), .06, .8)]), .48)
+    R["achieve"] = lambda: P(M([(B(f, .9, 1, 5), .09 * i, 1) for i, f in enumerate((G5, 1174.7, 1568, 2349))] + [(shimmer(.6), .2, .4)]), .7)
+    R["rps_shake"] = lambda: P(M([(N(.06, .3, .05, 40, seed=12), 0, 1), (T(180, .07, "sine", 1, 30, f1=120), 0, .7)]), .5)
+    R["rps_reveal"] = lambda: P(M([(N(.12, .6, .1, 20, seed=13), 0, .8), (T(440, .2, "square", 1, 12, lp=.5), .01, .5), (B(880, .4, 1, 7), .02, .6)]), .6)
+    # ---- battle
+    R["aim_tick"] = lambda: P(M([(T(2600, .012, "square", 1, 160, lp=.5), 0, 1), (N(.01, 1, .5, 200, seed=14), 0, .4)]), .16)
+    R["power_tick"] = lambda: P(T(900, .02, "tri", 1, 100), .16)
+    R["turn_you"] = lambda: P(M([(B(988, .35, 1, 8), 0, 1), (B(1319, .4, 1, 7), .08, 1)]), .44)
+    R["turn_cpu"] = lambda: P(M([(T(392, .12, "square", 1, 18, lp=.35), 0, 1), (T(330, .14, "square", 1, 16, lp=.35), .1, 1)]), .32)
+    R["tank_hit"] = lambda: P(M([(T(f, .5, "sine", 1, 7), 0, g) for f, g in ((180, 1.0), (437, .5), (811, .3), (1290, .2))]
+                                + [(N(.25, .5, .05, 14, seed=15), 0, .9), (T(70, .3, "sine", 1, 10, f1=40), 0, 1.2)]), .85)
+    R["shield_block"] = lambda: P(M([(B(1568, .55, 1, 6), 0, 1), (T(700, .4, "sine", 1, 6), 0, .5), (T(2800, .2, "saw", 1, 14, f1=300, lp=.5), 0, .5)]), .66)
+    R["tank_destroy"] = lambda: P(M([(T(75, 1.6, "sine", 1, 2.6, f1=26), 0, 1.6), (N(1.4, .45, 0, 2.8, .001, lp1=.02), 0, 1.3),
+                                     (N(.06, 1, .15, 40), 0, 1.0), (N(.9, .2, .02, 3.5, .02, seed=16), .25, .8),
+                                     (M([(N(.03, 1, .3, 90, seed=40 + k), 0, 1) for k in range(1)]), .45, .5),
+                                     (M([(T(1200 + 300 * k, .08, "sine", 1, 40), 0, 1) for k in range(1)]), .6, .3)]), .95)
+    R["debris"] = lambda: P(M([(N(.03, .8, .2, 80, seed=50 + k), .05 * k + .02 * k * k, .6 - .05 * k) for k in range(8)]), .5)
+    R["settle"] = lambda: P(M([(N(.9, .06, 0, 3, .1, seed=17, lp1=.02), 0, 1), (T(55, .8, "sine", 1, 3), 0, .5)]), .45)
+    R["mound"] = lambda: P(M([(N(.5, .08, 0, 5, .05, seed=18), 0, 1), (T(140, .3, "sine", 1, 8, f1=220), 0, .5)]), .5)
+    R["wind_gust"] = lambda: P(N(1.6, .02, .005, 0.0, .6, .6, seed=19, lp1=.09), .4)
+    R["special_charge"] = lambda: P(M([(T(220, .9, "saw", 1, 1.2, .1, f1=880, lp=.25), 0, 1), (shimmer(.6), .3, .5)]), .55)
+    R["special_fire"] = lambda: P(M([(T(60, .8, "sine", 1, 3.5, f1=30), 0, 1.4), (N(.7, .35, 0, 3.0, .01), 0, 1.0),
+                                     (T(880, .6, "saw", 1, 3, f1=110, lp=.4), 0, .5)]), .9)
+    R["ufo_hop"] = lambda: P(M([(T(300, .35, "sine", 1, 4, f1=1800, vib=.05), 0, 1), (T(1800, .3, "sine", 1, 5, f1=300), .2, .6)]), .55)
+    R["ufo_volley"] = lambda: P(M([(T(1400, .18, "square", 1, 12, f1=400, lp=.5), k * .14, .8) for k in range(3)]), .6)
+    R["round_win"] = lambda: P(M([(B(f, .7, 1, 5), .1 * i, 1) for i, f in enumerate((C5, E5, G5, C6))]), .66)
+    R["round_lose"] = lambda: P(M([(T(f, .45, "saw", 1, 3.5, .02, lp=.12), .18 * i, 1) for i, f in enumerate((392, 349, 311))]), .55)
+    R["match_win"] = lambda: P(M([(swell([C5, E5, G5, C6], 2.2, .6, .25), 0, 1)] + [(B(f, 1.6, 1, 3.5), .13 * i, .8) for i, f in enumerate((C6, E6, G6, 2093, 2637))]
+                                 + [(T(65, 1.2, "sine", 1, 2), 0, 1.0), (au_drum("crash"), 0, .5)]), .85)
+    R["match_lose"] = lambda: P(M([(T(f, .6, "saw", 1, 3.0, .02, lp=.12), .25 * i, 1) for i, f in enumerate((330, 294, 262, 247))]
+                                  + [(T(55, 1.6, "sine", 1, 1.6), 0, .8), (au_drum("gong"), .9, .4)]), .7)
+    R["payout"] = lambda: P(M([(B(f, .3, 1, 9), .055 * i, 1) for i, f in enumerate((1976, 2349, 2637, 3136, 2637, 3520))]), .55)
+    R["banner"] = lambda: P(M([(N(.35, .05, .01, 6, .05, lp1=.5), 0, .8), (T(220, .3, "saw", 1, 6, f1=660, lp=.3), 0, .5)]), .5)
+    # ---- story
+    R["whisper"] = lambda: P(au_space(M([(au_wave(f, 2.4, 1, au_table(_formant_weights(f, ((450, 120, 1.0), (850, 140, .5), (2700, 260, .15)))),
+                                                   env=(0.6, 0.0, 1.0, 0.9), voices=(0.99, 1.01), vib=(0.01, 3.5, 0.0)), 0, .5) for f in (196, 293.7, 392)]
+                                         + [(N(2.4, .3, .1, 0.6, .6, .3, seed=21), 0, .6)]), 0.8, 0.4), .5)
+    R["cine_hit"] = lambda: P(M([(au_drum("boom"), 0, 1), (au_drum("gong"), 0, .4)]), .8)
+    R["time_machine"] = lambda: P(au_space(M([(au_tone(f, 3.0, "sine", 1, .8, .4, vib=.004), 0, .5) for f in (110, 165, 220, 277, 330)]
+                                              + [(au_drum("clave"), .25 * k, .5) for k in range(10)] + [(au_drum("riser"), 1.2, .7), (au_drum("gong"), 3.0, .9)]), 1.0, .35), .85)
+    # ---- Martyr's Blessing
+    R["bless_tick"] = lambda: P(M([(au_drum("clave"), 0, 1), (B(2093, .3, 1, 9), 0, .4)]), .45)
+    R["bless_choir"] = lambda: P(au_space(M([(au_wave(f, 3.0, 1, au_table(_formant_weights(f, ((700, 130, 1.0), (1220, 140, .55), (2600, 220, .25)))),
+                                                      env=(0.8, 0.0, 1.0, 0.6), voices=(0.994, 1.0, 1.006), vib=(0.005, 5.0, 0.3)), 0, .4)
+                                             for f in (261.6, 329.6, 392.0, 523.3, 659.3)]), 1.0, .4), .75)
+    R["bless_star"] = lambda: P(M([(T(1800, .35, "sine", 1, 8, f1=600), 0, 1), (B(2637, .4, 1, 7), .02, .5)]), .45)
+    R["bless_pillar"] = lambda: P(M([(T(2400, .3, "saw", 1, 10, f1=200, lp=.5), 0, .6), (T(80, .9, "sine", 1, 4, f1=35), .12, 1.4),
+                                     (N(.6, .4, .02, 5, .005), .12, 1.0), (B(1568, .9, 1, 4), .12, .5)]), .9)
+    R["bless_nuke"] = lambda: P(M([(N(4.0, .9, 0, 1.0, .001, 1.0, seed=31, lp1=.01), 0, 1.4), (T(48, 4.0, "sine", 1, .7, .01, f1=24), 0, 1.8),
+                                   (T(90, 3.0, "saw", 1, 1.0, .02, f1=30, lp=.08), 0, .8), (N(.08, 1, .2, 30), 0, 1.0)]), .98)
+    R["bless_firewall"] = lambda: P(N(3.0, .25, .01, 0.6, .4, .9, seed=32, lp1=.04), .7)
+    R["bless_grant"] = lambda: P(au_space(M([(swell([261.6, 329.6, 392, 523.3, 659.3], 3.0, .55, .22), 0, 1)]
+                                             + [(B(f, 1.6, 1, 3), .12 * i + .3, .7) for i, f in enumerate((1047, 1319, 1568, 2093, 2637, 3136))]
+                                             + [(au_drum("gong"), 0, .6), (shimmer(1.6), .4, .5)]), 1.0, .4), .85)
+    return R
+
+
+SFX_RECIPES = _sfx_named()
+
+
+def _ammo_rng(key: str, salt: int) -> random.Random:
+    return random.Random(zlib.crc32(key.encode()) * 31 + salt)
+
+
+def sfx_fire(key: str, proj: str) -> list:
+    """The launch sound of one ammo: its family's character, varied by the ammo's own seed."""
+    r = _ammo_rng(key, 1)
+    T, N, M = au_tone, au_noise, au_mix
+    k = r.uniform(0.78, 1.32)
+    base = [(N(.08, .5, .05, 30, .001, seed=r.randrange(999)), 0, .9), (T(95 * k, .2, "sine", 1, 14, f1=45 * k), 0, 1.1)]   # the cannon thump
+    fam = {
+        "shell": [(N(.04, 1, .2, 60), 0, .6)],
+        "streak": [(N(.18, .9, .3, 18, lp1=.3), 0, .7), (T(3000 * k, .15, "sine", 1, 14, f1=900), 0, .4)],
+        "comet": [(N(.4, .4, .1, 6, .02, lp1=.9), 0, .7), (T(2400 * k, .3, "sine", 1, 8, f1=4000), .05, .3)],
+        "flame": [(N(.5, .25, .02, 4, .02, seed=5), 0, 1.0), (T(140 * k, .45, "saw", 1, 5, lp=.15), 0, .5)],
+        "ring": [(T(1200 * k, .35, "sine", 1, 9), 0, .6), (T(1800 * k, .3, "sine", 1, 11), .02, .4)],
+        "sun": [(T(220 * k, .4, "saw", 1, 6, f1=660 * k, lp=.3), 0, .6), (N(.25, .5, .1, 10), 0, .5)],
+        "drip": [(T(500 * k, .18, "sine", 1, 12, f1=1300 * k), 0, .8), (T(300 * k, .14, "sine", 1, 18, f1=900 * k), .08, .5)],
+        "star": [(au_bell(1760 * k, .4, 1, 8), 0, .6), (au_bell(2640 * k, .3, 1, 10), .05, .4)],
+        "lava": [(N(.45, .12, .01, 4, .03, seed=6), 0, 1.0), (T(70 * k, .4, "sine", 1, 5, vib=.06), 0, .7)],
+        "orb": [(T(700 * k, .4, "sine", 1, 6, vib=.04), 0, .7), (T(1050 * k, .35, "sine", 1, 7, vib=.05), 0, .4)],
+        "shard": [(au_bell(2200 * k, .3, 1, 12), 0, .7), (N(.1, 1, .5, 40), 0, .4)],
+        "spark": [(au_crush(N(.15, 1, .3, 25), 5, 2), 0, .7), (T(2800 * k, .1, "square", 1, 30, lp=.5), 0, .3)],
+        "bolt": [(au_drive(N(.2, 1, .2, 16), 3), 0, .7), (T(4000 * k, .2, "saw", 1, 16, f1=300, lp=.6), 0, .4)],
+        "prism": [(au_bell(f * k, .5, 1, 6), .03 * i, .4) for i, f in enumerate((1047, 1319, 1568))],
+        "helix": [(T(600 * k, .4, "sine", 1, 6, f1=2400 * k, vib=.08), 0, .7)],
+        "glyph": [(au_crush(T(f * k, .04, "square", 1, 40), 3, 3), .035 * i, .6) for i, f in enumerate((1200, 1800, 900, 2400))],
+        "relic": [(T(f * k, .7, "sine", 1, 3), 0, g) for f, g in ((220, 1.0), (330, .5), (523, .3))],
+        "eye": [(T(440 * k, .6, "sine", 1, 3, vib=.03), 0, .5), (T(466 * k, .6, "sine", 1, 3, vib=.03), 0, .5)],
+        "void": [(T(400 * k, .5, "sine", 1, 4, f1=60), 0, .8), (N(.4, .1, .01, 4, .1, lp1=.01), 0, .5)],
+        "phase": [(T(1500 * k, .25, "sine", 1, 9, f1=200, vib=.03), 0, .7), (T(200 * k, .25, "sine", 1, 9, f1=1500), .1, .5)],
+        "xenon": [(au_wave(f * k, .5, 1, au_table(_formant_weights(f, ((450, 120, 1.), (800, 120, .6), (2800, 240, .12)))), env=(.05, .1, .7, .1),
+                           voices=(.99, 1.01)), 0, .4) for f in (330, 495)] + [(T(1800 * k, .3, "sine", 1, 9, f1=400), 0, .4)],
+        "blessing": [(au_bell(f, 1.0, 1, 4), .05 * i, .5) for i, f in enumerate((1047, 1319, 1568, 2093))] + [(au_drum("clave"), 0, .5)],
+        "runes": [(T(f * k, .3, "tri", 1, 8), .05 * i, .5) for i, f in enumerate((660, 990, 880))],
+        "sigil": [(au_bell(523 * k, .7, 1, 4), 0, .6), (T(130 * k, .6, "saw", 1, 4, lp=.15), 0, .5)],
+        "sandglass": [(N(.6, .9, .4, 3, .1, seed=7), 0, .4), (au_drum("clave"), 0, .5), (au_drum("clave"), .15, .4)],
+        "lure": [(T(880 * k, .5, "sine", 1, 5, f1=1320 * k, vib=.05), 0, .5), (au_bell(1760 * k, .5, 1, 6), .05, .35), (N(.3, .2, .05, 8, lp1=.05), 0, .4)],
+        "foxfire": [(N(.5, .3, .05, 4, .04, seed=21, lp1=.6), 0, .8), (T(1400 * k, .4, "tri", 1, 6, f1=2100 * k, vib=.06), .02, .35),
+                    (au_bell(2349 * k, .4, 1, 7), .08, .25)],
+        "lance": [(au_drive(T(3200 * k, .35, "saw", 1, 10, f1=1600 * k, lp=.7), 2.0), 0, .55), (T(6400 * k, .25, "sine", 1, 14), 0, .3),
+                  (N(.06, 1, .6, 50), 0, .5)],
+        "paradox": [(T(700 * k, .35, "sine", 1, 7, f1=1400 * k), 0, .5), (list(reversed(T(700 * k, .35, "sine", 1, 7, f1=1400 * k))), .05, .45)],
+        "atomic": [(T(55 * k, .7, "saw", 1, 3, f1=110 * k, lp=.1), 0, .8), (au_drive(N(.5, .6, .2, 5, .05, seed=22), 2.5), 0, .6),
+                   (T(2600 * k, .4, "saw", 1, 7, f1=600, lp=.4), .05, .3)],
+        "spore": [(T(300 * k, .12, "sine", 1, 20, f1=700 * k), 0, .7), (N(.35, .4, .1, 8, .02, seed=23, lp1=.3), .03, .5)],
+        "worm": [(N(.6, .25, .02, 3.5, .04, seed=24, lp1=.4), 0, .9), (T(65 * k, .6, "saw", 1, 4, vib=.15, lp=.08), 0, .6)],
+        "serpent": [(N(.5, .9, .7, 5, .05, seed=25), 0, .5), (T(900 * k, .4, "tri", 1, 6, f1=450 * k, vib=.12), 0, .4)],
+        "astro": [(au_bell(f * k, .6, 1, 6), .04 * i, .35) for i, f in enumerate((1568, 1976, 2349, 3136))],
+        "cannonball": [(N(.1, 1, .1, 30, seed=26), 0, 1.0), (T(60 * k, .5, "sine", 1, 6, f1=34), 0, 1.2), (N(.5, .3, .02, 5, .03, seed=27, lp1=.5), .03, .5)],
+    }.get(proj, [])
+    extra = []
+    if r.random() < 0.35:                                         # some ammo carry an extra signature layer
+        extra.append((au_bell(r.choice((880, 1175, 1568, 2093)) * k, .3, 1, 9), .03, .25))
+    return au_peak(au_mix(base + fam + extra), r.uniform(0.62, 0.78))
+
+
+def sfx_impact(key: str, boom: str, big: float = 1.0) -> list:
+    """The blast of one ammo: its family's explosion, varied by the ammo's own seed."""
+    r = _ammo_rng(key, 2)
+    T, N, M = au_tone, au_noise, au_mix
+    k = r.uniform(0.75, 1.3)
+    d = r.uniform(0.8, 1.25)
+    core = [(T(70 * k, .9 * d, "sine", 1, 4.5 / d, f1=30 * k), 0, 1.4), (N(.8 * d, .45, 0, 4.5 / d, .001, seed=r.randrange(999), lp1=.03), 0, 1.0),
+            (N(.05, 1, .15, 40, seed=r.randrange(999)), 0, .9)]
+    fam = {
+        "classic": [],
+        "nova": [(au_bell(1568 * k, .8, 1, 4), .02, .4), (N(.6, 1, .4, 6), .02, .3)],
+        "implode": [(T(60 * k, .5, "sine", 1, 1.0, f1=400 * k, curve=2), 0, .7), (N(.4, .1, .05, 1, .35, lp1=.8), 0, .5)],
+        "magma": [(N(1.0, .15, .01, 2.5, .05, seed=9), .05, .9), (T(45 * k, 1.0, "sine", 1, 2.5, vib=.08), 0, .8)],
+        "cluster": [(M([(N(.05, .8, .1, 45, seed=60 + j), 0, 1), (T((300 + 90 * j) * k, .08, "sine", 1, 30, f1=90), 0, 1)]), .09 + .11 * j, .7) for j in range(4)],
+        "starrays": [(au_bell(f * k, .6, 1, 6), .04 * i, .3) for i, f in enumerate((1319, 1760, 2349, 2637))],
+        "fire": [(N(.9, .3, .02, 3.2, .03, seed=10), 0, 1.0), (T(120 * k, .7, "saw", 1, 3.5, lp=.12), 0, .5)],
+        "shock": [(au_drive(T(2400 * k, .5, "saw", 1, 5, f1=70, lp=.5), 2.5), 0, .6), (au_crush(N(.3, 1, .3, 10), 4, 3), 0, .5)],
+        "shatter": [(N(.5, 1, .55, 7, seed=11), 0, .8)] + [(au_bell(f * k, .35, 1, 12), .02 * i, .35) for i, f in enumerate((2637, 3136, 3951, 4699))],
+        "thunder": [(N(2.2, .1, .0, 1.6, .002, seed=12, lp1=.02), 0, 1.3), (au_crush(N(.15, 1, .2, 25), 5, 2), 0, .6)],
+        "ring": [(T(f * k, 1.0, "sine", 1, 3), 0, g) for f, g in ((880, .5), (1320, .3), (2200, .2))],
+        "cloud": [(N(1.2, .5, .2, 2.4, .05, seed=13), 0, .8)],
+        "rays": [(T(3000 * k, .4, "saw", 1, 8, f1=600, lp=.5), 0, .5), (T(2000 * k, .4, "saw", 1, 8, f1=400, lp=.5), .05, .4)],
+        "prism": [(au_bell(f * k, .9, 1, 4), .03 * i, .35) for i, f in enumerate((1047, 1319, 1568, 2093))],
+        "embers": [(M([(N(.02, 1, .4, 120, seed=70 + j), 0, 1)]), .05 + .07 * j * r.uniform(.6, 1.4), .45) for j in range(9)],
+        "bloom": [(T(200 * k, .9, "sine", 1, 3, f1=900 * k), 0, .5), (au_bell(1760 * k, .8, 1, 5), .1, .4)],
+        "sigil": [(au_bell(f * k, 1.2, 1, 3), 0, .4) for f in (523, 659, 784)] + [(au_drum("gong"), 0, .3)],
+        "eclipse": [(T(55 * k, 1.6, "sine", 1, 2), 0, 1.0), (au_wave(130 * k, 1.4, 1, au_table(_formant_weights(130, ((450, 110, 1.), (800, 120, .6))))
+                                                                        , env=(.2, 0, 1, .6)), 0, .4)],
+        "tidal": [(N(1.2, .35, .05, 2.6, .02, seed=14, lp1=.08), 0, 1.1), (T(160 * k, .5, "sine", 1, 5, f1=90, vib=.1), 0, .5)],
+        "alien": [(T(900 * k, .6, "sine", 1, 4, f1=300, vib=.06), 0, .6)],
+        "xenon": [(T(f * k, 1.0, "sine", 1, 3, vib=.02), .02 * i, .35) for i, f in enumerate((660, 990, 1320, 1980))] + [(N(.6, 1, .4, 6), 0, .3)],
+        "code": [(au_crush(N(.6, 1, .1, 5, seed=15), 3, 6), 0, .7)] + [(T(f, .05, "square", 1, 30), .06 * i, .4) for i, f in enumerate((880, 1320, 660, 1760, 990))],
+        "blessing": [(SFX_RECIPES["bless_pillar"](), 0, .7)],
+        "cinderstorm": [(N(1.6, .3, .02, 1.8, .05, seed=16), 0, 1.0)] + [(N(.02, 1, .4, 120, seed=80 + j), .2 + .1 * j, .4) for j in range(8)],
+        "rewind": [(list(reversed(au_mix([(N(.6, .4, .05, 6), 0, 1), (au_bell(880 * k, .6, 1, 6), 0, .5)]))), 0, .8)],
+        "biolume": [(T(f * k, 1.4, "sine", 1, 2.5, vib=.03), .03 * i, .3) for i, f in enumerate((392, 587, 784, 1175))] + [(N(1.0, .2, .05, 2.5, .05, lp1=.04), 0, .5)],
+        "foxfire": [(N(1.0, .35, .05, 3, .03, seed=28, lp1=.5), 0, .9)] + [(au_bell(f * k, .5, 1, 6), .05 * i, .25) for i, f in enumerate((1175, 1397, 1760))],
+        "hardlight": [(au_drive(T(4000 * k, .6, "saw", 1, 6, f1=200, lp=.6), 2.0), 0, .6), (T(110 * k, .5, "square", 1, 6, lp=.2), 0, .5)],
+        "paradox": [(list(reversed(au_mix([(N(.7, .5, .1, 5), 0, 1), (T(300 * k, .6, "sine", 1, 4), 0, .6)]))), 0, .7), (au_bell(1319 * k, .7, 1, 4), .3, .3)],
+        "atomic": [(T(40 * k, 2.0, "sine", 1, 1.6, f1=24), 0, 1.4), (N(2.0, .12, .0, 1.5, .01, seed=29, lp1=.02), 0, 1.2),
+                   (au_drive(N(.4, 1, .2, 6, seed=30), 3), 0, .5)],
+        "spore": [(M([(T((500 + 120 * j) * k, .08, "sine", 1, 30, f1=200), 0, 1)]), .9 + .08 * j, .5) for j in range(6)]
+                 + [(N(.8, .4, .2, 4, .1, seed=31, lp1=.2), 0, .5)],
+        "eruption": [(N(1.6, .2, .01, 2.2, .06, seed=32, lp1=.05), 0, 1.3), (T(38 * k, 1.4, "sine", 1, 2.2, vib=.1), 0, 1.0),
+                     (N(.8, .9, .7, 3, .1, seed=33), .1, .4)],
+        "jade": [(au_bell(f * k, .9, 1, 4), .04 * i, .35) for i, f in enumerate((659, 784, 988))] + [(au_drum("anvil"), 0, .4)],
+        "zodiac": [(au_bell(f * k, 1.0, 1, 4), .07 * i, .3) for i, f in enumerate((1047, 1319, 1568, 1976, 2637))],
+        "ghostfire": [(N(1.0, .3, .05, 3, .03, seed=34, lp1=.4), 0, .9),
+                      (au_wave(110 * k, .9, 1, au_table(_formant_weights(110, ((300, 100, 1.), (870, 120, .5)))), env=(.05, .2, .6, .4)), .05, .4)],
+    }.get(boom, [])
+    if r.random() < 0.3:
+        fam = fam + [(au_drum(r.choice(("tom", "tom.hi", "anvil", "rim"))), .05, .25)]
+    return au_peak(au_mix(core + fam), min(0.98, r.uniform(0.75, 0.9) * big))
+
+
+def sfx_build(name: str) -> list:
+    """name -> buffer. 'fire:<ammo>' and 'hit:<ammo>' are generated on demand from the ammo catalogue."""
+    if name.startswith("fire:"):
+        a = AMMO_BY_KEY.get(name[5:])
+        return sfx_fire(name[5:], a.proj if a else "shell")
+    if name.startswith("hit:"):
+        a = AMMO_BY_KEY.get(name[4:])
+        return sfx_impact(name[4:], a.boom if a else "classic")
+    fn = SFX_RECIPES.get(name)
+    return fn() if fn else [0.0]
+
+
+SFX_DUCK = {"tank_destroy", "match_win", "match_lose", "bless_nuke", "bless_grant", "time_machine", "special_fire", "cine_hit"}
+
+# ===========================================================================
+# AUDIO ENGINE - part 6: the real-time mixer, the OS output sinks, the helper-process server, and the game-side clients
+# (desktop: a helper process so audio can never stall rendering; browser: Web Audio; tests/headless: silent).
+# ===========================================================================
+AU_CHUNK = 512
+AUDIO_VER = "tt1"
+AU_MUSIC_K = 1.0 / 32768
+AU_PUMP = [math.exp(-j / (0.05 * AU_SR)) for j in range(int(0.22 * AU_SR))]
+AU_XFADE = 2.5
+SPEC_BANDS = [55 * 2 ** (k * 0.52) for k in range(16)]          # 55 Hz .. ~10 kHz, log spaced (the jukebox analyser)
+
+
+def audio_dir() -> Path:
+    base = os.environ.get("TT_AUDIO_DIR")
+    if base:
+        return Path(base)
+    try:
+        return default_save_path().parent / "audio" / AUDIO_VER
+    except Exception:
+        return Path.home() / ".terminaltanks_audio" / AUDIO_VER
+
+
+AU_CACHE_BANKS, AU_CACHE_BYTES = 48, 240 * 1024 * 1024     # the note-bank cache keeps the most recently played songs only
+
+
+def _prune_bank_cache(keep: Path) -> None:
+    """Old versions of a song and the least recently played banks are deleted so the cache never grows without bound."""
+    try:
+        files = sorted(keep.parent.glob("bank_*.z"), key=lambda p: p.stat().st_mtime, reverse=True)
+        stem = keep.name.rsplit("_", 1)[0]
+        total, kept = 0, 0
+        for p in files:
+            if p != keep and p.name.rsplit("_", 1)[0] == stem:
+                p.unlink()
+                continue
+            total += p.stat().st_size
+            kept += 1
+            if p != keep and (kept > AU_CACHE_BANKS or total > AU_CACHE_BYTES):
+                p.unlink()
+    except OSError:
+        pass
+
+
+def _song_sig(sid: str) -> str:
+    sp = SONGS[sid]
+    return "%08x" % (zlib.crc32(repr((sp.bpm, sp.root, sp.scale, sp.meter, sp.style, sp.prog, sp.mel, sp.form, sorted(sp.kw.items()),
+                                      STYLES[sp.style])).encode()) & 0xffffffff)
+
+
+class SongPlayer:
+    """Sequences one song: fires note samples on its beat grid; stem gains follow the mood; loops past the intro."""
+
+    def __init__(self, sid, song, bank, mood, fade) -> None:
+        self.sid, self.song, self.bank, self.mood = sid, song, bank, mood
+        self.pos, self.i = 0, 0
+        self.g, self.t, self.fade = 0.0, 1.0, fade
+        self.voices: list = []
+        self.sg: dict = {}
+        self.since = 10 ** 9
+        self.pump = SONGS[sid].get("pump", 0.0) or 0.0
+        self.loops = 0
+
+    def restart(self) -> None:
+        start = self.song.secs.get("A", 0)                           # loop back past the intro, not to silence
+        self.pos, self.i = start, bisect.bisect_left(self.song.times, start)
+        self.loops += 1
+
+    def render(self, mx: "Mixer", n: int, L: list, R: list) -> None:
+        song = self.song
+        self.g += (self.t - self.g) * min(1.0, n / AU_SR / max(0.15, self.fade) * 3)
+        tg = mx.stem_targets(self.mood)
+        for nm in STEMS:
+            c = self.sg.get(nm, tg.get(nm, 1.0))
+            self.sg[nm] = c + (tg.get(nm, 0.0) - c) * 0.08
+        end, ev, times, ko = self.pos + n, song.events, song.times, None
+        while self.i < len(ev) and times[self.i] < end:
+            t, stem, key, vel, pan = ev[self.i]
+            self.i += 1
+            gs = self.sg[stem]
+            if gs < 0.02:
+                continue
+            arr = self.bank.notes.get(key)
+            if arr is None:
+                continue
+            gain, off = vel * gs * STEM_GAIN[stem], max(0, t - self.pos)
+            self.voices.append([arr, 0, gain * (1 - max(0.0, pan) * 0.7), gain * (1 + min(0.0, pan) * 0.7), off, stem != "drums"])
+            if stem == "drums" and key[1].startswith("kick") and ko is None:
+                ko = off
+        if len(self.voices) > 48:                                     # polyphony cap: oldest long notes go first
+            self.voices = self.voices[-48:]
+        dg = self.g * mx.vol["mus"] * mx.vol["m"] * mx.dk * AU_MUSIC_K
+        Ld, Rd, Lm, Rm = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
+        for v in self.voices[:]:
+            arr, idx, gl, gr, off, mel = v
+            seg = arr[idx:idx + n - off]
+            m_ = len(seg)
+            if m_ == 0:
+                self.voices.remove(v)
+                continue
+            bl, br = (Lm, Rm) if mel else (Ld, Rd)
+            a, b = gl * dg, gr * dg
+            bl[off:off + m_] = [x + s * a for x, s in zip(bl[off:off + m_], seg)]
+            br[off:off + m_] = [x + s * b for x, s in zip(br[off:off + m_], seg)]
+            v[1], v[4] = idx + m_, 0
+            if v[1] >= len(arr):
+                self.voices.remove(v)
+        if self.pump > 0 and (ko is not None or self.since < len(AU_PUMP)):
+            env = [1.0] * n
+            s0, k0 = (ko, 0) if ko is not None else (0, self.since)
+            for i in range(s0, n):
+                k = k0 + i - s0
+                if k >= len(AU_PUMP):
+                    break
+                env[i] = 1 - self.pump * AU_PUMP[k]
+            Lm = [x * e for x, e in zip(Lm, env)]
+            Rm = [x * e for x, e in zip(Rm, env)]
+        self.since = (n - ko) if ko is not None else self.since + n
+        L[:] = [a + b + c for a, b, c in zip(L, Ld, Lm)]
+        R[:] = [a + b + c for a, b, c in zip(R, Rd, Rm)]
+        self.pos = end
+
+
+class Mixer:
+    """Music players + sound effects -> stereo int16 chunks. Owns the EQ, the auto-level and the spectrum analyser."""
+
+    def __init__(self, cache: bool = True) -> None:
+        self.cache = cache
+        self.voices: list = []
+        self.players: list = []
+        self.ready: dict = {}
+        self.sfx: dict = {}
+        self.lru: list = []
+        self.pq: "queue.PriorityQueue" = queue.PriorityQueue()
+        self.partial: dict = {}                                     # sid -> (bank, keys still to render, cache path)
+        self.req: dict = {}
+        self._cnt = 0
+        self.vol = {"m": 0.85, "mus": 0.7, "sfx": 0.9}
+        self.eq = (0.0, 0.0, 0.0)
+        self._eqs = [0.0] * 4
+        self.mood = "menu"
+        self.want: Optional[tuple] = None
+        self.pending_sfx: list = []
+        self.duck, self.dk = 0.0, 1.0
+        self.agc = 1.0
+        self.loop = True
+        self.status, self.outbox, self._lastsec, self._nspec = False, [], -1, 0
+        self.running = True
+        self.lock = threading.Lock()
+
+    # -- loading (runs on the loader thread)
+    def request(self, item: str, prio: int = 5) -> None:
+        """item: 'song:<sid>' or 'sfx:<name>'. A more urgent request jumps the queue."""
+        if (item.startswith("song:") and item[5:] in self.ready) or (item.startswith("sfx:") and item[4:] in self.sfx):
+            return
+        if prio < self.req.get(item, 10 ** 6):
+            self.req[item] = prio
+            self._cnt += 1
+            self.pq.put((prio, self._cnt, item))
+
+    def load(self, item: str) -> None:
+        if item.startswith("song:"):
+            self.load_song(item[5:])
+        elif item.startswith("fill:"):
+            self._fill(item[5:])
+        elif item.startswith("sfx:"):
+            self.load_sfx(item[4:])
+
+    def _fill_prio(self, sid: str) -> int:
+        """The song you are hearing fills first; prefetched songs fill only when nothing more urgent is waiting."""
+        playing = any(p.sid == sid for p in self.players) or (self.want is not None and self.want[0] == sid)
+        return 1 if playing else 4
+
+    def _fill(self, sid: str) -> None:
+        """Render the next slice of a song that is already playing (or ready), then requeue the rest. Slices are short, so a
+        new song request always jumps ahead and starts within a fraction of a second."""
+        job = self.partial.get(sid)
+        if job is None:
+            return
+        bank, keys, path = job
+        t0 = time.monotonic()
+        while keys and time.monotonic() - t0 < 0.06:
+            k = keys.pop(0)
+            if k not in bank.notes:
+                bank.notes[k] = bank.make(k)
+        if keys:
+            self._cnt += 1
+            self.pq.put((self._fill_prio(sid), self._cnt, "fill:" + sid))
+            return
+        self.partial.pop(sid, None)
+        if self.cache and path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(bank.dump())
+                os.replace(tmp, path)
+                _prune_bank_cache(path)
+            except OSError:
+                pass
+
+    def load_sfx(self, name: str) -> None:
+        if name in self.sfx:
+            return
+        path = audio_dir() / ("sfx_" + name.replace(":", "_") + ".pcm")
+        arr = array("h")
+        try:
+            if self.cache and path.exists():
+                arr.frombytes(zlib.decompress(path.read_bytes()))
+        except Exception:
+            arr = array("h")
+        if not arr:
+            arr = array("h", [int(max(-1.0, min(1.0, v)) * 30000) for v in au_finish(sfx_build(name))])
+            if self.cache:
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(zlib.compress(arr.tobytes(), 3))
+                except OSError:
+                    pass
+        self.sfx[name] = arr
+
+    def load_song(self, sid: str) -> None:
+        if sid in self.ready or sid not in SONGS:
+            return
+        song = song_of(sid)
+        spec = SONGS[sid]
+        bank = NoteBank(song.spb, spec.get("echo", 0.0) or 0.0)
+        path = audio_dir() / f"bank_{sid}_{_song_sig(sid)}.z"
+        if self.cache and path.exists():
+            try:
+                bank.load(path.read_bytes())
+                os.utime(path)                                  # recently played: keep it in the cache
+            except Exception:
+                bank.notes.clear()
+        order, seen = [], set()                                     # every note, in the order the song first needs it
+        for e in song.events:
+            if e[2] not in seen:
+                seen.add(e[2])
+                order.append(e[2])
+        first = {e[2] for e in song.events if e[0] < AU_SR * 1.5}  # the opening 1.5 seconds: enough to start at once
+        missing = [k for k in order if k not in bank.notes]
+        for k in [k for k in missing if k in first]:
+            bank.notes[k] = bank.make(k)
+        rest = [k for k in missing if k not in first]
+        if rest:
+            self.partial[sid] = (bank, rest, path)
+            self._cnt += 1
+            self.pq.put((self._fill_prio(sid), self._cnt, "fill:" + sid))
+        elif missing and self.cache:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_bytes(bank.dump())
+                os.replace(tmp, path)
+                _prune_bank_cache(path)
+            except OSError:
+                pass
+        with self.lock:
+            self.ready[sid] = (song, bank)
+            self.lru.append(sid)
+            keep = {p.sid for p in self.players} | ({self.want[0]} if self.want else set())
+            while len(self.ready) > 10:
+                old = next((s for s in self.lru if s not in keep and s != sid), None)
+                if old is None:
+                    break
+                self.lru.remove(old)
+                self.ready.pop(old, None)
+                self.partial.pop(old, None)
+                self.req.pop("song:" + old, None)
+        if self.status:
+            self.outbox.append(f"ready {sid}")
+
+    def stem_targets(self, mood: str) -> dict:
+        if mood == "story":
+            return {"drums": .45, "bass": .8, "harm": .9, "pad": 1.0, "lead": .85, "counter": .8}
+        if mood == "result":
+            return {"drums": .3, "bass": .7, "harm": .9, "pad": 1.0, "lead": .6, "counter": .6}
+        return {"drums": 1.0, "bass": 1.0, "harm": 1.0, "pad": 1.0, "lead": 1.0, "counter": 1.0}
+
+    # -- commands from the game
+    def command(self, line: str) -> None:
+        p = line.split()
+        if not p:
+            return
+        c = p[0]
+        try:
+            if c == "sfx":
+                name, vol, pan = p[1], float(p[2]), float(p[3])
+                rate = float(p[4]) if len(p) > 4 else 1.0
+                a = self.sfx.get(name)
+                if a is None:
+                    self.request("sfx:" + name, 0)
+                    self.pending_sfx.append((time.monotonic(), name, vol, pan, rate))
+                elif len(self.voices) < 32:
+                    self.voices.append([a, 0.0, vol, pan, rate])
+                    if name in SFX_DUCK:
+                        self.duck = 1.0
+            elif c == "music":
+                sid, fade = p[1], float(p[2]) if len(p) > 2 else 1.5
+                if sid in ("none", "-"):
+                    for pl in self.players:
+                        pl.t, pl.fade = 0.0, fade
+                    self.want = None
+                    return
+                cur = self.players[-1] if self.players else None
+                if cur and cur.sid == sid and cur.t == 1.0:
+                    return
+                self.want = (sid, fade)
+                self.request("song:" + sid, 0)
+                if sid in self.partial:
+                    self._cnt += 1
+                    self.pq.put((1, self._cnt, "fill:" + sid))
+            elif c == "mood":
+                self.mood = p[1]
+                for pl in self.players:
+                    pl.mood = p[1]
+            elif c == "vol":
+                self.vol = dict(zip(("m", "mus", "sfx"), map(float, p[1:4])))
+            elif c == "eq":
+                self.eq = tuple(float(x) for x in p[1:4])
+            elif c == "loop":
+                self.loop = p[1] == "1"
+            elif c == "prep":
+                for it in p[1:]:
+                    self.request(it, 2)
+            elif c == "quit":
+                self.running = False
+        except (IndexError, ValueError, KeyError):
+            pass
+
+    def _start(self, sid: str, fade: float) -> None:
+        song, bank = self.ready[sid]
+        for pl in self.players:
+            pl.t, pl.fade = 0.0, min(fade, 0.35)
+        self.players.append(SongPlayer(sid, song, bank, self.mood, min(fade, 0.06)))
+        if len(self.players) > 2:
+            self.players = self.players[-2:]
+        if self.status:
+            self.outbox.append(f"now {sid} {int(song.total / AU_SR)}")
+
+    def _apply_eq(self, buf: list, ch: int) -> list:
+        """3-band EQ (BASS < 250 Hz < MID < 3 kHz < TREBLE), each band -12..+12 dB."""
+        gb, gm, gt = (10 ** (x / 20) for x in self.eq)
+        a1, a2 = 1 - math.exp(-AU_TAU * 250 / AU_SR), 1 - math.exp(-AU_TAU * 3000 / AU_SR)
+        y1, y2 = self._eqs[2 * ch], self._eqs[2 * ch + 1]
+        out = [0.0] * len(buf)
+        for i, x in enumerate(buf):
+            y1 += a1 * (x - y1)
+            y2 += a2 * (x - y2)
+            out[i] = gb * y1 + gm * (y2 - y1) + gt * (x - y2)
+        self._eqs[2 * ch], self._eqs[2 * ch + 1] = y1, y2
+        return out
+
+    def _spectrum(self, mono: list) -> str:
+        n = len(mono)
+        out = []
+        for f in SPEC_BANDS:
+            w = AU_TAU * f / AU_SR
+            c = 2 * math.cos(w)
+            s1 = s2 = 0.0
+            for x in mono[::2] if f < 1500 else mono:
+                s0 = x + c * s1 - s2
+                s2, s1 = s1, s0
+            mag = math.sqrt(max(0.0, s1 * s1 + s2 * s2 - c * s1 * s2)) / (n / (2 if f < 1500 else 1))
+            out.append(str(int(max(0, min(9, 9 + 20 * math.log10(mag + 1e-6) / 6)))))
+        return "".join(out)
+
+    def render(self) -> bytes:
+        n = AU_CHUNK
+        L, R = [0.0] * n, [0.0] * n
+        v = self.vol
+        self.duck = max(0.0, self.duck - n / AU_SR * 1.2)
+        self.dk = 1.0 - 0.45 * self.duck
+        with self.lock:
+            if self.want and self.want[0] in self.ready:
+                sid, fade = self.want
+                self.want = None
+                self._start(sid, fade)
+            for pl in self.players[:]:
+                pl.render(self, n, L, R)
+                if pl.t == 1.0 and pl.pos >= pl.song.total:
+                    if self.loop:
+                        pl.restart()
+                    else:
+                        pl.t = 0.0
+                        if self.status:
+                            self.outbox.append(f"ended {pl.sid}")
+                if pl.t == 0.0 and pl.g < 0.01:
+                    self.players.remove(pl)
+        if self.players:
+            ms = sum(x * x for x in L[::8]) / (n // 8)                     # auto-level the music to about -18 dBFS
+            rms = math.sqrt(ms)
+            if rms > 1e-4:
+                want = clamp(0.11 / rms, 0.4, 2.4)
+                self.agc += (want - self.agc) * (0.02 if want < self.agc else 0.006)
+            L = [x * self.agc for x in L]
+            R = [x * self.agc for x in R]
+            if any(abs(x) > 0.05 for x in self.eq):
+                L, R = self._apply_eq(L, 0), self._apply_eq(R, 1)
+        now = time.monotonic()
+        if self.pending_sfx:
+            keep = []
+            for t0, name, vol, pan, rate in self.pending_sfx:
+                if name in self.sfx:
+                    self.voices.append([self.sfx[name], 0.0, vol, pan, rate])
+                elif now - t0 < 0.6:
+                    keep.append((t0, name, vol, pan, rate))
+            self.pending_sfx = keep
+        for vc in self.voices[:]:
+            arr, pos, vol, pan, rate = vc
+            ip = int(pos)
+            if ip >= len(arr):
+                self.voices.remove(vc)
+                continue
+            if rate == 1.0:
+                seg, step = arr[ip:ip + n], n
+            else:
+                step = n * rate
+                seg = [arr[int(ip + k * rate)] for k in range(n) if ip + k * rate < len(arr)]
+            g = vol * v["sfx"] * v["m"] * (1 / 32768) * 1.1
+            gl, gr = g * (1 - max(0.0, pan) * .85), g * (1 + min(0.0, pan) * .85)
+            m_ = len(seg)
+            L[:m_] = [x + s * gl for x, s in zip(L[:m_], seg)]
+            R[:m_] = [x + s * gr for x, s in zip(R[:m_], seg)]
+            vc[1] = pos + step
+        if self.status:
+            self._nspec += 1
+            if self._nspec % 4 == 0:
+                self.outbox.append("spec " + self._spectrum([(a + b) * 0.5 for a, b in zip(L, R)]))
+            if self.players:
+                pl = self.players[-1]
+                sec = int(pl.pos / AU_SR)
+                if sec != self._lastsec:
+                    self._lastsec = sec
+                    self.outbox.append(f"pos {pl.sid} {sec} {int(pl.song.total / AU_SR)}")
+        out = array("h", bytes(n * 4))
+        tanh = math.tanh
+        out[0::2] = array("h", [int(30000 * tanh(x * 1.15)) for x in L])
+        out[1::2] = array("h", [int(30000 * tanh(x * 1.15)) for x in R])
+        if sys.byteorder == "big":
+            out.byteswap()
+        return out.tobytes()
+
+
+# ---- OS output sinks ---------------------------------------------------------------------------------------------------
+class _PipeSink:
+    def __init__(self, cmd) -> None:
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def write(self, b: bytes) -> None:
+        self.p.stdin.write(b)
+        self.p.stdin.flush()
+
+    def close(self) -> None:
+        try:
+            self.p.stdin.close()
+            self.p.terminate()
+        except Exception:
+            pass
+
+
+class _FileSink:
+    """Writes raw PCM to a file in real time (for testing without speakers: TT_AUDIO_SINK=file:/path)."""
+
+    def __init__(self, path: str) -> None:
+        self.f = open(path, "wb")
+        self.t0, self.n = time.monotonic(), 0
+
+    def write(self, b: bytes) -> None:
+        self.f.write(b)
+        self.n += AU_CHUNK
+        ahead = self.n / AU_SR - (time.monotonic() - self.t0)
+        if ahead > 0.02:
+            time.sleep(ahead)
+
+    def close(self) -> None:
+        self.f.close()
+
+
+class _LibSink:
+    def __init__(self, kind: str) -> None:
+        if kind == "sounddevice":
+            import sounddevice as sd                       # type: ignore
+            self.s = sd.RawOutputStream(samplerate=AU_SR, channels=2, dtype="int16", blocksize=AU_CHUNK)
+            self.s.start()
+        else:
+            import pyaudio                                 # type: ignore
+            self.pa = pyaudio.PyAudio()
+            self.s = self.pa.open(format=pyaudio.paInt16, channels=2, rate=AU_SR, output=True, frames_per_buffer=AU_CHUNK)
+
+    def write(self, b: bytes) -> None:
+        self.s.write(b)
+
+    def close(self) -> None:
+        try:
+            self.s.stop_stream() if hasattr(self.s, "stop_stream") else self.s.stop()
+        except Exception:
+            pass
+
+
+class _WinSink:
+    """Windows waveOut ring buffer via ctypes (no packages needed)."""
+
+    def __init__(self) -> None:
+        import ctypes
+        self.ct = ctypes
+        winmm = ctypes.windll.winmm
+
+        class FMT(ctypes.Structure):
+            _fields_ = [("tag", ctypes.c_ushort), ("ch", ctypes.c_ushort), ("sr", ctypes.c_ulong), ("avg", ctypes.c_ulong),
+                        ("al", ctypes.c_ushort), ("bits", ctypes.c_ushort), ("cb", ctypes.c_ushort)]
+
+        class HDR(ctypes.Structure):
+            _fields_ = [("data", ctypes.c_void_p), ("len", ctypes.c_ulong), ("rec", ctypes.c_ulong), ("user", ctypes.c_void_p),
+                        ("flags", ctypes.c_ulong), ("loops", ctypes.c_ulong), ("next", ctypes.c_void_p), ("res", ctypes.c_void_p)]
+
+        fmt = FMT(1, 2, AU_SR, AU_SR * 4, 4, 16, 0)
+        self.h = ctypes.c_void_p()
+        if winmm.waveOutOpen(ctypes.byref(self.h), 0xFFFFFFFF, ctypes.byref(fmt), 0, 0, 0):
+            raise OSError("waveOutOpen failed")
+        self.winmm, self.i = winmm, 0
+        self.bufs = [ctypes.create_string_buffer(AU_CHUNK * 4) for _ in range(6)]
+        self.hdrs = []
+        for b in self.bufs:
+            hd = HDR(ctypes.cast(b, ctypes.c_void_p), AU_CHUNK * 4, 0, None, 0, 0, None, None)
+            winmm.waveOutPrepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            hd.flags |= 1
+            self.hdrs.append(hd)
+
+    def write(self, b: bytes) -> None:
+        hd, buf = self.hdrs[self.i], self.bufs[self.i]
+        t0 = time.monotonic()
+        while not (hd.flags & 1) and time.monotonic() - t0 < 0.5:
+            time.sleep(0.002)
+        self.ct.memmove(buf, b, len(b))
+        hd.flags &= ~1
+        self.winmm.waveOutWrite(self.h, self.ct.byref(hd), self.ct.sizeof(hd))
+        self.i = (self.i + 1) % len(self.bufs)
+
+    def close(self) -> None:
+        try:
+            self.winmm.waveOutReset(self.h)
+            self.winmm.waveOutClose(self.h)
+        except Exception:
+            pass
+
+
+def _module_ok(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+def find_audio_backend():
+    """(label, factory) for the best available output, or None."""
+    env = os.environ.get("TT_AUDIO_SINK", "")
+    if env == "none":
+        return None
+    if env.startswith("file:"):
+        return ("FILE", lambda: _FileSink(env[5:]))
+    if _module_ok("sounddevice"):
+        return ("SOUNDDEVICE", lambda: _LibSink("sounddevice"))
+    if _module_ok("pyaudio"):
+        return ("PYAUDIO", lambda: _LibSink("pyaudio"))
+    if os.name == "nt":
+        return ("WINDOWS", _WinSink)
+    rate = str(AU_SR)
+    for label, exe, cmd in (("PULSEAUDIO", "paplay", ["paplay", "--raw", f"--rate={rate}", "--format=s16le", "--channels=2", "--latency-msec=60"]),
+                            ("PIPEWIRE", "pw-cat", ["pw-cat", "--playback", "--raw", "--rate", rate, "--channels", "2", "--format", "s16", "--latency", "60ms", "-"]),
+                            ("ALSA", "aplay", ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rate, "-c", "2", "--buffer-time=80000"]),
+                            ("SOX", "play", ["play", "-q", "-V0", "-t", "raw", "-r", rate, "-e", "signed", "-b", "16", "-c", "2", "-"]),
+                            ("FFPLAY", "ffplay", ["ffplay", "-nodisp", "-loglevel", "quiet", "-fflags", "nobuffer", "-f", "s16le", "-ar", rate, "-ac", "2", "-i", "-"])):
+        if shutil.which(exe):
+            return (label, (lambda c=cmd: _PipeSink(c)))
+    return None
+
+
+def audio_server(cache: bool = True) -> int:
+    """Helper-process entry: read commands on stdin, sequence + mix, stream PCM to the OS, report status on stdout."""
+    sys.setswitchinterval(0.002)
+    be = find_audio_backend()
+    if be is None:
+        return 3
+    mixer = Mixer(cache)
+    mixer.status = True
+    cmds: "queue.Queue[str]" = queue.Queue()
+
+    def reader() -> None:
+        for line in sys.stdin:
+            cmds.put(line)
+        mixer.running = False
+
+    def loader() -> None:
+        try:
+            for nm in ("ui_move", "ui_select", "ui_back", "ui_tab", "ui_error", "ui_type", "ui_toggle"):
+                mixer.request("sfx:" + nm, 3)                   # queued behind the first song, so music starts first
+            while mixer.running:
+                try:
+                    _, _, item = mixer.pq.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                mixer.load(item)
+        except Exception:
+            try:
+                audio_dir().mkdir(parents=True, exist_ok=True)
+                with open(audio_dir() / "server.log", "a") as f:
+                    f.write(traceback.format_exc())
+            except OSError:
+                pass
+
+    threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=loader, daemon=True).start()
+    try:
+        sink = be[1]()
+    except Exception:
+        return 4
+    try:
+        while mixer.running:
+            while True:
+                try:
+                    mixer.command(cmds.get_nowait())
+                except queue.Empty:
+                    break
+            sink.write(mixer.render())
+            if mixer.outbox:
+                lines, mixer.outbox = mixer.outbox, []
+                sys.stdout.write("\n".join(lines) + "\n")
+                sys.stdout.flush()
+    except (BrokenPipeError, OSError, KeyboardInterrupt):
+        pass
+    finally:
+        try:
+            sink.close()
+        except Exception:
+            pass
+    return 0
+
+
+# ---- game-side clients ------------------------------------------------------------------------------------------------
+class NullAudio:
+    """Silent stand-in (audio off, no output device, or a headless run)."""
+    on = False
+    label = "OFF"
+    now_sid: Optional[str] = None
+    pos = dur = 0
+    spec = "0" * 16
+    ready: set = set()
+
+    def start(self) -> bool:
+        return False
+
+    def sfx(self, name: str, vol: float = 1.0, pan: float = 0.0, rate: float = 1.0) -> None: ...
+    def music(self, sid: Optional[str], fade: float = 1.5) -> None: ...
+    def mood(self, m: str) -> None: ...
+    def volumes(self, m: float, mus: float, sfx: float) -> None: ...
+    def eq(self, b: float, m: float, t: float) -> None: ...
+    def loop(self, on: bool) -> None: ...
+    def prep(self, items) -> None: ...
+    def tick(self) -> None: ...
+    def stop(self) -> None: ...
+    def resume(self) -> None: ...
+
+
+class AudioClient(NullAudio):
+    """Desktop: the game's handle to the audio helper process (`<this file> --audio-server`)."""
+
+    def __init__(self) -> None:
+        self.proc: Optional[subprocess.Popen] = None
+        self.label = "OFF"
+        self._music: Optional[str] = None
+        self._mood: Optional[str] = None
+        self.now_sid, self.pos, self.dur, self.spec, self.ended = None, 0, 0, "0" * 16, None
+        self.ready = set()
+
+    @property
+    def on(self) -> bool:
+        return self.proc is not None
+
+    def start(self) -> bool:
+        if self.proc:
+            return True
+        be = find_audio_backend()
+        if be is None:
+            self.label = "NO AUDIO OUTPUT FOUND"
+            return False
+        self.label = be[0]
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            self.proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--audio-server"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, creationflags=flags)
+        except (OSError, ValueError):
+            self.proc, self.label = None, "FAILED TO START"
+            return False
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        return True
+
+    def _reader(self, proc) -> None:
+        try:
+            for raw in iter(proc.stdout.readline, b""):
+                p = raw.decode("utf-8", "ignore").split()
+                if not p:
+                    continue
+                if p[0] == "now" and len(p) >= 3:
+                    self.now_sid, self.dur, self.pos = p[1], int(p[2]), 0
+                elif p[0] == "pos" and len(p) >= 4:
+                    self.now_sid, self.pos, self.dur = p[1], int(p[2]), int(p[3])
+                elif p[0] == "spec" and len(p) >= 2:
+                    self.spec = p[1]
+                elif p[0] == "ready":
+                    self.ready.add(p[1])
+                elif p[0] == "ended":
+                    self.ended = p[1]
+        except (OSError, ValueError):
+            pass
+
+    def send(self, line: str) -> None:
+        if self.proc and self.proc.stdin:
+            try:
+                self.proc.stdin.write((line + "\n").encode())
+            except (OSError, ValueError):
+                self.proc, self.label = None, "STOPPED"
+
+    def sfx(self, name: str, vol: float = 1.0, pan: float = 0.0, rate: float = 1.0) -> None:
+        if self.proc:
+            self.send(f"sfx {name} {vol:.2f} {clamp(pan, -1, 1):.2f} {rate:.3f}")
+
+    def music(self, sid: Optional[str], fade: float = 1.5) -> None:
+        if self.proc and sid != self._music:
+            self._music = sid
+            self.send(f"music {sid or 'none'} {fade}")
+
+    def mood(self, m: str) -> None:
+        if self.proc and m != self._mood:
+            self._mood = m
+            self.send(f"mood {m}")
+
+    def volumes(self, m: float, mus: float, sfx: float) -> None:
+        self.send(f"vol {m:.2f} {mus:.2f} {sfx:.2f}")
+
+    def eq(self, b: float, m: float, t: float) -> None:
+        self.send(f"eq {b:.1f} {m:.1f} {t:.1f}")
+
+    def loop(self, on: bool) -> None:
+        self.send(f"loop {int(on)}")
+
+    def prep(self, items) -> None:
+        items = list(items)
+        if items:
+            self.send("prep " + " ".join(items))
+
+    def stop(self) -> None:
+        if self.proc:
+            self.send("quit")
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=0.8)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
+
+class WebAudio(NullAudio):
+    """Browser (Pyodide): the same interface on the Web Audio API. Notes and effects are synthesised in Python a little
+    at a time (a per-frame budget, at half rate) and scheduled sample-accurately by the browser, which also does the
+    mixing, the EQ (biquad filters) and the analyser. Any failure turns audio off quietly."""
+    SR_DIV = 2
+
+    def __init__(self) -> None:
+        self.label, self.ok, self.ctx = "WEB AUDIO", False, None
+        self.now_sid, self.pos, self.dur, self.spec = None, 0, 0, "0" * 16
+        self.ready = set()
+        self._music, self._sched, self._bank, self._song, self._pending = None, 0, {}, None, []
+        self._banks: dict = {}
+        self._opening: set = set()
+        self._started = False
+        self._sfx_bufs, self._sfx_q, self._vols, self._eq = {}, [], (0.85, 0.7, 0.9), (0.0, 0.0, 0.0)
+        self._t0 = 0.0
+        self._looping = True
+
+    def start(self) -> bool:
+        try:
+            import js                                                      # type: ignore
+            from pyodide.ffi import to_js                                  # type: ignore
+            self.js, self.to_js = js, to_js
+            ctx = self.ctx = js.AudioContext.new()
+            self.master = ctx.createGain()
+            self.analyser = ctx.createAnalyser()
+            self.analyser.fftSize = 512
+            self.music_bus, self.sfx_bus = ctx.createGain(), ctx.createGain()
+            lo, mid, hi = ctx.createBiquadFilter(), ctx.createBiquadFilter(), ctx.createBiquadFilter()
+            lo.type, lo.frequency.value = "lowshelf", 250
+            mid.type, mid.frequency.value, mid.Q.value = "peaking", 1000, 0.7
+            hi.type, hi.frequency.value = "highshelf", 3000
+            self.eqf = (lo, mid, hi)
+            self.music_bus.connect(lo)
+            lo.connect(mid)
+            mid.connect(hi)
+            hi.connect(self.master)
+            self.sfx_bus.connect(self.master)
+            self.master.connect(self.analyser)
+            self.analyser.connect(ctx.destination)
+            self.stems = {s: ctx.createGain() for s in STEMS}
+            for g in self.stems.values():
+                g.connect(self.music_bus)
+            self.ok = True
+            return True
+        except Exception:
+            self.ok = False
+            return False
+
+    @property
+    def on(self) -> bool:
+        return self.ok
+
+    def resume(self) -> None:
+        try:
+            if self.ok and self.ctx.state != "running":
+                self.ctx.resume()
+        except Exception:
+            pass
+
+    def _buffer(self, data: list, sr: int):
+        b = self.ctx.createBuffer(1, max(1, len(data)), sr)
+        b.copyToChannel(self.js.Float32Array.new(self.to_js(data)), 0)
+        return b
+
+    def sfx(self, name: str, vol: float = 1.0, pan: float = 0.0, rate: float = 1.0) -> None:
+        if not self.ok:
+            return
+        b = self._sfx_bufs.get(name)
+        if b is None:
+            if name not in self._sfx_q:
+                self._sfx_q.append(name)
+            return
+        try:
+            src = self.ctx.createBufferSource()
+            src.buffer = b
+            src.playbackRate.value = rate
+            g = self.ctx.createGain()
+            g.gain.value = vol
+            pn = self.ctx.createStereoPanner()
+            pn.pan.value = clamp(pan, -1, 1)
+            src.connect(g)
+            g.connect(pn)
+            pn.connect(self.sfx_bus)
+            src.start()
+        except Exception:
+            pass
+
+    def music(self, sid: Optional[str], fade: float = 1.5) -> None:
+        if not self.ok or sid == self._music:
+            return
+        if self._music in self._banks:                                  # remember how far the last song got
+            self._banks[self._music] = (self._bank, self._pending)
+        self._music = sid
+        self._song, self._bank, self._pending, self._sched = None, {}, [], 0
+        try:
+            now = self.ctx.currentTime
+            self.music_bus.gain.setTargetAtTime(0.0, now, 0.06)
+        except Exception:
+            pass
+        if sid:
+            self._song = song_of(sid)
+            cached = self._banks.get(sid)
+            if cached is not None:                                      # heard recently: carry on from where it got to
+                self._bank, self._pending = cached[0], list(cached[1])
+            else:
+                order, seen = [], set()                                 # render in the order the song needs its notes
+                for e in self._song.events:
+                    if e[2] not in seen:
+                        seen.add(e[2])
+                        order.append(e[2])
+                self._pending = order
+                self._banks[sid] = (self._bank, self._pending)
+                while len(self._banks) > 6:
+                    self._banks.pop(next(iter(self._banks)))
+            self._opening = {e[2] for e in self._song.events if e[0] < AU_SR * 1.5}
+            self._started = False
+
+    def volumes(self, m: float, mus: float, sfx: float) -> None:
+        self._vols = (m, mus, sfx)
+        try:
+            self.master.gain.value, self.sfx_bus.gain.value = m, sfx
+        except Exception:
+            pass
+
+    def eq(self, b: float, m: float, t: float) -> None:
+        try:
+            for f, v in zip(self.eqf, (b, m, t)):
+                f.gain.value = v
+        except Exception:
+            pass
+
+    def loop(self, on: bool) -> None:
+        self._looping = on
+
+    def tick(self) -> None:
+        """Called once a frame: synthesise a little, schedule the next ~0.4 s of notes, read the analyser."""
+        if not self.ok:
+            return
+        try:
+            budget = time.perf_counter() + 0.008
+            while self._sfx_q and time.perf_counter() < budget:
+                nm = self._sfx_q.pop(0)
+                self._sfx_bufs[nm] = self._buffer(au_finish(sfx_build(nm)), AU_SR)
+            song = self._song
+            if song is None:
+                return
+            if self._pending:                                           # keep rendering ahead of playback, a slice per frame
+                bank = NoteBank(song.spb * 1.0, SONGS[song.sid].get("echo", 0.0) or 0.0)
+                while self._pending and time.perf_counter() < budget:
+                    k = self._pending.pop(0)
+                    arr = bank.make(k)
+                    self._bank[k] = self._buffer([x / 32768 for x in arr[::self.SR_DIV]], AU_SR // self.SR_DIV)
+            if not self._started:                                       # start as soon as the opening is ready
+                if any(k not in self._bank for k in self._opening):
+                    return
+                self._started = True
+                self._t0, self._sched = self.ctx.currentTime + 0.05, 0
+                self.music_bus.gain.setTargetAtTime(self._vols[1], self.ctx.currentTime, 0.05)
+                self.now_sid, self.dur = song.sid, int(song.total / AU_SR)
+            now = self.ctx.currentTime
+            horizon = int((now - self._t0 + 0.4) * AU_SR)
+            ev = song.events
+            while self._sched < len(ev) and ev[self._sched][0] <= horizon:
+                t, stem, key, vel, pan = ev[self._sched]
+                self._sched += 1
+                b = self._bank.get(key)
+                if b is None:
+                    continue
+                src = self.ctx.createBufferSource()
+                src.buffer = b
+                g = self.ctx.createGain()
+                g.gain.value = vel * STEM_GAIN[stem] * 0.55
+                src.connect(g)
+                g.connect(self.stems[stem])
+                src.start(self._t0 + t / AU_SR)
+            self.pos = int(max(0.0, now - self._t0))
+            if self._sched >= len(ev) and now - self._t0 > song.total / AU_SR:
+                if self._looping:
+                    start = song.secs.get("A", 0)
+                    self._t0 = now - start / AU_SR
+                    self._sched = bisect.bisect_left(song.times, start)
+            arr = self.js.Uint8Array.new(self.analyser.frequencyBinCount)
+            self.analyser.getByteFrequencyData(arr)
+            vals = arr.to_py()
+            n = len(vals)
+            self.spec = "".join(str(min(9, int(vals[min(n - 1, int(n * (2 ** (k * 0.45) - 1) / (2 ** 7.2)))] / 28))) for k in range(16))
+        except Exception:
+            self.ok = False
+
+    def prep(self, items) -> None:
+        for it in items:
+            if it.startswith("sfx:") and it[4:] not in self._sfx_bufs and it[4:] not in self._sfx_q:
+                self._sfx_q.append(it[4:])
+
+
+# ===========================================================================
+# MUSIC DIRECTOR: which song plays where. Every home screen, map family, boss, mission, ticket boss and Martyr phase.
+# ===========================================================================
+# ===========================================================================
+# THE HOUSE COMPOSER: every home screen and every battlefield without a hand-written theme gets its own piece, written once
+# from its name. Each one picks its own genre for its setting, its own key, mode, meter and tempo, its own progression, its
+# own instruments, and a melody built the way a person writes one: a one-bar motif, its answer, a climb and a cadence.
+# ===========================================================================
+_GEN_FAMILIES = {
+    "fire":     dict(styles=("metal", "metal2", "industrial", "epic", "dnb", "gothic"), scales=("phr", "hmin", "min", "phd"),
+                     lead=("saw", "supersaw", "brass", "organ", "hoover", "reed"), pad=("choir", "strings", "warmpad")),
+    "frost":    dict(styles=("ambient", "epic", "waltz", "cosmic", "hymn", "lullaby"), scales=("lyd", "min", "dor", "maj"),
+                     lead=("celesta", "glock", "bell", "flute", "music_box", "vibes"), pad=("glasspad", "choir_o", "strings")),
+    "desert":   dict(styles=("desert", "balkan", "eastern", "western", "funk", "epic"), scales=("phd", "hmin", "hung", "dor", "phr"),
+                     lead=("erhu", "sitar", "reed", "flute", "theremin", "koto"), pad=("warmpad", "strings")),
+    "water":    dict(styles=("dub", "house", "ambient", "synthwave", "funk", "waltz"), scales=("dor", "mix", "maj", "min", "lyd"),
+                     lead=("vibes", "marimba", "ep", "flute", "hollow", "celesta"), pad=("glasspad", "pad", "warmpad")),
+    "cosmic":   dict(styles=("cosmic", "synthwave", "techno", "ambient", "hyper", "glitch"), scales=("lyd", "min", "dor", "phr"),
+                     lead=("theremin", "supersaw", "glasspad", "hollow", "celesta", "square"), pad=("glasspad", "pad", "choir_o")),
+    "city":     dict(styles=("synthwave", "techno", "house", "funk", "dnb", "trap", "glitch", "industrial"), scales=("min", "dor", "mix", "phr"),
+                     lead=("square", "supersaw", "ep", "hollow", "bell", "saw"), pad=("pad", "glasspad", "warmpad")),
+    "storm":    dict(styles=("dnb", "metal2", "epic", "industrial", "hyper"), scales=("min", "phr", "hmin", "dor"),
+                     lead=("supersaw", "brass", "saw", "hoover", "choir"), pad=("choir", "strings", "pad")),
+    "wild":     dict(styles=("jig", "eastern", "folk", "funk", "epic", "dub"), scales=("mix", "dor", "maj", "min"),
+                     lead=("flute", "marimba", "koto", "harp", "reed", "pizz"), pad=("warmpad", "strings")),
+    "dark":     dict(styles=("gothic", "horror", "waltz", "industrial", "clock", "hymn"), scales=("hmin", "loc", "phr", "min", "hung"),
+                     lead=("organ", "choir", "theremin", "music_box", "harpsi", "erhu"), pad=("choir", "strings", "warmpad")),
+    "pastoral": dict(styles=("jig", "folk", "waltz", "fanfare", "march", "hymn"), scales=("maj", "mix", "dor", "lyd"),
+                     lead=("flute", "reed", "harp", "guitar", "ep", "horn"), pad=("strings", "warmpad")),
+    "plain":    dict(styles=("march", "epic", "metal2", "western", "chip", "funk", "synthwave", "metal", "fanfare"), scales=("min", "dor", "maj", "mix"),
+                     lead=("brass", "saw", "square", "reed", "guitar", "supersaw"), pad=("strings", "pad", "choir")),
+}
+_GEN_TEMPO = {"ambient": (62, 88), "balkan": (138, 168), "chip": (140, 168), "clock": (100, 120), "cosmic": (72, 112), "desert": (86, 126),
+              "dnb": (166, 176), "dub": (72, 94), "eastern": (96, 130), "epic": (96, 124), "fanfare": (84, 124), "folk": (80, 110),
+              "funk": (94, 124), "glitch": (118, 152), "gothic": (78, 104), "horror": (60, 110), "house": (116, 126), "hymn": (60, 76),
+              "hyper": (168, 180), "industrial": (96, 126), "jig": (104, 140), "lullaby": (74, 90), "march": (104, 124), "metal": (140, 162),
+              "metal2": (104, 142), "synthwave": (106, 134), "techno": (124, 138), "trap": (134, 150), "waltz": (84, 108), "western": (122, 146)}
+_GEN_METERS = {"waltz": ("34",), "lullaby": ("34",), "hymn": ("34",), "jig": ("68",), "balkan": ("78", "98"), "folk": ("68", "44", "34"),
+               "ambient": ("44", "34", "54"), "cosmic": ("44", "54"), "desert": ("44", "54"), "glitch": ("44", "54", "78"), "epic": ("44", "44", "34"),
+               "gothic": ("44", "34"), "horror": ("44", "34"), "eastern": ("44", "44", "54"), "fanfare": ("44", "34")}
+_GEN_METER_GROOVE = {"34": ("waltz", "waltz2"), "54": ("five", "five2"), "78": ("balkan", "balkan2"), "98": ("nine",), "128": ("twelve",),
+                     "68": ("jig", "jig2", "march68"), "58": ("five8",)}
+_GEN_CELLS = {      # rhythm cells (16th-step durations) per bar length, low energy first
+    16: ((16,), (8, 8), (12, 4), (8, 4, 4), (4, 4, 8), (6, 2, 8), (4, 4, 4, 4), (6, 2, 4, 4), (4, 2, 2, 8), (2, 2, 4, 8),
+         (3, 3, 2, 4, 4), (4, 2, 2, 4, 4), (2, 2, 2, 2, 8), (2, 2, 4, 2, 2, 4), (2, 2, 2, 2, 4, 4), (2, 2, 2, 2, 2, 2, 4)),
+    12: ((12,), (8, 4), (6, 6), (4, 8), (4, 4, 4), (6, 2, 4), (3, 1, 2, 6), (4, 2, 4, 2), (2, 2, 2, 6), (2, 2, 2, 2, 4), (2, 2, 2, 2, 2, 2)),
+    14: ((14,), (8, 6), (4, 4, 6), (6, 2, 6), (2, 2, 4, 6), (4, 4, 2, 2, 2), (2, 2, 2, 2, 6), (2, 2, 2, 2, 2, 2, 2)),
+    18: ((18,), (12, 6), (6, 6, 6), (4, 2, 6, 6), (6, 4, 2, 6), (2, 2, 2, 6, 6), (4, 2, 4, 2, 6)),
+    20: ((20,), (10, 10), (6, 4, 10), (6, 4, 6, 4), (4, 2, 4, 4, 6), (2, 2, 2, 4, 4, 6), (6, 2, 2, 6, 4)),
+    24: ((24,), (12, 12), (6, 6, 12), (6, 6, 6, 6), (4, 2, 6, 6, 6), (2, 2, 2, 6, 6, 6)),
+    10: ((10,), (4, 6), (6, 4), (2, 2, 6), (2, 2, 2, 4)),
+}
+_GEN_PROGS_MAJ = ("1 5 6 4", "1 6 4 5", "1 4 6 5", "6 4 1 5", "1 3 4 4", "1 5 4 4", "4 1 5 6", "1 2 4 5", "1 4 2 5", "1 6 2 5",
+                  "1 4 1 5", "1 5 6 3", "4 5 1 1", "1 3 6 4")
+_GEN_PROGS_MIN = ("1 6 7 1", "1 4 5 1", "1 6 3 7", "1 7 6 7", "1 4 7 3", "6 7 1 1", "1 3 4 5", "1 6 4 5", "1 4 6 5", "1 7 4 1",
+                  "1 5 6 4", "4 6 7 1", "1 3 7 4", "6 4 1 7")
+_GEN_PROGS_B = ("4 5 3 6", "6 4 5 5", "4 1 5 5", "2 5 1 6", "6 7 4 5", "4 6 5 5", "3 6 4 5", "6 3 4 5", "4 5 6 6", "2 4 5 5", "7 6 4 5")
+
+
+def _gen_chord(sc: tuple, deg: int, seventh: bool) -> str:
+    """A diatonic chord written with its quality (so pentatonic-free, unambiguous); the tonic is never diminished."""
+    third = deg_semi(sc, deg + 2) - deg_semi(sc, deg)
+    fifth = deg_semi(sc, deg + 4) - deg_semi(sc, deg)
+    q = {(4, 7): "M", (3, 7): "m", (3, 6): "d", (4, 8): "+"}.get((third, fifth), "m")
+    if deg == 1 and q in ("d", "+"):
+        q = "m" if third == 3 else "M"
+    if q == "+" and deg != 3:
+        q = "M"
+    return f"{deg}{q}{'7' if seventh and q in 'Mm' else ''}"
+
+
+def _gen_deg_token(idx: int, L: int) -> str:
+    o, d = divmod(idx, L)
+    return f"{d + 1}" + ("'" * o if o > 0 else "," * (-o))
+
+
+def _gen_melody(rng: random.Random, sc: tuple, bar: int, chords: list, energy: float, lo: int, hi: int, start: int, final: int) -> str:
+    """Four bars: motif, answer (sequenced), climb (new rhythm, toward the peak), cadence (approach + long final note)."""
+    L = len(sc)
+    cells = _GEN_CELLS[bar]
+    n = len(cells)
+    pick = lambda e: cells[max(0, min(n - 1, int(round(e * (n - 1) + rng.uniform(-1.6, 1.6)))))]
+    r1, r3 = pick(energy), pick(min(1.0, energy + 0.15))
+    cad_opts = [c for c in cells if c[-1] >= bar // 2 and len(c) <= 3] or [cells[0]]
+    r4 = rng.choice(cad_opts)
+
+    def tones(ch: int) -> list:
+        base = [(ch - 1) % L, (ch + 1) % L, (ch + 3) % L]
+        return [b + 7 * 0 + L * o for b in base for o in range(-2, 4)]
+
+    def nearest_tone(x: int, ch: int, lo_: int = lo, hi_: int = hi) -> int:
+        cand = [t for t in tones(ch) if lo_ <= t <= hi_]
+        return min(cand, key=lambda t: (abs(t - x), rng.random())) if cand else max(lo_, min(hi_, x))
+
+    def strong(pos: int) -> bool:
+        return pos == 0 or pos == bar // 2 or (bar in (12,) and pos in (6,)) or (bar == 20 and pos in (6, 10, 16))
+
+    out, cur = [], start
+    contour = rng.choice((1, 1, -1, 0))
+    motif = []
+    for bi in range(4):
+        ch = chords[bi % len(chords)]
+        rh = r1 if bi < 2 else (r3 if bi == 2 else r4)
+        pos = 0
+        notes = []
+        for k, d in enumerate(rh):
+            last_of_song = bi == 3 and k == len(rh) - 1
+            if bi == 1 and k < len(motif) and len(r1) == len(rh):     # the answer: the motif's shape, moved by a sequence step
+                shift = motif_shift
+                cur = max(lo, min(hi, motif[k] + shift))
+                if strong(pos):
+                    cur = nearest_tone(cur, ch)
+            elif last_of_song:
+                cur = final
+            elif strong(pos):
+                aim = cur + (contour if contour else rng.choice((-1, 1))) * rng.choice((1, 2, 2, 3))
+                cur = nearest_tone(aim, ch)
+            else:
+                step = rng.choice((1, 1, 1, 2)) * (contour if contour and rng.random() < 0.75 else rng.choice((-1, 1)))
+                cur = max(lo, min(hi, cur + step))
+            if cur >= hi - 1:
+                contour = -1
+            elif cur <= lo + 1:
+                contour = 1
+            if bi == 3 and k == len(rh) - 2:                           # approach the final note by step
+                cur = final + rng.choice((1, -1, 2))
+            notes.append(cur)
+            pos += d
+        if bi == 0:
+            motif = notes[:]
+            motif_shift = rng.choice((-2, -1, 1, 2, 2))
+        if bi == 2:
+            contour = -1 if cur > (lo + hi) // 2 else 1
+        toks = [f"{_gen_deg_token(p, L)}:{d}" for p, d in zip(notes, rh)]
+        if bi == 1 and energy < 0.7 and rh[-1] >= 4 and rng.random() < 0.35:   # a breath before the climb
+            toks[-1] = f"r:{rh[-1]}"
+        out.append(" ".join(toks))
+    return " | ".join(out)
+
+
+def gen_song(sid: str, name: str, cat: str, family: str, desc: str, hint: Optional[str] = None) -> None:
+    """Writes one complete song into SONGS (deterministic: the same name always gives the same music)."""
+    rng = random.Random(zlib.crc32(sid.encode()) ^ 0x5EED)
+    fam = _GEN_FAMILIES.get(family, _GEN_FAMILIES["plain"])
+    pool = list(fam["styles"])
+    if cat == "menu":                                         # home screens are for browsing: keep the heaviest genres for battle
+        calm = [s_ for s_ in pool if s_ not in ("hyper", "dnb", "metal", "metal2", "trap")]
+        pool = calm if (calm and (family not in ("fire", "storm") or rng.random() < 0.6)) else pool
+    else:
+        pool = [s_ for s_ in pool if s_ not in ("hymn", "lullaby")] or pool
+    style = hint if hint in STYLES else rng.choice(pool)
+    scale = SONGS[hint].scale if hint in SONGS else rng.choice(fam["scales"])
+    if hint in SONGS:
+        style = SONGS[hint].style
+    meter = rng.choice(_GEN_METERS.get(style, ("44",)))
+    lo_t, hi_t = _GEN_TEMPO.get(style, (96, 132))
+    mid = (lo_t + hi_t) / 2
+    bpm = int(rng.uniform(mid, hi_t) if cat == "battle" else rng.uniform(lo_t, mid + 4))
+    root = rng.randint(38, 51)
+    sc = SCALES[scale]
+    minorish = deg_semi(sc, 3) == 3
+    jazzy = style in ("funk", "house", "dub", "lullaby") or (style in ("ambient", "cosmic") and rng.random() < 0.4)
+    def stable(d: int) -> int:                                # no full bars of diminished / augmented harmony
+        for c in (d, d + 2, d - 2, d + 4, 1):
+            c = (c - 1) % 7 + 1
+            t3, t5 = deg_semi(sc, c + 2) - deg_semi(sc, c), deg_semi(sc, c + 4) - deg_semi(sc, c)
+            if t5 == 7 and t3 in (3, 4):
+                return c
+        return 1
+    pa = [stable(int(t)) for t in rng.choice(_GEN_PROGS_MIN if minorish else _GEN_PROGS_MAJ).split()]
+    pb = [stable(int(t)) for t in rng.choice(_GEN_PROGS_B).split()]
+    pc = [stable(int(t)) for t in rng.choice(_GEN_PROGS_MIN if minorish else _GEN_PROGS_MAJ).split()]
+    prog = {"A": " ".join(_gen_chord(sc, d, jazzy and rng.random() < 0.6) for d in pa),
+            "B": " ".join(_gen_chord(sc, d, jazzy and rng.random() < 0.6) for d in pb)}
+    energy = {"metal": .9, "metal2": .85, "dnb": .8, "hyper": .95, "techno": .7, "trap": .6, "chip": .85, "balkan": .9, "jig": .8,
+              "industrial": .65, "glitch": .8, "funk": .7, "house": .6, "synthwave": .6, "western": .75, "march": .6, "epic": .55,
+              "fanfare": .5, "eastern": .55, "desert": .5, "folk": .45, "dub": .35, "waltz": .45, "gothic": .4, "horror": .3, "clock": .6,
+              "cosmic": .3, "ambient": .15, "hymn": .1, "lullaby": .15}.get(style, .5)
+    if cat == "battle":
+        energy = min(1.0, energy + 0.1)
+    L = len(sc)
+    bar = METERS[meter][0]
+    mels = {"A": _gen_melody(rng, sc, bar, pa, energy, 0, L + 4, rng.choice((0, 2, 4)), 0),
+            "B": _gen_melody(rng, sc, bar, pb, min(1.0, energy + 0.1), 2, L + 6, rng.choice((L, L + 2, 4)), 4)}
+    form = rng.choice(("I A B A2 C X O", "I A A2 B X O", "I A B C A2 X O", "I A B A2 D X B2 O", "I A B2 C A2 X O", "A B A2 C X O"))
+    if "C" in form:
+        prog["C"] = " ".join(_gen_chord(sc, d, jazzy) for d in pc)
+        mels["C"] = _gen_melody(rng, sc, bar, pc, max(0.0, energy - 0.35), 0, L + 4, rng.choice((2, 4)), rng.choice((0, 4)))
+    kw = {}
+    if not hint:
+        kw["lead"] = rng.choice(fam["lead"])
+        others = [x for x in fam["lead"] if x != kw["lead"]]
+        kw["lead2"] = rng.choice(others)
+        kw["counter"] = rng.choice(fam["pad"] + tuple(others[:2]))
+        if STYLES[style].get("pad") is not None and rng.random() < 0.7:
+            kw["pad"] = rng.choice(fam["pad"])
+    else:
+        kw["lead"] = rng.choice(fam["lead"])
+    if meter in _GEN_METER_GROOVE and _GEN_METERS.get(style, ("44",))[0] != meter:
+        kw["groove"] = rng.choice(_GEN_METER_GROOVE[meter])
+    if style in ("funk", "house", "dub", "jig", "folk") and rng.random() < 0.6:
+        kw["swing"] = round(rng.uniform(0.06, 0.2), 2)
+    SONGS[sid] = SongSpec(sid, name, cat, bpm, root, scale, meter, style, prog, mels, form, desc, **kw)
+
+
+_HOME_HAND = {"CLASSIC": "main_theme", "MEADOW": "green_hills", "CAMPFIRE": "embers_and_ale", "DESERT": "mirage_road",
+              "ARCTIC": "frost_lullaby", "NEON": "neon_arcade", "DEEPSEA": "undertow_dub", "MOLTEN": "ash_kingdom", "JUNGLE": "canopy",
+              "GALAXY": "starlight_drift", "GHOSTTOWN": "ghost_waltz", "INVASION": "first_contact", "SOLARIS": "solaris_hymn",
+              "CHRONOS": "chronos_clockwork", "ETERNAL": "protector", "MASTER": "masters_throne", "SECRET": "kernel_panic",
+              "GLASSDESERT": "glass_desert", "LANTERNFEST": "lantern_festival", "WORLDTREE": "worldtree", "SKYWHALE": "sky_whale",
+              "SHATTERLINE": "shatterline", "BIOLUME": "h_biolume", "SPIRITSHRINE": "h_spiritshrine", "HOLOCITY": "h_holocity",
+              "TESSERACT": "h_tesseract", "KAIJUBAY": "h_kaijubay", "SHROOMGROVE": "h_shroomgrove", "WORMSEA": "h_wormsea",
+              "JADETEMPLE": "h_jadetemple", "ORRERY": "h_orrery", "GHOSTARMADA": "h_ghostarmada"}
+TOURNAMENT_SONGS = ("boss_stinger", "boss_warden", "boss_specter", "boss_colossus", "boss_sentinel", "boss_glacier", "boss_helios", "boss_rattler",
+                    "boss_miasma", "boss_bastion", "boss_zephyr", "boss_geode", "boss_mirage", "boss_revenant", "boss_corsair", "boss_tyrant",
+                    "boss_archon", "boss_obsidian", "boss_tempest", "boss_master")
+MARTYR_SONGS = ("martyr_ember", "martyr_tempest", "martyr_astral")
+MAP_FAMILY_SONGS = {"fire": ("magma_pressure",), "frost": ("frostbite_front",), "desert": ("sandstorm_siege",), "water": ("tidebreaker",),
+                    "cosmic": ("orbital_barrage",), "city": ("scrapyard_riot",), "storm": ("eye_of_the_storm",), "wild": ("jungle_drums",),
+                    "dark": ("graveyard_shift",), "pastoral": ("hedgerow_skirmish",), "plain": ("steel_rain", "iron_valley", "cartridge_war")}
+_MAP_WORDS = (("fire", "lava magma volcan forge ember inferno molten cinder scorch burn hell crater caldera brimstone furnace solar sun obsidian shelled"),
+              ("frost", "ice snow frost glacier arctic tundra frozen cryo polar winter crystal fjord crevasse aurora"),
+              ("desert", "desert dune sand mesa canyon pyramid oasis sahara badland dust wasteland salt worm"),
+              ("water", "sea lagoon harbor harbour beach lake swamp marsh reef coral tide coast river delta wave bay island breakwater causeway culvert cascade falls deep mariana"),
+              ("cosmic", "space orbit star starfall nebula galaxy void rift astral cosmic moon moonscape lunar comet asteroid quasar mothership eclipse spiral elevator astrolabe celestial"),
+              ("city", "city neon cyber skyline factory rust steam station scrap junk metro foundry industrial citadel rail mine quarry skyscraper skybridge clockwork glitch grid gridlock tokyo vapor synth market"),
+              ("storm", "storm thunder gale monsoon tempest cyclone spire lightning maelstrom"),
+              ("wild", "jungle forest bamboo grove canopy wild vine root emerald tree gardens anthill mycelia serpent torii"),
+              ("dark", "ghost grave blood gothic haunt crypt tomb shadow night skull bone maw sludge cathedral labyrinth cauldron fog"),
+              ("pastoral", "meadow valley hill hills hilltop farm field prairie garden orchard hollow pasture glen knoll haystack windmill picnic spring harvest dawn sunset lakeside autumn twilight"))
+_MAP_FX = {"embers": "fire", "inferno": "fire", "snow": "frost", "stardust": "cosmic", "rift": "cosmic", "fireflies": "wild", "ash": "dark",
+           "storm": "storm", "tempest": "storm", "motes": "city", "plankton": "water", "sakura": "wild", "rain": "city", "spores": "wild",
+           "sandfall": "desert", "ghostlights": "dark"}
+_PREMIUM_MAP_SONGS = {"glass-desert": "glass_dunes_battle", "lantern-terraces": "lantern_terraces", "worldtree-roots": "worldtree_roots",
+                      "whalefall": "whalefall", "shatterline": "shatterline_battle", "mariana-deep": "m_mariana", "torii-path": "m_torii",
+                      "neon-gridlock": "m_gridlock", "paradox-engine": "m_paradox", "kaiju-bay": "m_kaiju", "mycelia": "m_mycelia",
+                      "worm's-maw": "m_wormsmaw", "serpent-stairs": "m_serpent", "astrolabe": "m_astrolabe", "ghost-reef": "m_ghostreef"}
+
+
+def _family_of(text: str, fx: str) -> str:
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    for fam, kw in _MAP_WORDS:
+        for k in kw.split():
+            if k in words or any(w.rstrip("s") == k or (len(k) >= 4 and w.startswith(k)) for w in words):
+                return fam
+    return _MAP_FX.get(fx, "plain")
+
+
+def map_family(m) -> str:
+    return _family_of(f"{m.key} {m.name}", m.theme.fx)
+
+
+def _build_music_map() -> tuple:
+    """One song per home screen and one per battlefield: hand-written where one exists, otherwise the house composer's."""
+    homes: dict = {}
+    for key in HOME_ORDER:
+        if key in _HOME_HAND:
+            homes[key] = _HOME_HAND[key]
+            continue
+        th = HOME_THEMES.get(key)
+        name, blurb, fx = (th.name, th.blurb, th.fx) if th else (key.title(), "", "")
+        hint = None
+        for bt in TICKET_BOSSES:
+            if bt.theme == key:
+                hint = "t_" + bt.key
+        if key in ANCIENT_THEMES[:3]:
+            hint = MARTYR_SONGS[ANCIENT_THEMES.index(key)]
+        sid = "home_" + key.lower()
+        fam = _family_of(f"{key} {name}", "")
+        if fam == "plain":
+            fam = _family_of(blurb, fx)
+        gen_song(sid, name + (" (VAULT)" if hint and hint.startswith("t_") else " (SANCTUM)" if hint else ""), "menu", fam, "Home screen. " + blurb, hint)
+        homes[key] = sid
+    maps: dict = dict(_PREMIUM_MAP_SONGS)
+    for b_ in TICKET_BOSSES:
+        maps[b_.map_key] = "t_" + b_.key
+    for i, am in enumerate(ANCIENT_MAPS):
+        maps[am.key] = MARTYR_SONGS[i]
+    left = {f: list(v) for f, v in MAP_FAMILY_SONGS.items()}
+    every = list(all_maps().values())
+    for m in every:                                        # the original battle themes each keep one battlefield of their own
+        if m.key in maps:
+            continue
+        fam = map_family(m)
+        if left.get(fam):
+            maps[m.key] = left[fam].pop(0)
+    for m in every:
+        if m.key in maps:
+            continue
+        sid = "map_" + m.key.replace("'", "")
+        gen_song(sid, m.name, "battle", map_family(m), "Battlefield. " + m.description)
+        maps[m.key] = sid
+    return homes, maps
+
+
+HOME_SONG, MAP_SONG = _build_music_map()
+SONG_HOMES: dict = {}
+for _k, _v in HOME_SONG.items():
+    SONG_HOMES.setdefault(_v, []).append(_k)
+SONG_MAPS: dict = {}
+for _k, _v in MAP_SONG.items():
+    SONG_MAPS.setdefault(_v, []).append(_k)
+
+
+def map_song(m) -> str:
+    if m is None:
+        return "steel_rain"
+    return MAP_SONG.get(m.key, "steel_rain")
+
+
+def battle_song(sess) -> str:
+    if isinstance(sess, PracticeSession):
+        return "tutorial"
+    if isinstance(sess, MartyrSession):
+        return MARTYR_SONGS[min(sess.phase_i, 2)]
+    if isinstance(sess, TicketSession):
+        return "t_" + sess.boss.key
+    if isinstance(sess, TournamentSession):
+        return TOURNAMENT_SONGS[min(len(TOURNAMENT_SONGS), max(1, sess.level.number)) - 1]
+    if isinstance(sess, MissionSession):
+        m = sess.mission
+        if m.kind == "coop" and m.coop_ufo:
+            return "saucer_attack"
+        return {"ufo": "saucer_attack", "mother": "mothership", "rush": "boss_rush", "coop": "squad_up", "2v1": "squad_up"}.get(m.kind) \
+            or map_song(sess.current_map)
+    return map_song(sess.current_map)
+
+
+JUKEBOX_GROUPS = (("HOME SCREENS", "menu"), ("BATTLEFIELDS", "battle"), ("TOURNAMENT", "tbos"), ("MISSIONS", "mission"),
+                  ("ANCIENT HOARDERS", "ticket"), ("THE MARTYR", "martyr"), ("STORY", "story"))
+
+
+def song_group(sid: str) -> str:
+    if sid in TOURNAMENT_SONGS:
+        return "tbos"
+    if sid in ("saucer_attack", "mothership", "boss_rush", "squad_up"):
+        return "mission"
+    if sid.startswith("t_"):
+        return "ticket"
+    if sid in MARTYR_SONGS:
+        return "martyr"
+    return {"menu": "menu", "battle": "battle", "story": "story"}.get(SONGS[sid].cat, "battle")
+
+
+def jukebox_unlocked(app, sid: str) -> bool:
+    """Everything you have heard, plus everything your progress has reached (so older saves start with a full shelf)."""
+    sv = app.save
+    if sid in heard_songs(sv) or sid in ("main_theme", "tutorial", "shop_jingle", "workshop"):
+        return True
+    if sid in TOURNAMENT_SONGS:
+        return TOURNAMENT_SONGS.index(sid) + 1 in sv.completed
+    if sid.startswith("t_"):
+        return sid[2:] in sv.tickets_won
+    if sid == "whisper":
+        return bool(sv.tickets_won) or sv.martyr_won
+    if sid in MARTYR_SONGS or sid in ("time_machine", "the_blessing", "protector"):
+        return sv.martyr_won or (sid in MARTYR_SONGS and sv.martyr_seen and MARTYR_SONGS.index(sid) <= sv.martyr_phase)
+    if sid in ("saucer_attack", "squad_up", "first_contact"):
+        return sv.missions_open()
+    if sid in ("mothership", "boss_rush"):
+        return len(MISSIONS) in sv.mission_completed or (sid == "boss_rush" and 40 in sv.mission_completed)
+    owned = sv.home_modes()
+    if any(h in owned for h in SONG_HOMES.get(sid, ())):
+        return True
+    am = all_maps()
+    return any(k in am and (am[k] in MAPS or sv.is_unlocked("map:" + k)) for k in SONG_MAPS.get(sid, ()))
+
+
+def heard_songs(sv) -> set:
+    return set(filter(None, sv.settings.get("heard", "").split(",")))
+
+
+def make_audio(term, settings: "Settings"):
+    """The right audio engine for where we run: helper process (desktop), Web Audio (browser) or silence."""
+    if getattr(settings, "audio", 2) != 2 or os.environ.get("TT_NOAUDIO"):
+        return NullAudio()
+    if IS_WEB:
+        a = WebAudio()
+        return a if a.start() else NullAudio()
+    if isinstance(term, WebTerminalIO):                     # headless / test harness: never spawn processes
+        return NullAudio()
+    a = AudioClient()
+    return a if a.start() else NullAudio()
+
+
+def export_music(outdir: str, only: str = "") -> int:
+    """`--export-music DIR`: renders every song (and every named sound effect) to WAV files so you can audition them."""
+    out = Path(outdir).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    import wave
+    want = [s for s in SONGS if not only or only.lower() in (s + " " + SONGS[s].name + " " + song_group(s)).lower()]
+    for i, sid in enumerate(want):
+        t0 = time.time()
+        mx = Mixer(cache=False)
+        mx.load_song(sid)
+        mx.command(f"music {sid} 0.05")
+        mx.command("loop 0")
+        total = song_of(sid).total + AU_SR
+        pcm = b"".join(mx.render() for _ in range(total // AU_CHUNK))
+        nice = "".join(c if c.isalnum() or c in " -" else "_" for c in SONGS[sid].name).strip()
+        with wave.open(str(out / f"{i + 1:03d} {song_group(sid)} - {nice} [{sid}].wav"), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(AU_SR)
+            w.writeframes(pcm)
+        print(f"{i + 1:3d}/{len(want)}  {SONGS[sid].name:<40} {song_of(sid).total / AU_SR:6.1f}s  ({time.time() - t0:.1f}s)", flush=True)
+    if only and only.lower() != "sfx":
+        print(f"done: {len(want)} songs in {out}")
+        return 0
+    sdir = out / "sfx"
+    sdir.mkdir(exist_ok=True)
+    for nm in SFX_RECIPES:
+        with wave.open(str(sdir / f"{nm}.wav"), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(AU_SR)
+            w.writeframes(array("h", [int(max(-1, min(1, v)) * 30000) for v in au_finish(sfx_build(nm))]).tobytes())
+    print(f"done: {len(want)} songs and {len(SFX_RECIPES)} sound effects in {out}")
+    return 0
+
+
+class JukeboxScene(BackdropScene):
+    """Every song you have unlocked: play anything, watch the analyser, shape it with a 3-band EQ."""
+    BANDS = ("BASS", "MID", "TREBLE")
+
+    def __init__(self, app) -> None:
+        super().__init__(app)
+        self.rows = []
+        for title, grp in JUKEBOX_GROUPS:
+            ids = [s for s in SONGS if song_group(s) == grp]
+            got = [s for s in ids if jukebox_unlocked(app, s)]
+            self.rows.append(("hdr", title, len(got), len(ids)))
+            self.rows += [("song", s) for s in got]
+        self.sel = next((i for i, r in enumerate(self.rows) if r[0] == "song"), 0)
+        self.playing: Optional[str] = None
+        self.band, self.loop_one = 0, True
+        self.bars = [0.0] * 16
+        try:
+            self.eq = [float(x) for x in app.save.settings.get("eq", "0,0,0").split(",")][:3]
+        except ValueError:
+            self.eq = [0.0, 0.0, 0.0]
+
+    def music(self):
+        return (self.playing, "menu") if self.playing else None
+
+    def _songs(self) -> list:
+        return [r[1] for r in self.rows if r[0] == "song"]
+
+    def handle(self, ev: InputEvent) -> None:
+        a = self.app.audio
+        if ev.action is Action.BACK:
+            a.loop(True)
+            self.app.goto(MenuScene(self.app))
+        elif ev.action in (Action.UP, Action.DOWN):
+            d = -1 if ev.action is Action.UP else 1
+            for _ in range(10 if ev.coarse else 1):                 # SHIFT jumps ten songs
+                for _ in range(len(self.rows)):
+                    self.sel = (self.sel + d) % len(self.rows)
+                    if self.rows[self.sel][0] == "song":
+                        break
+            if self.rows and self.rows[self.sel][0] == "song":
+                a.prep(["song:" + self.rows[self.sel][1]])
+        elif ev.raw == "TAB":                                      # the first song of the next group
+            hdrs = [i for i, r in enumerate(self.rows) if r[0] == "hdr"]
+            nxt = next((h for h in hdrs if h > self.sel), hdrs[0] if hdrs else 0)
+            for i in range(nxt, len(self.rows)):
+                if self.rows[i][0] == "song":
+                    self.sel = i
+                    break
+        elif ev.action in (Action.LEFT, Action.RIGHT):
+            self.eq[self.band] = clamp(self.eq[self.band] + (-2 if ev.action is Action.LEFT else 2), -12, 12)
+            a.eq(*self.eq)
+            self.app.save.settings["eq"] = ",".join(f"{x:g}" for x in self.eq)
+        elif ev.raw in ("e", "E"):
+            self.band = (self.band + 1) % 3
+        elif ev.raw in ("r", "R"):
+            self.eq = [0.0, 0.0, 0.0]
+            a.eq(0, 0, 0)
+            self.app.save.settings["eq"] = "0,0,0"
+        elif ev.raw in ("l", "L"):
+            self.loop_one = not self.loop_one
+            a.loop(self.loop_one)
+        elif ev.confirm and self.rows and self.rows[self.sel][0] == "song":
+            self.playing = self.rows[self.sel][1]
+            a.loop(self.loop_one)
+
+    def update(self, dt: float) -> None:
+        super().update(dt)
+        a = self.app.audio
+        spec = getattr(a, "spec", "0" * 16)
+        for i in range(16):
+            v = int(spec[i]) if i < len(spec) and spec[i].isdigit() else 0
+            self.bars[i] += (v - self.bars[i]) * min(1.0, dt * (14 if v > self.bars[i] else 5))
+        if self.playing and not self.loop_one and getattr(a, "ended", None) == self.playing:
+            a.ended = None
+            songs = self._songs()
+            self.playing = songs[(songs.index(self.playing) + 1) % len(songs)] if self.playing in songs else None
+
+    def draw(self, screen: Screen) -> None:
+        super().draw(screen)
+        a, t = self.app.audio, self.app.time
+        W, H = min(100, screen.cols - 2), min(28, screen.rows - 1)
+        LW = W - 54                                                 # the song list gets whatever the NOW PLAYING panel leaves
+        x, y = (screen.cols - W) // 2, max(0, (screen.rows - H) // 2)
+        screen.box(x, y, LW, H, "double", Palette.LINE, Palette.PANEL, "JUKEBOX")
+        top = max(0, min(self.sel - (H - 6) // 2, len(self.rows) - (H - 4)))
+        for k, r in enumerate(self.rows[top:top + H - 4]):
+            ry, i = y + 2 + k, top + k
+            if r[0] == "hdr":
+                screen.text(x + 2, ry, f"{r[1]}  {r[2]}/{r[3]}", GOLD, Palette.PANEL)
+                continue
+            sel = i == self.sel
+            bg = Palette.PANEL_HI if sel else Palette.PANEL
+            screen.fill(x + 2, ry, LW - 4, 1, bg)
+            mark = "♪ " if r[1] == self.playing else ("▶ " if sel else "  ")
+            name = SONGS[r[1]].name
+            if len(name) > LW - 7:                                    # never cut mid-word: drop whole trailing words
+                name = name[:LW - 8].rsplit(" ", 1)[0] + "…"
+            screen.text(x + 3, ry, mark + name, GOLD if r[1] == self.playing else Palette.WHITE if sel else Palette.TEXT, bg)
+        if len(self.rows) > H - 4:                                 # scroll position
+            track = H - 4
+            pos = int((track - 1) * top / max(1, len(self.rows) - (H - 4)))
+            for k in range(track):
+                screen.put(x + LW - 2, y + 2 + k, "█" if k == pos else "│", GOLD if k == pos else Palette.LINE, Palette.PANEL)
+        px = x + LW + 1
+        screen.box(px, y, 53, H, "double", Palette.LINE, Palette.PANEL, "NOW PLAYING")
+        cur = self.playing or getattr(a, "now_sid", None)
+        if not a.on:
+            wrap_center(screen, y + 9, f"Audio is off ({a.label}). Turn AUDIO on in Settings - music needs a sound device.", 47, Palette.AMBER, Palette.PANEL, px, 53, 2)
+        if cur in SONGS:
+            sp = SONGS[cur]
+            screen.center(y + 2, sp.name, GOLD, Palette.PANEL, px, 53)
+            wrap_center(screen, y + 3, sp.desc, 47, Palette.MUTED, Palette.PANEL, px, 53, 2)
+            meter = {"44": "4/4", "34": "3/4", "68": "6/8", "78": "7/8", "54": "5/4"}.get(sp.meter, sp.meter)
+            screen.center(y + 5, f"{sp.bpm} BPM  ·  {meter}  ·  {sp.style.upper()}", Palette.TEXT, Palette.PANEL, px, 53)
+            pos, dur = getattr(a, "pos", 0), max(1, getattr(a, "dur", 0))
+            bw = 40
+            n = int(bw * clamp(pos / dur, 0, 1)) if a.on else 0
+            screen.text(px + 4, y + 7, "█" * n + "░" * (bw - n), Palette.PRIMARY, Palette.PANEL)
+            screen.text(px + 45, y + 7, f"{pos // 60}:{pos % 60:02d}", Palette.MUTED, Palette.PANEL)
+        # the analyser: 16 bands, 10 rows tall
+        base = y + 19
+        for i, v in enumerate(self.bars):
+            h = int(round(v))
+            for r in range(9):
+                on = r < h
+                col = gradient(((0.0, (60, 220, 160)), (0.55, (255, 214, 90)), (1.0, (255, 80, 90))), r / 8) if on else (32, 36, 52)
+                screen.text(px + 4 + i * 3, base - r, "▆▆", col, Palette.PANEL)
+        screen.text(px + 4, base + 1, "55Hz" + " " * 36 + "10kHz", Palette.MUTED, Palette.PANEL)
+        for i, nm in enumerate(self.BANDS):                        # the EQ
+            bx = px + 4 + i * 16
+            sel = i == self.band
+            screen.text(bx, y + 22, ("▶" if sel else " ") + nm, GOLD if sel else Palette.TEXT, Palette.PANEL)
+            v = self.eq[i]
+            pos_ = int((v + 12) / 24 * 12)
+            screen.text(bx, y + 23, "".join("●" if k == pos_ else "─" for k in range(13)), GOLD if sel else Palette.MUTED, Palette.PANEL)
+            screen.text(bx + 4, y + 24, f"{v:+.0f} dB", Palette.WHITE if sel else Palette.MUTED, Palette.PANEL)
+        screen.text(px + 4, y + 25, "LOOP ONE SONG" if self.loop_one else "AUTO-PLAY NEXT", Palette.PRIMARY, Palette.PANEL)
+        ky = y + H if y + H < screen.rows else y + H - 1              # under the panels when there is a free row
+        draw_keycaps(screen, x + 2, ky, (("▲▼", "SONG"), ("TAB", "GROUP"), ("ENTER", "PLAY"), ("◄►", "EQ"), ("E", "BAND"), ("R", "FLAT"),
+                                         ("L", "LOOP"), ("ESC", "BACK")), Palette.PANEL if ky < y + H else None)
+
+
+class BlessingGiftScene(BackdropScene):
+    """After the finale's rewards: the Martyr's last power, handed down as a single shell."""
+
+    def __init__(self, app) -> None:
+        super().__init__(app)
+        self.t = 0.0
+        self.stage = PreviewStage(app.settings, 46, 26, 2)
+        self.stage.set_kit(DESIGN_BY_KEY.get("a_martyr", DEFAULT_DESIGN), ASTRAL, AMMO_BY_KEY[BLESSING_KEY], (255, 226, 120), 0.0)
+
+    def enter(self) -> None:
+        self.app.sfx("bless_grant", 1.0)
+
+    def music(self):
+        return ("the_blessing", "story")
+
+    def handle(self, ev: InputEvent) -> None:
+        if self.t > 1.0 and (ev.confirm or ev.action in (Action.CONFIRM, Action.BACK)):
+            self.app.goto(MartyrFinaleScene(self.app))
+
+    def update(self, dt: float) -> None:
+        super().update(dt)
+        self.t += dt
+        self.stage.update(dt)
+
+    def draw(self, screen: Screen) -> None:
+        super().draw(screen)
+        t = self.t
+        W, H = 72, 26
+        x, y = (screen.cols - W) // 2, max(0, (screen.rows - H) // 2)
+        screen.box(x, y, W, H, "double", GOLD, Palette.PANEL, "A GIFT ACROSS TEN THOUSAND YEARS")
+        screen.blit(self.stage.render(), x + (W - 46) // 2, y + 1)
+        title = "M A R T Y R ' S   B L E S S I N G"
+        screen.center(y + 15, title, mix((176, 120, 255), GOLD, 0.5 + 0.5 * math.sin(t * 3)), Palette.PANEL, x, W)
+        lines = ("What remained of the Martyr's power could not follow him into rest.",
+                 "It has been sealed into a single shell of gold and starlight: MARTYR'S BLESSING.",
+                 "Land one direct hit and nothing left standing in your way will stay standing.",
+                 "Enable it in the rules of Single Player, Two Player or LAN.")
+        for k, ln in enumerate(lines):
+            if t > 0.6 + k * 0.7:
+                wrap_center(screen, y + 17 + k * 2, ln, W - 6, Palette.WHITE if k < 3 else Palette.MUTED, Palette.PANEL, x, W, 2)
+        if t > 3.5:
+            screen.center(y + H - 2, "[ ENTER ]", Palette.PRIMARY if int(t * 2) % 2 == 0 else Palette.MUTED, Palette.PANEL, x, W)
+
+
 class Application:
     def __init__(self, term, seed: Optional[int] = None, color_mode: ColorMode = ColorMode.AUTO,
                  save_path: Optional[Path] = None) -> None:
@@ -13047,6 +19502,12 @@ class Application:
             self.settings.color_mode = color_mode
         self.screen = Screen(term, self.settings.color_mode)
         self.feedback = Feedback(term, self.settings)
+        self.audio = make_audio(term, self.settings)
+        self.now_playing = NowPlaying()
+        self._sync_audio()
+        self.last_battle_song: Optional[str] = None
+        self._sfx_t: dict = {}
+        self._wallet_seen = (self.save.coins, len(self.save.granted))
         self.backdrop = AmbientBackdrop()
         self.master_backdrop = MasterBackdrop(self.settings)
         self.secret_backdrop = SecretBackdrop(self.settings)
@@ -13081,7 +19542,7 @@ class Application:
     def start_match(self, cfg: MatchConfig, mapdef: Optional[MapDefinition], wind: Optional[float] = None, rps: bool = True) -> None:
         session = MatchSession(cfg, mapdef, self.rng.randrange(1 << 30))
         session.wind_override = wind
-        if rps and cfg.mode == "two" and cfg.net is None:                  # who shoots first is decided by rock-paper-scissors
+        if rps and cfg.mode in ("two", "single") and cfg.net is None:      # who shoots first is decided by rock-paper-scissors
             self.goto(RPSScene(self, session))
         else:
             self.goto(BattleScene(self, session))
@@ -13130,7 +19591,93 @@ class Application:
             self.save = SaveData.load(self.profiles.active_path())
             self.save.apply_settings(self.settings)
 
+    def _sync_audio(self) -> None:
+        """Start/stop the engine to match the AUDIO setting and push the volumes and EQ."""
+        want = getattr(self.settings, "audio", 2) == 2
+        if want and not self.audio.on:
+            self.audio = make_audio(self.term, self.settings)
+        elif not want and self.audio.on:
+            self.audio.stop()
+            self.audio = NullAudio()
+        self.audio.volumes(0.9, self.settings.music_vol, self.settings.sfx_vol)
+        try:
+            self.audio.eq(*[float(x) for x in self.save.settings.get("eq", "0,0,0").split(",")][:3])
+        except (ValueError, TypeError):
+            pass
+        if hasattr(self.audio, "_music"):
+            self.audio._music = None                         # re-send the current song after a restart
+
+    def sfx(self, name: str, vol: float = 1.0, pan: float = 0.0, rate: float = 1.0, gap: float = 0.0) -> None:
+        """Play a sound effect (optionally at most once per `gap` seconds)."""
+        if gap:
+            last = self._sfx_t.get(name, -9.0)
+            if self.time - last < gap:
+                return
+            self._sfx_t[name] = self.time
+        self.audio.sfx(name, vol, pan, rate)
+
+    def _direct_music(self) -> None:
+        """Pick the song for whatever is on screen (top-most scene that has an opinion, else the home screen's song)."""
+        sid, mood = None, None
+        for s in reversed(self.stack):
+            f = getattr(s, "music", None)
+            r = f() if f else None
+            if r:
+                sid, mood = r
+                break
+        if sid is None:
+            sid, mood = HOME_SONG.get(self.home_theme(), "main_theme"), "menu"
+        if sid not in SONGS:
+            sid = "main_theme"
+        if mood in ("battle",):
+            self.last_battle_song = sid
+        if sid != getattr(self, "_np_last", None):
+            self._np_last = sid
+            top = self.stack[-1] if self.stack else None
+            if self.audio.on and self.settings.song_popup and not isinstance(top, JukeboxScene):
+                self.now_playing.show(sid)
+        self.audio.music(sid)
+        self.audio.mood(mood or "menu")
+        top = self.stack[-1] if self.stack else None
+        pkey = (type(top).__name__, self.home_theme())
+        if pkey != getattr(self, "_prefetch_key", None):           # warm up what is likely to play next
+            self._prefetch_key = pkey
+            owned = [k for k in HOME_ORDER if k in self.save.home_modes()]
+            cur = self.home_theme()
+            want = ["shop_jingle", "workshop"]
+            if cur in owned and len(owned) > 1:
+                i = owned.index(cur)
+                want += [HOME_SONG.get(owned[(i + 1) % len(owned)]), HOME_SONG.get(owned[i - 1])]
+            want += list(getattr(top, "prefetch_songs", lambda: [])())
+            self.audio.prep(["song:" + s for s in want if s in SONGS and s != sid])
+        heard = self.save.settings.get("heard", "")
+        if ("," + sid + ",") not in ("," + heard + ","):
+            self.save.settings["heard"] = (heard + "," + sid).strip(",")
+
+    def _ui_sound(self, ev: InputEvent) -> None:
+        top = self.stack[-1] if self.stack else None
+        if isinstance(top, BattleScene):
+            if top.phase is Phase.AIMING and top._control(top.current) == "local":
+                if ev.action in (Action.LEFT, Action.RIGHT):
+                    self.sfx("aim_tick", 0.6, gap=0.035)
+                elif ev.action in (Action.UP, Action.DOWN):
+                    self.sfx("power_tick", 0.6, gap=0.035)
+            return
+        if isinstance(top, CinematicScene):
+            return
+        if ev.action in (Action.UP, Action.DOWN):
+            self.sfx("ui_move", 0.7, gap=0.03)
+        elif ev.action in (Action.LEFT, Action.RIGHT):
+            self.sfx("ui_tab", 0.7, gap=0.03)
+        elif ev.action in (Action.CONFIRM, Action.FIRE):
+            self.sfx("ui_select", 0.8, gap=0.05)
+        elif ev.action is Action.BACK:
+            self.sfx("ui_back", 0.8, gap=0.05)
+        elif len(ev.raw) == 1 and ev.raw.isalnum():
+            self.sfx("ui_type", 0.5, gap=0.02)
+
     def apply_settings(self) -> None:
+        self._sync_audio()
         self.screen.set_mode(self.settings.color_mode)
         self.save.capture_settings(self.settings)
         self.save.flush()
@@ -13168,8 +19715,19 @@ class Application:
             for ev in events:
                 if self.transition is not None:
                     break
+                self._ui_sound(ev)
                 self.stack[-1].handle(ev)
         if self.stack:
+            coins, got = self.save.coins, len(self.save.granted)        # wallet / unlock chimes
+            if coins < self._wallet_seen[0]:
+                self.sfx("ui_buy", 0.9, gap=0.3)
+            elif coins > self._wallet_seen[0] + 0:
+                self.sfx("payout", 0.8, gap=0.6)
+            if got > self._wallet_seen[1]:
+                self.sfx("ui_unlock", 0.9, gap=0.8)
+            self._wallet_seen = (coins, got)
+            self._direct_music()
+            self.audio.tick()
             self.stack[-1].update(dt)
             for s in self.stack[:-1]:
                 if s.ambient:
@@ -13182,6 +19740,11 @@ class Application:
             if self.stack[base].show_wallet and not (tr and tr.phase == "out" and tr.progress > 0.9):
                 self._wallet_flash = max(0.0, getattr(self, "_wallet_flash", 0.0) - dt)
                 draw_wallet(screen, self.save, self._wallet_flash)
+            lay = getattr(self.stack[-1], "layout", None)
+            ny = (lay.fy + 1) if lay is not None and hasattr(lay, "fy") else 1
+            if getattr(self.stack[-1], "coach", False):                # tutorial coach box open: the card sits under it
+                ny += getattr(self.stack[-1], "coach_h", 0) + 1
+            self.now_playing.draw(screen, dt, getattr(self.audio, "spec", ""), self.time, ny)
         tr = self.transition
         if tr:
             p = tr.progress
@@ -13228,6 +19791,10 @@ def _parse_cli(argv: Optional[Sequence[str]]):
     parser.add_argument("--seed", type=int, default=None, help="seed maps and AI for reproducible matches")
     parser.add_argument("--save-file", default=None, help="progress file (default: per-user config directory)")
     parser.add_argument("--reset-progress", action="store_true", help="delete saved tournament progress and unlocks, then exit")
+    parser.add_argument("--export-music", metavar="DIR", default=None, help="render the whole soundtrack and every sound effect to WAV files, then exit")
+    parser.add_argument("--only", metavar="TEXT", default="", help="with --export-music: only songs whose id, name or group contains TEXT "
+                                                                   "(e.g. martyr, t_, boss, map_, home_)")
+    parser.add_argument("--audio-server", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=f"TerminalTanks {__version__} by {CREDIT_NAME} (https://{CREDIT_URL})")
     args = parser.parse_args(argv)
     mode = {"auto": ColorMode.AUTO, "truecolor": ColorMode.TRUE, "256": ColorMode.ANSI256, "16": ColorMode.ANSI16}[args.color]
@@ -13246,11 +19813,17 @@ def _reset_progress(save_path: Path) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args, mode, save_path = _parse_cli(argv)
+    if args.audio_server:
+        return audio_server()
+    if args.export_music:
+        return export_music(args.export_music, args.only)
     if args.reset_progress:
         return _reset_progress(save_path)
+    app = None
     try:
         with TerminalIO() as term:
-            Application(term, args.seed, mode, save_path).run()
+            app = Application(term, args.seed, mode, save_path)
+            app.run()
     except KeyboardInterrupt:
         pass
     except TerminalError as exc:
@@ -13260,6 +19833,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         traceback.print_exc()
         print("\nTerminalTanks crashed; your terminal has been restored.", file=sys.stderr)
         return 1
+    finally:
+        if app is not None:
+            app.audio.stop()
     return 0
 
 
